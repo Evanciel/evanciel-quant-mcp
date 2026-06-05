@@ -6,6 +6,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import * as H from "./handlers.js";
+import * as B from "./bot-handlers.js";
 import * as S from "./schemas.js";
 
 const DISCLAIMER = "주의: 리스크 필터 + 표현력 도구이지 알파 생성기가 아님(리테일 방향성 알파≈0). 기대수익을 보장하지 않음.";
@@ -68,6 +69,41 @@ export function buildServer(): McpServer {
     inputSchema: S.strategyFactoryShape,
   }, guard((a) => H.strategyFactory(a as Parameters<typeof H.strategyFactory>[0])));
 
+  // ── v2: 봇/전략/대시보드 (로컬 스토어 + 페이퍼 러너) ──
+  server.registerTool("save_strategy", {
+    title: "전략(복합전략) 저장",
+    description: `에이전트가 조립한 복합 전략 트리를 검증 후 로컬 스토어에 저장. 반환 id로 봇을 만든다. ${DISCLAIMER}`,
+    inputSchema: S.saveCompositeShape,
+  }, guard((a) => B.saveComposite(a as Parameters<typeof B.saveComposite>[0])));
+
+  server.registerTool("create_bot", {
+    title: "로컬 봇 생성",
+    description: `저장한 전략으로 로컬 봇 생성(기본 paper). 라이브 실행은 v2.5(브로커 키 + 2단계 확인토큰 + 하드게이트). ${DISCLAIMER}`,
+    inputSchema: S.createBotShape,
+  }, guard((a) => B.createBot(a as Parameters<typeof B.createBot>[0])));
+
+  server.registerTool("list_bots", {
+    title: "봇 목록", description: `로컬 봇 목록 + 상태. ${DISCLAIMER}`, inputSchema: S.listBotsShape,
+  }, guard(() => B.listBots()));
+
+  server.registerTool("get_bot_status", {
+    title: "봇 상태", description: `봇 상태 + 포지션 + 최근 체결/로그. ${DISCLAIMER}`, inputSchema: S.botIdShape,
+  }, guard((a) => B.getBotStatus(a as { botId: string })));
+
+  server.registerTool("start_bot", {
+    title: "봇 가동", description: `봇을 페이퍼로 가동(interval마다 평가, core 엔진 재사용=backtest≡live). ${DISCLAIMER}`, inputSchema: S.botIdShape,
+  }, guard((a) => B.startBot(a as { botId: string })));
+
+  server.registerTool("stop_bot", {
+    title: "봇 중지", description: `봇 가동 중지. ${DISCLAIMER}`, inputSchema: S.botIdShape,
+  }, guard((a) => B.stopBot(a as { botId: string })));
+
+  server.registerTool("open_dashboard", {
+    title: "실시간 HTML 대시보드 열기",
+    description: `로컬(127.0.0.1) HTML 대시보드 기동 + URL 반환. 봇 포지션 + 실시간 미실현손익(Binance WS). 읽기전용·토큰보호. ${DISCLAIMER}`,
+    inputSchema: S.openDashboardShape,
+  }, guard((a) => B.openDashboard(a as { port?: number })));
+
   return server;
 }
 
@@ -75,8 +111,12 @@ async function main() {
   const server = buildServer();
   const transport = new StdioServerTransport();
   await server.connect(transport);
+  const { runner } = await import("../runner/runner.js");
+  runner().resumeAll(); // 재기동 시 running 봇 재개
+  const shutdown = () => { runner().shutdown(); process.exit(0); };
+  process.on("SIGINT", shutdown); process.on("SIGTERM", shutdown);
   // stdio 서버는 stdout=프로토콜 채널 → 로그는 stderr로.
-  process.stderr.write("quant-mcp server ready (stdio) — 8 tools. risk filter, not alpha source.\n");
+  process.stderr.write("quant-mcp server ready (stdio) — 15 tools (8 analysis + 7 bot/dashboard). paper mode. risk filter, not alpha source.\n");
 }
 
 // 직접 실행 시에만 기동(테스트 import 시엔 buildServer만 사용).

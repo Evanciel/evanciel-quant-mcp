@@ -78,3 +78,30 @@ export const strategyFactoryShape = {
   days: z.number().optional(),
   minDsr: z.number().default(0.95).describe("생존 DSR 임계(기본 0.95, 다중검정 보정)"),
 };
+
+// ── v2: 봇/전략/대시보드 (로컬 스토어 + 페이퍼 러너) ──
+export const saveCompositeShape = {
+  name: z.string().describe("전략 이름"),
+  tree: z.unknown().describe("복합 전략 트리(validateRootNode 검증)"),
+  symbol: z.string().default("BTCUSDT"),
+  market: z.enum(["spot", "futures"]).default("spot"),
+  leverage: z.number().default(1),
+  stopLossPercent: z.number().optional(),
+  takeProfitPercent: z.number().optional(),
+  tpLadder: z.array(z.object({ pct: z.number() })).optional().describe("다단계 부분익절 라더"),
+  scaleIn: z.unknown().optional(),
+  pyramid: z.unknown().optional(),
+  trailingStopPercent: z.number().optional(),
+};
+export const createBotShape = {
+  name: z.string().describe("봇 이름"),
+  compositeStrategyId: z.string().describe("save_composite가 반환한 전략 id"),
+  symbol: z.string().optional(),
+  capital: z.number().default(1_000_000).describe("운용 자본(페이퍼)"),
+  mode: z.enum(["paper", "live"]).default("paper").describe("paper만 가능(live=v2.5, 키+게이트 필요)"),
+  broker: z.string().default("binance"),
+  intervalSeconds: z.number().int().default(60).describe("평가 주기(최소 15초)"),
+};
+export const botIdShape = { botId: z.string().describe("봇 id") };
+export const listBotsShape = {};
+export const openDashboardShape = { port: z.number().int().default(7788).describe("대시보드 로컬 포트(127.0.0.1)") };
