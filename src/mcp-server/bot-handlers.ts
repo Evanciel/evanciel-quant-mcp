@@ -6,6 +6,7 @@ import { validateRootNode } from "../core/validation/composite-node.js";
 import * as store from "../store/db.js";
 import { runner } from "../runner/runner.js";
 import { startDashboard } from "../dashboard/server.js";
+import { liveGate, type Broker } from "../brokers/safety.js";
 
 export function saveComposite(a: {
   name: string; tree: unknown; symbol?: string; market?: "spot" | "futures"; leverage?: number;
@@ -26,13 +27,20 @@ export function saveComposite(a: {
 export function createBot(a: { name: string; compositeStrategyId: string; symbol?: string; capital?: number; mode?: "paper" | "live"; broker?: string; intervalSeconds?: number }) {
   const comp = store.getComposite(a.compositeStrategyId);
   if (!comp) return { ok: false, error: `복합전략 없음: ${a.compositeStrategyId}` };
-  if (a.mode === "live") return { ok: false, error: "라이브 실행은 아직 비활성(v2.5: 브로커 키 + 2단계 확인토큰 + 하드게이트 필요). 현재는 mode=paper만 가능." };
+  const mode = a.mode === "live" ? "live" : "paper";
+  const broker = a.broker || "binance";
   const bot = store.insertBot({
     name: a.name, symbol: a.symbol || comp.symbol, composite_strategy_id: a.compositeStrategyId,
-    mode: "paper", capital: a.capital ?? 1_000_000, broker: a.broker || "binance", interval_seconds: a.intervalSeconds ?? 60,
+    mode, capital: a.capital ?? 1_000_000, broker, interval_seconds: a.intervalSeconds ?? 60,
   });
-  store.insertLog(bot.id, "create", `[페이퍼] 봇 생성 — ${bot.name} (${bot.symbol})`);
-  return { ok: true, botId: bot.id, name: bot.name, symbol: bot.symbol, mode: bot.mode, status: bot.status, note: "mode=paper. start_bot으로 가동." };
+  // 라이브 모드면 현재 게이트 상태를 알려줌(실행은 가동 시 게이트가 통제 — 키없으면 페이퍼 폴백).
+  let note = "mode=paper. start_bot으로 가동.";
+  if (mode === "live") {
+    const g = liveGate(broker as Broker, "spot");
+    note = g.allowed ? `mode=live — ${g.reason} start_bot 시 실주문(하드리밋 적용).` : `mode=live지만 ${g.reason} start_bot해도 게이트 통과 전엔 페이퍼 폴백. SETUP-LIVE.md로 키/스위치 설정.`;
+  }
+  store.insertLog(bot.id, "create", `[${mode}] 봇 생성 — ${bot.name} (${bot.symbol})`);
+  return { ok: true, botId: bot.id, name: bot.name, symbol: bot.symbol, mode: bot.mode, status: bot.status, note };
 }
 
 export function listBots() {

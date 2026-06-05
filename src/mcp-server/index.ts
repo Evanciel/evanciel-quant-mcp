@@ -7,6 +7,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import * as H from "./handlers.js";
 import * as B from "./bot-handlers.js";
+import * as L from "./live-handlers.js";
 import * as S from "./schemas.js";
 
 const DISCLAIMER = "주의: 리스크 필터 + 표현력 도구이지 알파 생성기가 아님(리테일 방향성 알파≈0). 기대수익을 보장하지 않음.";
@@ -104,6 +105,31 @@ export function buildServer(): McpServer {
     inputSchema: S.openDashboardShape,
   }, guard((a) => B.openDashboard(a as { port?: number })));
 
+  // ── v2.5: 라이브 거래(BYOK, 안전게이트). place_order=fail-closed 2단계토큰. ──
+  server.registerTool("live_status", {
+    title: "라이브 설정 상태",
+    description: `어떤 브로커가 어떤 env(testnet/mock/live)로 설정됐는지 + 마스터스위치 + 하드리밋(키 노출 0). ${DISCLAIMER}`,
+    inputSchema: S.liveStatusShape, annotations: { readOnlyHint: true },
+  }, guard(() => L.liveStatus()));
+
+  server.registerTool("get_positions", {
+    title: "실포지션 조회(BYOK)",
+    description: `거래소 키로 실제 포지션 조회. 키 없으면 안내. ${DISCLAIMER}`,
+    inputSchema: S.brokerReadShape, annotations: { readOnlyHint: true },
+  }, guard((a) => L.getPositions(a as Parameters<typeof L.getPositions>[0])));
+
+  server.registerTool("get_balance", {
+    title: "실잔고 조회(BYOK)",
+    description: `거래소 키로 실제 잔고 조회. ${DISCLAIMER}`,
+    inputSchema: S.brokerReadShape, annotations: { readOnlyHint: true },
+  }, guard((a) => L.getBalance(a as Parameters<typeof L.getBalance>[0])));
+
+  server.registerTool("place_order", {
+    title: "실주문(BYOK, 2단계 확인)",
+    description: `실제 주문. **fail-CLOSED 2단계**: 1차=프리뷰+확인토큰, 2차=동일인자+토큰이어야 실행. testnet/mock 키는 즉시, 메인넷은 LIVE_TRADING_ENABLED=true 필요. 서버측 하드리밋(노셔널캡/심볼allowlist/일일손실서킷) 적용. ${DISCLAIMER}`,
+    inputSchema: S.placeOrderShape, annotations: { destructiveHint: true, readOnlyHint: false, idempotentHint: false },
+  }, guard((a) => L.placeOrder(a as Parameters<typeof L.placeOrder>[0])));
+
   return server;
 }
 
@@ -116,7 +142,7 @@ async function main() {
   const shutdown = () => { runner().shutdown(); process.exit(0); };
   process.on("SIGINT", shutdown); process.on("SIGTERM", shutdown);
   // stdio 서버는 stdout=프로토콜 채널 → 로그는 stderr로.
-  process.stderr.write("quant-mcp server ready (stdio) — 15 tools (8 analysis + 7 bot/dashboard). paper mode. risk filter, not alpha source.\n");
+  process.stderr.write("quant-mcp server ready (stdio) — 19 tools (8 analysis + 7 bot + 4 live). paper mode. risk filter, not alpha source.\n");
 }
 
 // 직접 실행 시에만 기동(테스트 import 시엔 buildServer만 사용).

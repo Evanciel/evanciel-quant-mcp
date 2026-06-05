@@ -105,3 +105,19 @@ export const createBotShape = {
 export const botIdShape = { botId: z.string().describe("봇 id") };
 export const listBotsShape = {};
 export const openDashboardShape = { port: z.number().int().default(7788).describe("대시보드 로컬 포트(127.0.0.1)") };
+
+// ── v2.5: 라이브 거래(BYOK, 안전게이트) ──
+const brokerEnum = z.enum(["binance", "kis", "kiwoom"]).default("binance");
+const marketEnum = z.enum(["spot", "futures"]).default("spot");
+export const liveStatusShape = {};
+export const brokerReadShape = { broker: brokerEnum, market: marketEnum };
+export const placeOrderShape = {
+  broker: brokerEnum,
+  market: marketEnum,
+  symbol: z.string().describe("종목/심볼 (BTCUSDT, 005930 등)"),
+  side: z.enum(["buy", "sell"]),
+  type: z.enum(["market", "limit"]).default("market"),
+  quantity: z.number().positive(),
+  price: z.number().optional().describe("지정가 시 가격(시장가는 생략)"),
+  confirmToken: z.string().optional().describe("프리뷰가 반환한 토큰. 없으면 프리뷰만(실주문 안 함=fail-closed)"),
+};
