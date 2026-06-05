@@ -38,6 +38,39 @@ npm run typecheck   # tsc --noEmit
 npm test            # vitest
 ```
 
+## Use with any MCP client
+
+quant-mcp is a stdio MCP server, so **any MCP-compatible agent** (Claude Desktop, Cursor, Claude Code, Continue, etc.) can use its 8 tools.
+
+**1. Get it running locally**
+```bash
+git clone https://github.com/Evanciel/quant-mcp.git
+cd quant-mcp
+npm install          # installs the MCP SDK, zod, tsx
+npm test             # optional: confirms the server boots + tools work (14/14)
+```
+
+**2. Register the server** — add to your client's MCP config (see [`examples/mcp-config.json`](examples/mcp-config.json)). Replace `ABSOLUTE_PATH` with your clone location:
+```json
+{
+  "mcpServers": {
+    "quant-mcp": {
+      "command": "npx",
+      "args": ["-y", "tsx", "ABSOLUTE_PATH/quant-mcp/src/mcp-server/index.ts"]
+    }
+  }
+}
+```
+- **Claude Desktop**: `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) / `%APPDATA%\Claude\claude_desktop_config.json` (Windows)
+- **Cursor**: `.cursor/mcp.json`
+- **Claude Code (CLI)**: `claude mcp add quant-mcp -- npx -y tsx ABSOLUTE_PATH/quant-mcp/src/mcp-server/index.ts`
+
+**3. Verify** — the server announces `quant-mcp server ready (stdio) — 8 tools` on stderr, and your client should list 8 tools (`validate_strategy`, `backtest`, …).
+
+**4. Use it** — see [`examples/usage.md`](examples/usage.md) for example prompts + tool inputs/outputs. e.g. *"Backtest this RSI strategy on BTCUSDT 1d, and tell me if it survives the out-of-sample gate."*
+
+> ⚠️ **Scope reminder**: these tools analyze **public** market data — they do **not** see your account/positions and do **not** trade. (Reading *your* live portfolio = v2, bring-your-own-keys; not built yet.)
+
 ## v1 tool surface (implemented ✅)
 
 8 stdio MCP tools, each mapping 1:1 to a verified pure engine function. Every description carries the "risk filter, not alpha source" disclaimer.
