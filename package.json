@@ -1,0 +1,22 @@
+{
+  "name": "quant-mcp",
+  "version": "0.1.0",
+  "description": "Open-source MIT quant MCP server — risk filter + expressiveness layer, not an alpha source.",
+  "type": "module",
+  "license": "MIT",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "dev": "tsx src/mcp-server/index.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.4",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@types/node": "^20",
+    "tsx": "^4.22.4",
+    "typescript": "^5",
+    "vitest": "^4.1.0"
+  }
+}
