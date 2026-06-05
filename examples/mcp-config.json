@@ -1,9 +1,9 @@
 {
-  "_comment": "Drop this into your MCP client config. Replace ABSOLUTE_PATH with where you cloned quant-mcp. Requires: Node 18+, and `npm install` run inside the repo first (installs the MCP SDK, zod, tsx).",
+  "_comment": "Drop this into your MCP client config. Replace ABSOLUTE_PATH with where you cloned evanciel-quant-mcp. Requires: Node 18+, and `npm install` run inside the repo first (installs the MCP SDK, zod, tsx).",
   "mcpServers": {
     "quant-mcp": {
       "command": "npx",
-      "args": ["-y", "tsx", "ABSOLUTE_PATH/quant-mcp/src/mcp-server/index.ts"]
+      "args": ["-y", "tsx", "ABSOLUTE_PATH/evanciel-quant-mcp/src/mcp-server/index.ts"]
     }
   }
 }
