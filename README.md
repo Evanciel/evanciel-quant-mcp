@@ -38,8 +38,28 @@ npm run typecheck   # tsc --noEmit
 npm test            # vitest
 ```
 
-## v1 tool surface (planned, PR #3-4)
+## v1 tool surface (implemented ✅)
 
-`validate_strategy`, `backtest`, `backtest_short`, `detect_regime`, `derivatives_signal`, `suggest_position_size`, `portfolio_risk`, `strategy_factory` — each maps 1:1 to a verified pure engine function. Every description carries the "risk filter, not alpha source" disclaimer.
+8 stdio MCP tools, each mapping 1:1 to a verified pure engine function. Every description carries the "risk filter, not alpha source" disclaimer.
+
+| Tool | What it does |
+|---|---|
+| `validate_strategy` | Validate a composite strategy tree (recursion/weighted/time bounds). Upstream gate for all tools. |
+| `backtest` | Backtest + walk-forward 70/30 OOS + PSR (overfit detection). |
+| `backtest_short` | Short backtest (sell=open, buy=cover); same signal eval as long → backtest≡live. |
+| `detect_regime` | ADX / Kaufman ER / ATR% → trend/range/high_vol. |
+| `derivatives_signal` | fapi funding (annualized) / OI quadrant / long-short tilt / taker flow. |
+| `suggest_position_size` | EWMA vol-target / ATR / fractional Kelly. |
+| `portfolio_risk` | Heat / MDD circuit breaker / correlation adjust (pure, no account). |
+| `strategy_factory` | Bulk OOS + Deflated Sharpe survivor filter. Most candidates rejected by design. |
+
+Run the server: `npm run dev` (stdio). Live data smoke (real Binance): `npx tsx scripts/live-smoke.ts`.
+
+### Status
+- ✅ PR #1-2: portable core + Binance public data layer
+- ✅ PR #3-4: MCP server (stdio) + 8 tools + protocol round-trip test
+- ✅ PR #5: broker port scaffold (v2 contract) + CI
+- Verified: `tsc --noEmit` clean, `vitest` 14/14 (incl. MCP protocol round-trip), live Binance E2E pass.
+- v2 (roadmap): live execution, bring-your-own-keys, Binance + 한국투자(KIS) + 키움 adapters. Note: Kiwoom needs a dedicated adapter (not KIS-compatible).
 
 [stock-autotrade]: ../stock-autotrade
