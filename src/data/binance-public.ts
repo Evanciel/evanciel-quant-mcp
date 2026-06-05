@@ -2,15 +2,19 @@
  * binance-public.ts — Binance 공개 REST 데이터(키 불필요). v1의 유일한 데이터 출처.
  * stock-autotrade/scripts/agent-cli.ts 의 fetchKlines 페이지네이션을 그대로 이식(verbatim).
  */
-export interface Bar { date: string; open: number; high: number; low: number; close: number; volume: number }
+// datetime = 봉 오픈 전체 ISO(시각 포함) → 시간대(time-of-day/session) 조건 평가용. date(YYYY-MM-DD)는 하위호환.
+export interface Bar { date: string; datetime: string; open: number; high: number; low: number; close: number; volume: number }
 
 const MAX_KLINE_PAGES = 60; // 60 × 1000 = 60,000봉 상한(1m≈41일).
 
-export const mapKline = (k: (string | number)[]): Bar => ({
-  date: new Date(Number(k[0])).toISOString().slice(0, 10),
-  open: parseFloat(k[1] as string), high: parseFloat(k[2] as string),
-  low: parseFloat(k[3] as string), close: parseFloat(k[4] as string), volume: parseFloat(k[5] as string),
-});
+export const mapKline = (k: (string | number)[]): Bar => {
+  const iso = new Date(Number(k[0])).toISOString();
+  return {
+    date: iso.slice(0, 10), datetime: iso,
+    open: parseFloat(k[1] as string), high: parseFloat(k[2] as string),
+    low: parseFloat(k[3] as string), close: parseFloat(k[4] as string), volume: parseFloat(k[5] as string),
+  };
+};
 
 export async function fetchKlinePage(symbol: string, interval: string, limit: number, endTime?: number): Promise<(string | number)[][]> {
   const u = new URL("https://api.binance.com/api/v3/klines");

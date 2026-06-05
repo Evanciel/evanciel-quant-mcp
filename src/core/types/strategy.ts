@@ -148,9 +148,10 @@ export interface IndicatorCondition {
 
 export interface TimeCondition {
   type: "time";
-  field: "month" | "quarter" | "dayOfWeek";
+  field: "month" | "quarter" | "dayOfWeek" | "hour" | "minute";
   operator: "eq" | "in" | "between";
   values: number[];
+  tz?: string; // hour/minute를 시장 현지시각으로(예: "Asia/Seoul"). 없으면 UTC.
 }
 
 export interface PerformanceCondition {

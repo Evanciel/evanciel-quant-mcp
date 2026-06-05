@@ -39,6 +39,12 @@ async function fillOrder(bot: store.BotRow, side: "buy" | "sell", qty: number, p
 
 export interface PaperPosition { status: "open"; entryAvg: number; qty: number; openedAt: string; }
 
+/** 폴링 주기(초) → Binance kline 타임프레임. 인트라데이 봉이라야 시간대(hour) 조건이 의미. */
+function secsToInterval(s: number): string {
+  if (s <= 60) return "1m"; if (s <= 180) return "3m"; if (s <= 300) return "5m"; if (s <= 900) return "15m";
+  if (s <= 1800) return "30m"; if (s <= 3600) return "1h"; if (s <= 14400) return "4h"; if (s <= 86400) return "1d"; return "1d";
+}
+
 /** 백테스트 결과의 trade 시퀀스에서 "현재 보유 여부 + 평단/수량"을 도출(net). */
 function derivePosition(trades: { action: string; price: number; quantity: number }[]): { holding: boolean; entryAvg: number; qty: number } {
   let qty = 0, cost = 0;
@@ -56,7 +62,7 @@ export async function tickBot(botId: string): Promise<{ action: "buy" | "sell" |
   const comp = store.getComposite(bot.composite_strategy_id);
   if (!comp) { store.insertLog(botId, "error", "복합전략 없음"); return { action: "hold", detail: "no composite" }; }
 
-  const interval = "1d"; // v1 분석과 동일 기본; 멀티 타임프레임은 후속
+  const interval = secsToInterval(bot.interval_seconds); // 폴링 주기 → kline 타임프레임(인트라데이 자동). 시간대 조건 해금.
   const data = await fetchKlines(bot.symbol, interval, 300);
   if (data.length < 30) { store.setBotPositionState(botId, bot.position_state); return { action: "hold", detail: `데이터 부족(${data.length})` }; }
   const price = data[data.length - 1].close;

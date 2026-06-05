@@ -15,6 +15,7 @@ import { evaluateLadderTick, openPosition, type PositionState, type LadderLevel,
 
 interface OHLCV {
   date: string;
+  datetime?: string; // 전체 ISO(시각 포함). 시간대(hour/minute/session) 조건 평가용. 없으면 date 자정.
   open: number;
   high: number;
   low: number;
@@ -370,13 +371,23 @@ function evaluateNodeCondition(
     }
 
     case "time": {
-      const date = new Date(data[index].date);
+      // datetime(시각 포함) 있으면 사용, 없으면 date(자정). hour/minute는 datetime 필수.
+      const iso = data[index].datetime ?? data[index].date;
+      const date = new Date(iso);
+      const tz = (condition as { tz?: string }).tz;
+      // tz-aware 시/분 추출(예: "Asia/Seoul" → KST 9시). en-GB hour12:false = 00~23.
+      const local = tz
+        ? (() => { const p = new Intl.DateTimeFormat("en-GB", { timeZone: tz, hour: "2-digit", minute: "2-digit", hour12: false }).formatToParts(date);
+                   return { h: Number(p.find((x) => x.type === "hour")?.value ?? "0") % 24, m: Number(p.find((x) => x.type === "minute")?.value ?? "0") }; })()
+        : { h: date.getUTCHours(), m: date.getUTCMinutes() };
       let fieldVal: number;
       switch (condition.field) {
         // UTC 기준(date-only 문자열은 UTC 자정 파싱) → 서버 TZ 무관 재현성 + 라이브와 일치
         case "month": fieldVal = date.getUTCMonth() + 1; break;
         case "quarter": fieldVal = Math.ceil((date.getUTCMonth() + 1) / 3); break;
         case "dayOfWeek": fieldVal = date.getUTCDay(); break;
+        case "hour": fieldVal = local.h; break;       // 시간대 조건(0~23). tz로 시장 현지시각.
+        case "minute": fieldVal = local.m; break;     // 분(0~59).
         default: return false;
       }
       switch (condition.operator) {

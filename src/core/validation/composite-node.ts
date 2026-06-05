@@ -61,9 +61,12 @@ const IndicatorConditionSchema = z.object({
 const TimeConditionSchema = z
   .object({
     type: z.literal("time"),
-    field: z.enum(["month", "quarter", "dayOfWeek"]),
+    // month/quarter/dayOfWeek + 시간대(hour 0~23, minute 0~59). 시각은 인트라데이 봉(datetime) 필요.
+    field: z.enum(["month", "quarter", "dayOfWeek", "hour", "minute"]),
     operator: z.enum(["eq", "in", "between"]),
     values: z.array(z.number()),
+    // 시장 현지시각 변환(예: "Asia/Seoul" → KST 9시). 없으면 UTC. hour/minute에만 의미.
+    tz: z.string().optional(),
   })
   // between은 [최솟값, 최댓값] 2값(min ≤ max) 필수. 과거: 길이 무제한 → between [5]/[]도 통과하면
   // engine.ts(383)는 values[1] undefined 비교(우연히 false), live(route.ts 295)는 length>=2 가드(false)로
