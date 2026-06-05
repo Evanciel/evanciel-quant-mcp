@@ -62,6 +62,7 @@ export const portfolioRiskShape = {
   avgCorr: z.number().optional(),
   maxHeat: z.number().optional(),
   riskBudget: z.number().optional(),
+  tiers: z.array(z.object({ dd: z.number(), mult: z.number() })).optional().describe("MDD 디리스킹 티어 오버라이드(dd=고점대비낙폭 0~1, mult=사이즈배수. 기본 -10%→0.5, -20%→0.0)"),
 };
 
 export const strategyFactoryShape = {
