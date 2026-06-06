@@ -210,11 +210,18 @@ async function tickScanner(bot: store.BotRow, node: ScannerNode): Promise<{ acti
   const evalSet = new Set<string>([...held, ...topSymbols]);
   const wantHold: Record<string, boolean> = {};
   const priceOf: Record<string, number> = {};
+  // then 전략의 표현력 조건 needs를 1회 산출(이벤트=절대캘린더라 1회 빌드, spread/MTF는 심볼별 주입) → 스캐너 then도 backtest≡live.
+  const thenSpreadSyms = collectSpreadSymbols(node.then);
+  const thenMtfNeeds = collectMtfConditions(node.then);
+  const thenCalNames = collectEventCalendars(node.then);
+  const thenEvents = thenCalNames.length ? buildEventCalendars(thenCalNames) : undefined;
   for (const sym of evalSet) {
     const bars = barsOf[sym];
     if (!bars) { wantHold[sym] = false; continue; } // 데이터 없음 → 청산쪽
     priceOf[sym] = bars[bars.length - 1].close;
-    const cfg: BacktestConfig = { strategyId: "scanner", symbol: sym, startDate: bars[0].date, endDate: bars[bars.length - 1].date, initialCapital: perSymCapital, commission: 0.1, timeframe: interval };
+    const auxSeries = thenSpreadSyms.length ? await buildAuxSeries(bars, thenSpreadSyms, interval) : undefined;
+    const mtfSeries = thenMtfNeeds.length ? await buildMtfSeries(bars as unknown as MtfBar[], thenMtfNeeds, (tf, lim) => fetchKlines(sym, tf, lim) as unknown as Promise<MtfBar[]>) : undefined;
+    const cfg: BacktestConfig = { strategyId: "scanner", symbol: sym, startDate: bars[0].date, endDate: bars[bars.length - 1].date, initialCapital: perSymCapital, commission: 0.1, timeframe: interval, auxSeries, mtfSeries, eventCalendars: thenEvents };
     const res = runCompositeBacktest(node.then, bars as unknown as Parameters<typeof runCompositeBacktest>[1], cfg);
     wantHold[sym] = derivePosition(res.trades).holding;
   }
