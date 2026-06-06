@@ -30,24 +30,72 @@ function summarizeStrategy(node: unknown, depth = 0): string {
     return `복합[${mode}]: ${kids.join(" | ")}`;
   }
   if (n.type === "condition") {
-    const cond = n.condition as { field?: string; metric?: string; operator?: string; values?: unknown; value?: unknown };
-    const what = cond?.field || cond?.metric || "조건";
-    return `IF ${what} ${OPS[cond?.operator ?? ""] ?? cond?.operator ?? ""} ${JSON.stringify(cond?.values ?? cond?.value ?? "")} THEN(${summarizeStrategy(n.thenNode, depth + 1)})${n.elseNode ? ` ELSE(${summarizeStrategy(n.elseNode, depth + 1)})` : ""}`;
+    const cond = n.condition as Record<string, unknown>;
+    const what = describeCondition(cond);
+    return `IF ${what} THEN(${summarizeStrategy(n.thenNode, depth + 1)})${n.elseNode ? ` ELSE(${summarizeStrategy(n.elseNode, depth + 1)})` : ""}`;
+  }
+  if (n.type === "scanner") {
+    const rk = (n.rank ?? {}) as { metric?: string; top?: number };
+    const uni = Array.isArray(n.universe) ? (n.universe as string[]).length : 0;
+    const sch = n.schedule ? ` @${((n.schedule as { hour?: number[] }).hour ?? []).join(",")}시` : "";
+    return `스캐너[${rk.metric ?? "?"} 상위${rk.top ?? "?"}/${uni}종목${sch}] → ${summarizeStrategy(n.then, depth + 1)}`;
   }
   return "?";
+}
+
+/** 노드 조건 → 사람이 읽는 한 줄(신규 조건 타입 포함). */
+function describeCondition(c: Record<string, unknown>): string {
+  const op = (o: unknown) => OPS[String(o)] ?? String(o ?? "");
+  switch (c?.type) {
+    case "indicator": {
+      const tf = c.timeframe ? `@${c.timeframe}` : "";
+      const p = (c.params as { period?: number })?.period;
+      return `${String(c.indicator).toUpperCase()}${p ? `(${p})` : ""}${tf} ${op(c.operator)} ${c.value}`;
+    }
+    case "time": return `시간 ${c.field} ${op(c.operator)} ${JSON.stringify(c.values)}${c.tz ? `(${c.tz})` : ""}`;
+    case "regime": return `레짐 ∈ ${JSON.stringify(c.in)}`;
+    case "anchor": return `가격 ${op(c.operator)} ${c.anchor}×${(c.multiplier as number) ?? 1}`;
+    case "spread": return `${c.symbolB} 스프레드(${c.expr}) ${op(c.operator)} ${c.value}`;
+    case "event": {
+      const src = c.calendar ? String(c.calendar) : Array.isArray(c.times) ? `이벤트(${(c.times as unknown[]).length}건)` : "이벤트";
+      return `${src} ±[${(c.hoursBefore as number) ?? 0}h,${(c.hoursAfter as number) ?? 0}h]`;
+    }
+    case "performance": return `성과 ${c.metric}(${c.lookbackDays}일) ${op(c.operator)} ${c.value}`;
+    default: return `${c?.field || c?.metric || "조건"} ${op(c?.operator)} ${JSON.stringify(c?.values ?? c?.value ?? "")}`;
+  }
+}
+
+interface PosView { symbol: string; side: "long" | "short"; entryAvg: number; qty: number }
+
+/** position_state → 포지션 배열. 스캐너는 {심볼:포지션} 맵, 일반봇은 단일 포지션. (스캐너 버그 수정) */
+function extractPositions(ps: unknown, botSymbol: string, market: string, isScanner: boolean): PosView[] {
+  if (!ps || typeof ps !== "object") return [];
+  const open = (p: unknown): p is { entryAvg: number; qty: number } => {
+    const x = p as { status?: string; entryAvg?: number; qty?: number };
+    return !!x && x.status === "open" && !!x.entryAvg && !!x.qty;
+  };
+  if (isScanner) {
+    return Object.entries(ps as Record<string, unknown>).filter(([, p]) => open(p)).map(([sym, p]) => {
+      const x = p as { entryAvg: number; qty: number };
+      return { symbol: sym.toUpperCase(), side: "long" as const, entryAvg: x.entryAvg, qty: x.qty };
+    });
+  }
+  return open(ps) ? [{ symbol: botSymbol.toUpperCase(), side: market === "futures" ? "short" : "long", entryAvg: (ps as { entryAvg: number }).entryAvg, qty: (ps as { qty: number }).qty }] : [];
 }
 
 function snapshot() {
   const bots = store.listBots().map((b) => {
     const comp = store.getComposite(b.composite_strategy_id);
-    const ps = b.position_state as { status?: string; entryAvg?: number; qty?: number } | null;
-    const open = ps && ps.status === "open" && ps.entryAvg && ps.qty;
+    const isScanner = (comp?.root_node as { type?: string })?.type === "scanner";
+    const market = comp?.market ?? "spot";
+    const st = store.tradeStats(b.id);
     return {
       id: b.id, name: b.name, symbol: b.symbol.toUpperCase(), mode: b.mode, status: b.status,
       strategy: comp ? summarizeStrategy(comp.root_node) : "(전략 없음)",
-      market: comp?.market ?? "spot",
-      position: open ? { side: (comp?.market === "futures" ? "short" : "long"), entryAvg: ps!.entryAvg!, qty: ps!.qty! } : null,
-      lastEvaluatedAt: b.last_evaluated_at,
+      market, isScanner,
+      positions: extractPositions(b.position_state, b.symbol, market, isScanner),
+      realizedPnl: +st.realizedPnl.toFixed(2), closes: st.closes, winRate: st.closes > 0 ? +(st.wins / st.closes * 100).toFixed(0) : null,
+      lastEvaluatedAt: b.last_evaluated_at, lastExecutedAt: b.last_executed_at,
       activity: store.recentLogs(b.id, 6).map((l) => ({ ts: l.ts, action: l.action, detail: l.detail })),
     };
   });
@@ -69,6 +117,7 @@ export function startDashboard(port = 7788): Promise<{ url: string; port: number
     const auth = u.searchParams.get("token") === token;
 
     if (u.pathname === "/") { res.writeHead(200, { "content-type": "text/html; charset=utf-8" }); res.end(html(token)); return; }
+    if (u.pathname === "/favicon.ico") { res.writeHead(204).end(); return; } // 토큰 불필요(콘솔 401 소거)
     if (!auth) { res.writeHead(401).end("unauthorized"); return; }
 
     if (u.pathname === "/api/state") {
@@ -116,13 +165,17 @@ h1{font-size:18px;margin:0 0 2px}.sub{color:#8a94a6;font-size:12px;margin-bottom
 .act div{display:flex;gap:6px;padding:1px 0}.act .a{color:#7aa2f7;min-width:42px}
 .st{font-size:10px;padding:1px 5px;border-radius:4px;margin-left:6px}.run{background:rgba(122,162,247,.15);color:#7aa2f7}.stop{background:#222838;color:#8a94a6}
 .short{background:rgba(244,63,94,.15);color:#f43f5e}.live{background:rgba(245,158,11,.18);color:#f59e0b}
+.sc{background:rgba(168,85,247,.18);color:#a855f7}
+.plist{margin-top:8px}.prow{background:#0e1320;border:1px solid #222838;border-radius:8px;padding:8px 10px;margin-top:6px;font-size:12px}
+.psym{font-weight:600;font-size:13px}.prow .g3{margin-top:6px}
+@media(max-width:560px){.wrap{padding:14px}.hdr{grid-template-columns:1fr 1fr}.pos{grid-template-columns:1fr}.v{font-size:20px}}
 </style></head><body><div class="wrap">
 <h1>quant-mcp 라이브 대시보드 <span class="dot"></span></h1>
 <div class="sub">봇별 전략 · 포지션 · 실시간 미실현손익(Binance WS) · 움직임 로그</div>
 <div class="hdr">
-  <div class="card"><div class="k">봇 / 오픈</div><div class="v"><span id="bcnt">0</span><span style="font-size:14px;color:#8a94a6"> / </span><span id="cnt">0</span></div></div>
+  <div class="card"><div class="k">봇 / 오픈 포지션</div><div class="v"><span id="bcnt">0</span><span style="font-size:14px;color:#8a94a6"> / </span><span id="cnt">0</span></div></div>
   <div class="card"><div class="k">미실현 손익 (실시간)</div><div class="v" id="tot">+0.00</div></div>
-  <div class="card"><div class="k">갱신</div><div class="v" id="upd" style="font-size:15px">—</div></div>
+  <div class="card"><div class="k">실현 손익 (누적) <span id="upd" style="font-size:10px;color:#8a94a6;font-weight:400">—</span></div><div class="v" id="rtot">+0.00</div></div>
 </div>
 <div class="pos" id="pos"></div>
 <div class="empty" id="empty">봇이 없습니다. create_bot으로 봇을 만들고 start_bot으로 가동하세요.</div>
@@ -131,29 +184,44 @@ const TOKEN=${JSON.stringify(token)};
 let bots=[];const prices=new Map();let ws=null;
 function fmt(n,d=2){return Number(n).toLocaleString(undefined,{minimumFractionDigits:d,maximumFractionDigits:d})}
 function esc(s){return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))}
-function subscribe(){const syms=[...new Set(bots.filter(b=>b.position).map(b=>b.symbol))];if(ws){try{ws.close()}catch(e){}}
- if(!syms.length)return;const streams=syms.map(s=>s.toLowerCase()+'@ticker').join('/');
+function allSyms(){return [...new Set(bots.flatMap(b=>(b.positions||[]).map(p=>p.symbol)))]}
+let subSig='';
+function subscribe(){const syms=allSyms().sort();const sig=syms.join(',');
+ if(sig===subSig&&ws&&ws.readyState<=1)return; // 심볼 동일 + 연결 살아있으면 재구독 안 함(churn 방지)
+ subSig=sig;if(ws){try{ws.close()}catch(e){}}
+ if(!syms.length){ws=null;return;}const streams=syms.map(s=>s.toLowerCase()+'@ticker').join('/');
  ws=new WebSocket('wss://stream.binance.com:9443/ws/'+streams);
  ws.onmessage=e=>{const d=JSON.parse(e.data);if(d.e==='24hrTicker'){prices.set(d.s,parseFloat(d.c));render()}}}
-function render(){const pos=document.getElementById('pos');let tot=0,n=0;pos.innerHTML='';
- for(const b of bots){const p=b.position;const live=b.mode==='live';
-  let plHtml='<span class="st stop">관망</span>',pos3='';
-  if(p){const cur=prices.get(b.symbol)??p.entryAvg;const sign=p.side==='short'?-1:1;const up=sign*(cur-p.entryAvg)/p.entryAvg*100;const abs=sign*(cur-p.entryAvg)*p.qty;tot+=abs;n++;
-   plHtml='<span class="pl '+(up>=0?'up':'dn')+'">'+(up>=0?'+':'')+fmt(up)+'%</span>';
-   pos3='<div class="g3"><div><div class="k">진입가</div>'+fmt(p.entryAvg)+'</div><div><div class="k">현재가</div>'+fmt(cur)+'</div><div><div class="k">수량</div>'+p.qty+'</div></div>'+
-        '<div class="row" style="margin-top:6px"><div class="k">미실현</div><div class="'+(abs>=0?'up':'dn')+'">'+(abs>=0?'+':'')+fmt(abs)+'</div></div>';}
-  const sideBadge=p?('<span class="badge '+(p.side==='short'?'short':'')+'">'+(p.side==='short'?'숏':'롱')+'</span>'):'';
+function posRow(p){const cur=prices.get(p.symbol)??p.entryAvg;const sign=p.side==='short'?-1:1;
+ const up=sign*(cur-p.entryAvg)/p.entryAvg*100;const abs=sign*(cur-p.entryAvg)*p.qty;
+ const badge='<span class="badge '+(p.side==='short'?'short':'')+'">'+(p.side==='short'?'숏':'롱')+'</span>';
+ const html='<div class="prow"><div class="row"><div><span class="psym">'+esc(p.symbol)+'</span>'+badge+'</div>'+
+   '<span class="pl '+(up>=0?'up':'dn')+'">'+(up>=0?'+':'')+fmt(up)+'%</span></div>'+
+   '<div class="g3"><div><div class="k">진입</div>'+fmt(p.entryAvg)+'</div><div><div class="k">현재</div>'+fmt(cur)+'</div>'+
+   '<div><div class="k">미실현</div><span class="'+(abs>=0?'up':'dn')+'">'+(abs>=0?'+':'')+fmt(abs)+'</span></div></div></div>';
+ return {html,abs};}
+function render(){const pos=document.getElementById('pos');let tot=0,n=0,rtot=0;pos.innerHTML='';
+ for(const b of bots){const live=b.mode==='live';const ps=b.positions||[];rtot+=b.realizedPnl||0;
+  let body='';
+  if(ps.length){for(const p of ps){const r=posRow(p);tot+=r.abs;n++;body+=r.html;}}
+  else body='<div class="prow" style="color:#8a94a6">관망 중 (포지션 없음)</div>';
+  const rp=b.realizedPnl||0;const wr=b.winRate!=null?' · 승률 '+b.winRate+'%':'';
+  const statBadge=b.closes>0?'<span class="st '+(rp>=0?'run':'stop')+'" title="누적 실현손익">실현 '+(rp>=0?'+':'')+fmt(rp)+' ('+b.closes+'회'+wr+')</span>':'';
+  const scBadge=b.isScanner?'<span class="st sc">스캐너</span>':'';
   const el=document.createElement('div');el.className='card';
-  el.innerHTML='<div class="row"><div><span class="sym">'+esc(b.symbol)+'</span>'+sideBadge+
+  el.innerHTML='<div class="row"><div><span class="sym">'+esc(b.name)+'</span>'+scBadge+
     '<span class="st '+(b.status==='running'?'run':'stop')+'">'+(b.status==='running'?'가동중':'중지')+'</span>'+
-    (live?'<span class="st live">실거래</span>':'<span class="st stop">페이퍼</span>')+'</div>'+plHtml+'</div>'+
-   '<div class="row" style="margin-top:2px"><div class="k">'+esc(b.name)+'</div></div>'+
-   '<div class="strat"><b>전략</b> '+esc(b.strategy)+'</div>'+pos3+
+    (live?'<span class="st live">실거래</span>':'<span class="st stop">페이퍼</span>')+'</div>'+
+    (ps.length?'<span class="mode">'+ps.length+'개 포지션</span>':'')+'</div>'+
+   '<div class="strat"><b>전략</b> '+esc(b.strategy)+'</div>'+
+   (statBadge?'<div style="margin-top:6px">'+statBadge+'</div>':'')+
+   '<div class="plist">'+body+'</div>'+
    '<div class="act">'+(b.activity.length?b.activity.map(a=>'<div><span class="a">'+esc(a.action)+'</span><span>'+esc(a.detail||'')+'</span></div>').join(''):'<div>아직 활동 없음</div>')+'</div>';
   pos.appendChild(el)}
  document.getElementById('bcnt').textContent=bots.length;
  document.getElementById('cnt').textContent=n;
  const t=document.getElementById('tot');t.textContent=(tot>=0?'+':'')+fmt(tot);t.className='v '+(tot>=0?'up':'dn');
+ const rt=document.getElementById('rtot');rt.textContent=(rtot>=0?'+':'')+fmt(rtot);rt.className='v '+(rtot>=0?'up':'dn');
  document.getElementById('empty').style.display=bots.length?'none':'block'}
 const es=new EventSource('/events?token='+TOKEN);
 es.onmessage=e=>{const s=JSON.parse(e.data);bots=s.bots;document.getElementById('upd').textContent=new Date(s.updatedAt).toLocaleTimeString();subscribe();render()};

@@ -140,6 +140,11 @@ export function insertTrade(t: Omit<TradeRow, "id" | "ts">): TradeRow | null {
 export function insertLog(bot_id: string, action: string, detail = ""): void {
   db().prepare(`INSERT INTO bot_logs (id,bot_id,ts,action,detail) VALUES (?,?,?,?,?)`).run(randomUUID(), bot_id, now(), action, detail);
 }
+/** 봇의 누적 거래 통계(실현손익=청산 pnl 합, 청산 수, 승리 수). 대시보드 표시용. */
+export function tradeStats(bot_id: string): { realizedPnl: number; closes: number; wins: number } {
+  const r = db().prepare(`SELECT COALESCE(SUM(pnl),0) p, COUNT(*) c, COALESCE(SUM(CASE WHEN pnl>0 THEN 1 ELSE 0 END),0) w FROM trades WHERE bot_id=? AND side='sell'`).get(bot_id) as { p: number; c: number; w: number };
+  return { realizedPnl: r.p, closes: r.c, wins: r.w };
+}
 export function recentTrades(bot_id: string, limit = 50): TradeRow[] {
   return db().prepare(`SELECT * FROM trades WHERE bot_id=? ORDER BY ts DESC LIMIT ?`).all(bot_id, limit) as unknown as TradeRow[];
 }
