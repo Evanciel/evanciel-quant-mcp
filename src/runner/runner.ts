@@ -8,6 +8,7 @@ import { runCompositeBacktest } from "../core/backtest/engine.js";
 import { fetchKlines, buildAuxSeries, type Bar } from "../data/binance-public.js";
 import { collectSpreadSymbols } from "../core/strategy/spread-symbols.js";
 import { collectMtfConditions, buildMtfSeries, type MtfBar } from "../core/strategy/mtf.js";
+import { collectEventCalendars, buildEventCalendars } from "../core/calendar/calendars.js";
 import { rankUniverse, decideScannerActions, type RankBar } from "../core/scanner/rank.js";
 import * as store from "../store/db.js";
 import { getAdapter } from "../brokers/index.js";
@@ -101,8 +102,11 @@ export async function tickBot(botId: string): Promise<{ action: "buy" | "sell" |
   // 멀티타임프레임: timeframe 지정된 지표조건들의 상위TF 봉을 페치·정렬해 주입(라이브에서도 MTF 평가, backtest≡live).
   const mtfNeeds = collectMtfConditions(root);
   const mtfSeries = mtfNeeds.length ? await buildMtfSeries(data as unknown as MtfBar[], mtfNeeds, (tf, lim) => fetchKlines(bot.symbol, tf, lim) as unknown as Promise<MtfBar[]>) : undefined;
+  // 이벤트 조건의 명명 캘린더(FOMC 등) 주입. 인라인 times는 조건에 내장돼 주입 불필요.
+  const calNames = collectEventCalendars(root);
+  const eventCalendars = calNames.length ? buildEventCalendars(calNames) : undefined;
 
-  const cfg: BacktestConfig = { strategyId: "runner", symbol: bot.symbol, startDate: data[0].date, endDate: data[data.length - 1].date, initialCapital: bot.capital, commission: 0.1, timeframe: interval, auxSeries, mtfSeries };
+  const cfg: BacktestConfig = { strategyId: "runner", symbol: bot.symbol, startDate: data[0].date, endDate: data[data.length - 1].date, initialCapital: bot.capital, commission: 0.1, timeframe: interval, auxSeries, mtfSeries, eventCalendars };
   const risk = {
     stopLossPercent: comp.stop_loss_percent, takeProfitPercent: comp.take_profit_percent,
     tpLadder: comp.tp_ladder as never, scaleIn: comp.scale_in as never, pyramid: comp.pyramid as never,

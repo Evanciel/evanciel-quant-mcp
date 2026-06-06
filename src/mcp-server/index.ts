@@ -70,6 +70,12 @@ export function buildServer(): McpServer {
     inputSchema: S.strategyFactoryShape,
   }, guard((a) => H.strategyFactory(a as Parameters<typeof H.strategyFactory>[0])));
 
+  server.registerTool("list_events", {
+    title: "이벤트 캘린더 조회(FOMC 등)",
+    description: `내장 일정 이벤트 캘린더(FOMC 등) 날짜 조회. event 조건(calendar 또는 인라인 times)으로 "FOMC 2시간 전 청산"·"실적 직후 변동성 매매" 같은 전략 구성. 일정 이벤트는 날짜가 사실이라 백테스트 가능. ${DISCLAIMER}`,
+    inputSchema: S.listEventsShape, annotations: { readOnlyHint: true },
+  }, guard((a) => H.listEvents(a as Parameters<typeof H.listEvents>[0])));
+
   server.registerTool("allocate_portfolio", {
     title: "포트폴리오 자본 배분 제안",
     description: `여러 심볼에 자본을 어떻게 나눌지 제안(equal/inverse_vol=리스크패리티 대각근사/vol_target). 실시세 EWMA 변동성 기반. 자동 리밸런스 아닌 '제안'. ${DISCLAIMER}`,
@@ -154,7 +160,7 @@ async function main() {
   const shutdown = () => { runner().shutdown(); process.exit(0); };
   process.on("SIGINT", shutdown); process.on("SIGTERM", shutdown);
   // stdio 서버는 stdout=프로토콜 채널 → 로그는 stderr로.
-  process.stderr.write("quant-mcp server ready (stdio) — 21 tools (8 analysis + scan_universe + allocate_portfolio + 7 bot + 4 live). paper mode. risk filter, not alpha source.\n");
+  process.stderr.write("quant-mcp server ready (stdio) — 22 tools (8 analysis + scan_universe + allocate_portfolio + list_events + 7 bot + 4 live). paper mode. risk filter, not alpha source.\n");
 }
 
 // 직접 실행 시에만 기동(테스트 import 시엔 buildServer만 사용).

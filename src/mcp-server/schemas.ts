@@ -102,6 +102,11 @@ export const createBotShape = {
   broker: z.string().default("binance"),
   intervalSeconds: z.number().int().default(60).describe("평가 주기(최소 15초)"),
 };
+export const listEventsShape = {
+  calendar: z.string().optional().describe("캘린더 이름(예: FOMC). 생략 시 전체 내장 캘린더"),
+  from: z.string().optional().describe("ISO 시작 필터(예: 2025-01-01)"),
+  to: z.string().optional().describe("ISO 끝 필터"),
+};
 export const allocatePortfolioShape = {
   symbols: z.array(z.string()).min(2).describe("배분할 심볼 리스트(최소 2)"),
   method: z.enum(["equal", "inverse_vol", "vol_target"]).default("inverse_vol").describe("equal=동등, inverse_vol=변동성역가중(리스크패리티 대각근사), vol_target=목표변동성"),

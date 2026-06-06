@@ -302,6 +302,7 @@ const MAX_RECURSION_DEPTH = 10;
 export interface EvalContext {
   aux?: Record<string, number[]>;
   mtf?: Record<string, number[]>;
+  events?: Record<string, number[]>; // 명명 캘린더 → 이벤트 epoch(ms) 배열
 }
 
 /** 멀티타임프레임 지표 조건의 안정 키(엔진·주입기 공유). timeframe|indicator|정렬된 params. */
@@ -537,6 +538,23 @@ function evaluateNodeCondition(
       }
     }
 
+    case "event": {
+      // 현재 봉이 어떤 이벤트의 [event-before, event+after] 윈도우에 들면 참. 인라인 times + 명명 캘린더(주입) 병합.
+      const t = Date.parse(data[index].datetime ?? data[index].date);
+      if (!Number.isFinite(t)) return false;
+      const before = (condition.hoursBefore ?? 0) * 3600000;
+      const after = (condition.hoursAfter ?? 0) * 3600000;
+      const hit = (e: number) => Number.isFinite(e) && t >= e - before && t <= e + after;
+      if (Array.isArray(condition.times)) {
+        for (const iso of condition.times) { if (hit(Date.parse(iso))) return true; }
+      }
+      if (condition.calendar) {
+        const cal = ctx?.events?.[condition.calendar];
+        if (cal) for (const e of cal) { if (hit(e)) return true; }
+      }
+      return false; // 윈도우 밖 또는 캘린더 미주입 → false(fail-closed). "이벤트 회피"는 elseNode로.
+    }
+
     case "spread": {
       const b = ctx?.aux?.[condition.symbolB];
       if (!b || b.length !== prices.length) return false; // B 데이터 부재/미정렬 → false(fail-closed, 무거래)
@@ -725,7 +743,7 @@ export function runCompositeBacktest(
 
   for (let i = 0; i < data.length; i++) {
     const price = data[i].close;
-    const activeStrategy = resolveActiveStrategy(rootNode, data, i, prices, volumes, 0, { aux: config.auxSeries, mtf: config.mtfSeries });
+    const activeStrategy = resolveActiveStrategy(rootNode, data, i, prices, volumes, 0, { aux: config.auxSeries, mtf: config.mtfSeries, events: config.eventCalendars });
 
     // 손절/익절 체크: 포지션 보유 중이면 활성 leaf 존재 여부와 무관하게 평가한다.
     // 우선순위 = 활성 leaf SL/TP ?? composite 레벨 SL/TP

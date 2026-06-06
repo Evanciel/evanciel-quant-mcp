@@ -42,7 +42,17 @@ async function main() {
   const mres = await backtest({ tree: mtfTree as never, symbol: "BTCUSDT", interval: "15m", days: 500 });
   console.log(JSON.stringify({ ok: mres.ok, stats: (mres as { stats?: unknown }).stats }, null, 2));
 
-  const pass = scan.ok && sres.ok && rres.ok && mres.ok;
+  console.log("\n== event 조건 backtest (FOMC 회피 — 발표 ±6h엔 매매 안 함) ==");
+  const fomcTree = {
+    id: "cn", type: "condition", name: "FOMC 회피",
+    condition: { type: "event", calendar: "FOMC", hoursBefore: 6, hoursAfter: 6 },
+    thenNode: { id: "flat", type: "leaf", name: "no-trade", strategy: { id: "s0", userId: "u", name: "s0", description: "", symbol: "BTCUSDT", rules: [{ id: "b", action: "buy", conditions: [{ id: "c", indicator: "rsi", params: { period: 14 }, operator: "lt", value: -999 }], quantityPercent: 100 }], isActive: true, createdAt: new Date(), updatedAt: new Date() } }, // FOMC 윈도우엔 매매 0
+    elseNode: { id: "l", type: "leaf", name: "rsi", strategy: { id: "s", userId: "u", name: "s", description: "", symbol: "BTCUSDT", rules: [{ id: "b", action: "buy", conditions: [{ id: "c", indicator: "rsi", params: { period: 14 }, operator: "lt", value: 35 }], quantityPercent: 100 }, { id: "se", action: "sell", conditions: [{ id: "c2", indicator: "rsi", params: { period: 14 }, operator: "gt", value: 65 }], quantityPercent: 100 }], isActive: true, createdAt: new Date(), updatedAt: new Date() } },
+  };
+  const eres = await backtest({ tree: fomcTree as never, symbol: "BTCUSDT", interval: "1h", days: 700 });
+  console.log(JSON.stringify({ ok: eres.ok, stats: (eres as { stats?: unknown }).stats }, null, 2));
+
+  const pass = scan.ok && sres.ok && rres.ok && mres.ok && eres.ok;
   console.log(`\n${pass ? "✅ E2E PASS" : "⚠️ 부분 실패(네트워크/지역차단 가능)"}`);
 }
 main().catch((e) => { console.error("E2E error:", e); process.exit(1); });

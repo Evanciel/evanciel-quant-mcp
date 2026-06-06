@@ -113,6 +113,19 @@ const SpreadConditionSchema = z.object({
   value: z.number().refine(Number.isFinite, { message: "value는 유한수여야 합니다" }),
 });
 
+// 이벤트 조건: calendar 또는 times 중 하나 이상 필수, times는 유효 ISO, hours는 유한·음수 아님.
+const EventConditionSchema = z
+  .object({
+    type: z.literal("event"),
+    calendar: z.string().optional(),
+    times: z.array(z.string()).optional(),
+    hoursBefore: z.number().optional(),
+    hoursAfter: z.number().optional(),
+  })
+  .refine((c) => (typeof c.calendar === "string" && c.calendar.length > 0) || (Array.isArray(c.times) && c.times.length > 0), { message: "event 조건은 calendar 또는 times(비어있지 않음) 중 하나가 필요합니다", path: ["times"] })
+  .refine((c) => !c.times || c.times.every((s) => typeof s === "string" && !Number.isNaN(Date.parse(s))), { message: "times의 각 항목은 유효한 ISO 8601 시각이어야 합니다", path: ["times"] })
+  .refine((c) => [c.hoursBefore, c.hoursAfter].every((h) => h === undefined || (Number.isFinite(h) && h >= 0)), { message: "hoursBefore/hoursAfter는 0 이상의 유한수여야 합니다" });
+
 const NodeConditionSchema = z.discriminatedUnion("type", [
   IndicatorConditionSchema,
   TimeConditionSchema,
@@ -120,6 +133,7 @@ const NodeConditionSchema = z.discriminatedUnion("type", [
   RegimeConditionSchema,
   AnchorConditionSchema,
   SpreadConditionSchema,
+  EventConditionSchema,
 ]);
 
 // ── 재귀 노드 트리 ──

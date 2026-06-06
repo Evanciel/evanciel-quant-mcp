@@ -17,12 +17,13 @@ import { summarizeDerivatives } from "../core/signals/derivatives.js";
 import { validateRootNode } from "../core/validation/composite-node.js";
 import { collectSpreadSymbols } from "../core/strategy/spread-symbols.js";
 import { collectMtfConditions, buildMtfSeries, type MtfBar } from "../core/strategy/mtf.js";
+import { collectEventCalendars, buildEventCalendars, BUILTIN_CALENDARS } from "../core/calendar/calendars.js";
 import { rankUniverse, computeRankMetric, type RankBar, type RankMetric } from "../core/scanner/rank.js";
 import { fetchKlines, fetchDerivatives, buildAuxSeries, type Bar } from "../data/binance-public.js";
 
-const cfg = (d: Bar[], symbol: string, interval: string, auxSeries?: Record<string, number[]>, mtfSeries?: Record<string, number[]>): BacktestConfig => ({
+const cfg = (d: Bar[], symbol: string, interval: string, auxSeries?: Record<string, number[]>, mtfSeries?: Record<string, number[]>, eventCalendars?: Record<string, number[]>): BacktestConfig => ({
   strategyId: "quant-mcp", symbol, startDate: d[0].date, endDate: d[d.length - 1].date,
-  initialCapital: 1_000_000, commission: 0.1, timeframe: interval, auxSeries, mtfSeries,
+  initialCapital: 1_000_000, commission: 0.1, timeframe: interval, auxSeries, mtfSeries, eventCalendars,
 });
 /** auxSeries(전체 data 기준)를 [start,end) 슬라이스에 맞춰 잘라 정렬 유지. 없으면 undefined. */
 const sliceAux = (aux: Record<string, number[]> | undefined, start: number, end: number): Record<string, number[]> | undefined => {
@@ -40,6 +41,24 @@ const statOf = (r: ReturnType<typeof runCompositeBacktest>) => ({
 export function validateStrategy(args: { tree: unknown }) {
   const err = validateRootNode(args.tree);
   return { ok: err === null, valid: err === null, error: err };
+}
+
+// ── list_events: 내장 이벤트 캘린더 조회(읽기전용) ──
+// 에이전트가 FOMC 등 일정 이벤트 날짜를 확인 → event 조건(calendar 또는 인라인 times)으로 전략 구성.
+export function listEvents(args: { calendar?: string; from?: string; to?: string }) {
+  const names = args.calendar ? [args.calendar] : Object.keys(BUILTIN_CALENDARS);
+  const fromMs = args.from ? Date.parse(args.from) : Number.NEGATIVE_INFINITY;
+  const toMs = args.to ? Date.parse(args.to) : Number.POSITIVE_INFINITY;
+  const calendars: Record<string, string[]> = {};
+  for (const n of names) {
+    const iso = BUILTIN_CALENDARS[n];
+    if (!iso) continue;
+    calendars[n] = iso.filter((s) => { const t = Date.parse(s); return Number.isFinite(t) && t >= fromMs && t <= toMs; });
+  }
+  return {
+    ok: true, calendars, available: Object.keys(BUILTIN_CALENDARS),
+    note: "내장 캘린더는 근사 시각(미 동부 오후 2시 발표). 라이브 전 verify 권장. 정밀/기타 이벤트(실적 등)는 event 조건의 인라인 times(정확한 ISO)를 쓰면 외부데이터 0으로 backtest≡live.",
+  };
 }
 
 // ── allocate_portfolio: 다자산 자본 배분 제안(읽기전용) ──
@@ -99,13 +118,16 @@ export async function backtest(args: { tree: StrategyNode; symbol?: string; inte
   const aux = spreadSyms.length ? await buildAuxSeries(data, spreadSyms, interval) : undefined;
   const mtfNeeds = collectMtfConditions(args.tree);
   const mtf = mtfNeeds.length ? await buildMtfSeries(data as unknown as MtfBar[], mtfNeeds, (tf, lim) => fetchKlines(symbol, tf, lim) as unknown as Promise<MtfBar[]>) : undefined;
-  const full = runCompositeBacktest(args.tree, data, cfg(data, symbol, interval, aux, mtf));
+  // 이벤트 캘린더는 절대 epoch 타임스탬프 → 윈도우 슬라이스 불필요(엔진이 각 봉 시각을 전체 이벤트와 대조).
+  const calNames = collectEventCalendars(args.tree);
+  const ev = calNames.length ? buildEventCalendars(calNames) : undefined;
+  const full = runCompositeBacktest(args.tree, data, cfg(data, symbol, interval, aux, mtf, ev));
   let oos: Record<string, unknown> | null = null;
   const split = Math.floor(data.length * 0.7);
   if (split >= 30 && data.length - split >= 20) {
     const train = data.slice(0, split), test = data.slice(split);
-    const tr = runCompositeBacktest(args.tree, train, cfg(train, symbol, interval, sliceAux(aux, 0, split), sliceAux(mtf, 0, split)));
-    const te = runCompositeBacktest(args.tree, test, cfg(test, symbol, interval, sliceAux(aux, split, data.length), sliceAux(mtf, split, data.length)));
+    const tr = runCompositeBacktest(args.tree, train, cfg(train, symbol, interval, sliceAux(aux, 0, split), sliceAux(mtf, 0, split), ev));
+    const te = runCompositeBacktest(args.tree, test, cfg(test, symbol, interval, sliceAux(aux, split, data.length), sliceAux(mtf, split, data.length), ev));
     const m = calcReturnMoments(te.equityCurve);
     const psr = probabilisticSharpe(m.perBarSharpe, m.n, m.skewness, m.kurtosis, 0);
     oos = {

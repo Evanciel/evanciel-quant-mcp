@@ -56,6 +56,7 @@ export interface BacktestConfig {
   timeframe?: string; // 봉 주기(1m~1d). Sharpe 연환산에 사용. 미지정 시 일봉(크립토 365). (mig017 연계)
   auxSeries?: Record<string, number[]>; // 스프레드 조건용: symbolB → 종가 배열(메인 data와 동일 길이·정렬). 러너/백테스트툴이 주입.
   mtfSeries?: Record<string, number[]>; // 멀티타임프레임용: mtfKey → 상위TF 지표값(LTF 정렬·전방채움). 러너/백테스트툴이 주입.
+  eventCalendars?: Record<string, number[]>; // 이벤트 조건용: 명명 캘린더 → 이벤트 epoch(ms) 배열. 러너/백테스트툴이 주입.
 }
 
 export interface BacktestTrade {
@@ -141,7 +142,7 @@ export interface CompositeNode {
   weights?: number[];
 }
 
-export type NodeCondition = IndicatorCondition | TimeCondition | PerformanceCondition | RegimeCondition | AnchorCondition | SpreadCondition;
+export type NodeCondition = IndicatorCondition | TimeCondition | PerformanceCondition | RegimeCondition | AnchorCondition | SpreadCondition | EventCondition;
 
 export interface IndicatorCondition {
   type: "indicator";
@@ -187,6 +188,19 @@ export interface AnchorCondition {
   operator: ConditionOperator;
   multiplier?: number;       // 기준값 배수(기본 1). 예: 1.03 = 시가 대비 +3%
   tz?: string;               // 세션(일자) 경계 기준 시간대. 없으면 UTC.
+}
+
+// 이벤트(캘린더) 조건: 현재 봉이 일정 이벤트(FOMC/CPI/NFP/실적 등)의 [전 N시간, 후 M시간] 윈도우 안이면 참.
+// 일정 이벤트는 날짜가 사전 확정된 사실 → 백테스트 가능. 두 모드:
+//  ① times(인라인 ISO 시각 배열) = 에이전트가 직접 제공(실적일 등). 자기완결적, 외부데이터 0, backtest≡live 완벽.
+//  ② calendar(명명) = 내장/주입 캘린더(예 "FOMC"). 러너/백테스트툴이 ctx.events로 주입.
+// "FOMC 2시간 전 청산"(elseNode에 전략) / "실적 직후 1시간 변동성 매매"(thenNode에 전략) 등.
+export interface EventCondition {
+  type: "event";
+  calendar?: string;     // 명명 캘린더(내장 FOMC 등). times와 병합 평가.
+  times?: string[];      // 인라인 이벤트 시각(ISO 8601). 에이전트 제공.
+  hoursBefore?: number;  // 이벤트 전 N시간부터 윈도우 시작 (기본 0)
+  hoursAfter?: number;   // 이벤트 후 M시간까지 윈도우 유지 (기본 0)
 }
 
 // 스프레드 조건(페어/스탯아브): 봇 심볼(A) vs 다른 심볼(B)의 비율/차이%/z-score를 비교.
