@@ -66,10 +66,12 @@ describe("decideScannerActions", () => {
     expect(d.toClose).toEqual(["A"]);
     expect(d.hold).toEqual([]);
   });
-  it("비활성(상위N 비어있음) → 보유 전부 청산, 신규 0", () => {
-    const d = decideScannerActions([], ["A", "B"], { A: true, B: true });
-    expect(d.toClose.sort()).toEqual(["A", "B"]);
-    expect(d.toOpen).toEqual([]);
+  it("스케줄 비활성(allowOpen/rankExit off) → 보유는 then 신호로만 청산(라이드스루), 신규 0", () => {
+    // 러너가 비활성 시각에 {allowOpen:false, rankExit:false}로 호출 → 강제 플랫 아님
+    const d = decideScannerActions([], ["A", "B"], { A: true, B: false }, { allowOpen: false, rankExit: false });
+    expect(d.toClose).toEqual(["B"]); // B만 then 청산희망 → 청산
+    expect(d.hold).toEqual(["A"]);    // A는 유지(상위N 이탈로 강제청산 안 함)
+    expect(d.toOpen).toEqual([]);     // 신규 진입 0
   });
 });
 
@@ -79,6 +81,12 @@ describe("scanner 노드 검증", () => {
   it("정상 스캐너 통과", () => {
     expect(validateScannerNode(scanner())).toBeNull();
     expect(validateScannerNode(scanner({ schedule: { hour: [9, 10], tz: "Asia/Seoul" } }))).toBeNull();
+  });
+  it("universe>50 거부(페치 폭주 방지)", () => {
+    const big = Array.from({ length: 51 }, (_, i) => `S${i}USDT`);
+    expect(validateScannerNode(scanner({ universe: big }))).not.toBeNull();
+    const ok = Array.from({ length: 50 }, (_, i) => `S${i}USDT`);
+    expect(validateScannerNode(scanner({ universe: ok }))).toBeNull();
   });
   it("universe<2 / 잘못된 metric / then 누락 거부", () => {
     expect(validateScannerNode(scanner({ universe: ["BTCUSDT"] }))).not.toBeNull();

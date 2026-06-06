@@ -87,10 +87,17 @@ export async function tickBot(botId: string): Promise<{ action: "buy" | "sell" |
   };
   const res = runCompositeBacktest(root, data as unknown as Parameters<typeof runCompositeBacktest>[1], cfg, 0, risk);
   const want = derivePosition(res.trades);
+  // ⚠️ 알려진 한계(v1 독립 러너): derivePosition은 엔진의 체결열을 '순(net) 보유 1개'로 축약한다.
+  // tpLadder(부분익절 50/25/25)·scaleIn(물타기)·pyramid(추가매수)처럼 보유 중 수량이 단계적으로 변하는 전략은
+  // 엔진 백테스트에선 중간 부분체결이 발생하지만, 여기선 flat↔holding 이진 전이만 처리해 중간 단계가 라이브에 반영되지 않는다
+  // (넷 보유가 0이 될 때 한 번에 청산). 단순 진입/청산 전략은 backtest≡live지만, 라더/스케일인/피라미딩 봇은 발산.
+  // 페이퍼 전용이라 실자금 위험은 없으나, 라이브 정합을 위해선 러너를 엔진 PositionState로 구동하는 리팩토링 필요(별도 작업).
 
   const cur = bot.position_state as PaperPosition | null;
   const holding = !!cur && cur.status === "open";
-  const idem = (sfx: string) => `${botId}:${data[data.length - 1].date}:${sfx}`;
+  // 멱등키는 봉 오픈시각(datetime, 전체 ISO) 기준 — date(YYYY-MM-DD)면 인트라데이 봇이 하루 1회 매매만 기록되어
+  // 같은 날 재진입이 영구 차단됨(backtest≠live). 스캐너 경로와 동일 granularity.
+  const idem = (sfx: string) => `${botId}:${data[data.length - 1].datetime}:${sfx}`;
 
   // 전이: flat→holding = 페이퍼 진입 / holding→flat = 페이퍼 청산
   if (!holding && want.holding) {
@@ -145,13 +152,15 @@ async function tickScanner(bot: store.BotRow, node: ScannerNode): Promise<{ acti
   const active = inSchedule(nowIso, node.schedule);
 
   const ranked = rankUniverse(entries.map((e) => ({ symbol: e.symbol, bars: e.bars as unknown as RankBar[] })), node.rank.metric, node.rank.top, node.rank.order, node.rank.period);
-  const topSymbols = active ? ranked.map((r) => r.symbol) : []; // 비활성 시각엔 신규 진입 0(보유는 then 신호로만 청산)
+  const topSymbols = ranked.map((r) => r.symbol);
+  // 자본 분할: 실제 보유 가능 슬롯 수(top과 유니버스 크기 중 작은 값)로 나눔 — top>유니버스면 과소배분 방지.
+  const slots = Math.max(1, Math.min(node.rank.top, node.universe.length));
+  const perSymCapital = bot.capital / slots;
 
   // 보유 + 상위N 종목의 then 전략 평가 → 보유 희망 여부
   const evalSet = new Set<string>([...held, ...topSymbols]);
   const wantHold: Record<string, boolean> = {};
   const priceOf: Record<string, number> = {};
-  const perSymCapital = bot.capital / Math.max(1, node.rank.top);
   for (const sym of evalSet) {
     const bars = barsOf[sym];
     if (!bars) { wantHold[sym] = false; continue; } // 데이터 없음 → 청산쪽
@@ -161,7 +170,10 @@ async function tickScanner(bot: store.BotRow, node: ScannerNode): Promise<{ acti
     wantHold[sym] = derivePosition(res.trades).holding;
   }
 
-  const { toOpen, toClose } = decideScannerActions(topSymbols, held, wantHold);
+  // 스케줄 비활성: 신규 진입 0 + 보유는 then 청산 신호로만 정리(강제 플랫 아님 — 라이드스루).
+  const { toOpen, toClose } = decideScannerActions(topSymbols, held, wantHold, { allowOpen: active, rankExit: active });
+  // 멱등키는 각 심볼 자기 봉의 datetime 기준(entries[0] 공유 시각은 선두 심볼 페치 실패 시 비결정적).
+  const barIso = (sym: string) => (barsOf[sym]?.[barsOf[sym].length - 1]?.datetime ?? nowIso);
   let opens = 0, closes = 0;
   // 청산 먼저(자본 회수)
   for (const sym of toClose) {
@@ -169,7 +181,7 @@ async function tickScanner(bot: store.BotRow, node: ScannerNode): Promise<{ acti
     if (!pos) { delete positions[sym]; continue; }
     if (price === undefined) { store.insertLog(bot.id, "gate", `${sym} 청산 보류(가격 없음, 다음 틱 재시도)`); continue; } // 데이터 부재 → 다음 틱
     const realPnl = (price - pos.entryAvg) * pos.qty;
-    const t = store.insertTrade({ bot_id: bot.id, side: "sell", price, qty: pos.qty, pnl: realPnl, is_paper: 1, reason: `스캐너 청산(${sym})`, idempotency_key: `${bot.id}:${sym}:${nowIso}:sell` });
+    const t = store.insertTrade({ bot_id: bot.id, side: "sell", price, qty: pos.qty, pnl: realPnl, is_paper: 1, reason: `스캐너 청산(${sym})`, idempotency_key: `${bot.id}:${sym}:${barIso(sym)}:sell` });
     if (t) { delete positions[sym]; closes++; store.insertLog(bot.id, "sell", `[페이퍼] ${sym} 청산 qty=${pos.qty} @ ${price} pnl=${realPnl.toFixed(2)}`); }
   }
   // 신규 진입
@@ -178,7 +190,7 @@ async function tickScanner(bot: store.BotRow, node: ScannerNode): Promise<{ acti
     if (price === undefined || price <= 0) continue;
     const qty = Math.floor(perSymCapital / price);
     if (qty <= 0) continue;
-    const t = store.insertTrade({ bot_id: bot.id, side: "buy", price, qty, pnl: 0, is_paper: 1, reason: `스캐너 진입(${sym}, ${node.rank.metric} 상위)`, idempotency_key: `${bot.id}:${sym}:${nowIso}:buy` });
+    const t = store.insertTrade({ bot_id: bot.id, side: "buy", price, qty, pnl: 0, is_paper: 1, reason: `스캐너 진입(${sym}, ${node.rank.metric} 상위)`, idempotency_key: `${bot.id}:${sym}:${barIso(sym)}:buy` });
     if (t) { positions[sym] = { status: "open", entryAvg: price, qty, openedAt: new Date().toISOString() }; opens++; store.insertLog(bot.id, "buy", `[페이퍼] ${sym} 진입 qty=${qty} @ ${price}`); }
   }
 

@@ -187,7 +187,7 @@ const ScannerNodeSchema = z.object({
   id: z.string(),
   type: z.literal("scanner"),
   name: z.string(),
-  universe: z.array(z.string().min(1)).min(2), // 최소 2종목(랭킹 의미)
+  universe: z.array(z.string().min(1)).min(2).max(50), // 2~50종목. 상한=틱마다 심볼당 1페치라 폭주/레이트리밋 방지.
   rank: z.object({
     metric: z.enum(["gapPct", "roc", "relVolume", "rangePct"]),
     top: z.number().int().min(1),

@@ -75,28 +75,35 @@ export interface ScannerDecision {
   hold: string[];     // 유지
 }
 
+export interface ScannerDecisionOpts {
+  allowOpen?: boolean;  // 신규 진입 허용(기본 true). 스케줄 비활성 시 false → 진입 0.
+  rankExit?: boolean;   // 상위N 이탈 시 청산(기본 true). 비활성 시 false → 보유는 then 신호로만 청산(라이드스루).
+}
+
 /**
  * 스캐너 1틱 액션 결정(순수). 룩어헤드 없음.
  * @param topSymbols 이번 틱 상위 N 심볼
  * @param held 현재 페이퍼 보유 심볼
  * @param wantHold 심볼별 then 전략의 "보유 희망" 여부(상위 N에 한해 평가). 상위 N 밖은 무관.
+ * @param opts 스케줄 비활성 시 {allowOpen:false, rankExit:false} → 신규 0 + 보유는 then 청산 신호로만 정리(강제 플랫 아님).
  *
- * 규칙: 상위N 이탈 종목은 무조건 청산(자본 회수). 상위N 유지 종목은 then 신호(wantHold)로 진입/청산/유지.
+ * 규칙(활성): 상위N 이탈 종목은 청산(자본 회수). 상위N 유지 종목은 then 신호(wantHold)로 진입/청산/유지.
  */
-export function decideScannerActions(topSymbols: string[], held: string[], wantHold: Record<string, boolean>): ScannerDecision {
+export function decideScannerActions(topSymbols: string[], held: string[], wantHold: Record<string, boolean>, opts: ScannerDecisionOpts = {}): ScannerDecision {
+  const { allowOpen = true, rankExit = true } = opts;
   const topSet = new Set(topSymbols);
   const heldSet = new Set(held);
   const toOpen: string[] = [];
   const toClose: string[] = [];
   const hold: string[] = [];
-  // 보유 종목 처리: 상위N 이탈 or then이 청산 희망 → 청산, 아니면 유지
+  // 보유 종목 처리: (rankExit & 상위N 이탈) or then 청산희망 → 청산, 아니면 유지.
   for (const s of held) {
-    if (!topSet.has(s) || wantHold[s] === false) toClose.push(s);
+    if ((rankExit && !topSet.has(s)) || wantHold[s] === false) toClose.push(s);
     else hold.push(s);
   }
-  // 상위N 신규 진입: 미보유 + then 매수 희망
+  // 상위N 신규 진입: allowOpen + 미보유 + then 매수 희망
   for (const s of topSymbols) {
-    if (!heldSet.has(s) && wantHold[s] === true) toOpen.push(s);
+    if (allowOpen && !heldSet.has(s) && wantHold[s] === true) toOpen.push(s);
   }
   return { toOpen, toClose, hold };
 }
