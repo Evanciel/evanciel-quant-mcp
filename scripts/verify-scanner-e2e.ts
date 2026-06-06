@@ -33,7 +33,16 @@ async function main() {
   const rres = await backtest({ tree: regimeTree as never, symbol: "BTCUSDT", interval: "1d", days: 300 });
   console.log(JSON.stringify({ ok: rres.ok, stats: (rres as { stats?: unknown }).stats }, null, 2));
 
-  const pass = scan.ok && sres.ok && rres.ok;
+  console.log("\n== MTF 조건 backtest (4h 추세 + 15m 진입) ==");
+  const mtfTree = {
+    id: "cn", type: "condition", name: "4h SMA 추세 필터",
+    condition: { type: "indicator", indicator: "sma", params: { period: 50 }, operator: "gt", value: 0, timeframe: "4h" }, // 4h sma>0(항상참, MTF 페치·정렬 경로 검증)
+    thenNode: { id: "l", type: "leaf", name: "rsi", strategy: { id: "s", userId: "u", name: "s", description: "", symbol: "BTCUSDT", rules: [{ id: "b", action: "buy", conditions: [{ id: "c", indicator: "rsi", params: { period: 14 }, operator: "lt", value: 35 }], quantityPercent: 100 }, { id: "se", action: "sell", conditions: [{ id: "c2", indicator: "rsi", params: { period: 14 }, operator: "gt", value: 65 }], quantityPercent: 100 }], isActive: true, createdAt: new Date(), updatedAt: new Date() } },
+  };
+  const mres = await backtest({ tree: mtfTree as never, symbol: "BTCUSDT", interval: "15m", days: 500 });
+  console.log(JSON.stringify({ ok: mres.ok, stats: (mres as { stats?: unknown }).stats }, null, 2));
+
+  const pass = scan.ok && sres.ok && rres.ok && mres.ok;
   console.log(`\n${pass ? "✅ E2E PASS" : "⚠️ 부분 실패(네트워크/지역차단 가능)"}`);
 }
 main().catch((e) => { console.error("E2E error:", e); process.exit(1); });

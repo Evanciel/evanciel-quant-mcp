@@ -15,12 +15,13 @@ import { evaluatePortfolioRisk } from "../core/risk/portfolio.js";
 import { summarizeDerivatives } from "../core/signals/derivatives.js";
 import { validateRootNode } from "../core/validation/composite-node.js";
 import { collectSpreadSymbols } from "../core/strategy/spread-symbols.js";
+import { collectMtfConditions, buildMtfSeries, type MtfBar } from "../core/strategy/mtf.js";
 import { rankUniverse, computeRankMetric, type RankBar, type RankMetric } from "../core/scanner/rank.js";
 import { fetchKlines, fetchDerivatives, buildAuxSeries, type Bar } from "../data/binance-public.js";
 
-const cfg = (d: Bar[], symbol: string, interval: string, auxSeries?: Record<string, number[]>): BacktestConfig => ({
+const cfg = (d: Bar[], symbol: string, interval: string, auxSeries?: Record<string, number[]>, mtfSeries?: Record<string, number[]>): BacktestConfig => ({
   strategyId: "quant-mcp", symbol, startDate: d[0].date, endDate: d[d.length - 1].date,
-  initialCapital: 1_000_000, commission: 0.1, timeframe: interval, auxSeries,
+  initialCapital: 1_000_000, commission: 0.1, timeframe: interval, auxSeries, mtfSeries,
 });
 /** auxSeries(전체 data 기준)를 [start,end) 슬라이스에 맞춰 잘라 정렬 유지. 없으면 undefined. */
 const sliceAux = (aux: Record<string, number[]> | undefined, start: number, end: number): Record<string, number[]> | undefined => {
@@ -76,16 +77,18 @@ export async function backtest(args: { tree: StrategyNode; symbol?: string; inte
   const symbol = args.symbol || "BTCUSDT", interval = args.interval || "1d", days = Number(args.days || 200);
   const data = await fetchKlines(symbol, interval, days);
   if (data.length < 30) return { ok: false, error: `데이터 부족(${data.length}봉)` };
-  // 스프레드 조건이 있으면 상대심볼을 동일 봉에 정렬해 주입(전체→슬라이스). 없으면 undefined(기존 동작).
+  // 스프레드/MTF 조건이 있으면 상대심볼·상위TF를 동일 봉에 정렬해 주입(전체→슬라이스). 없으면 undefined(기존 동작).
   const spreadSyms = collectSpreadSymbols(args.tree);
   const aux = spreadSyms.length ? await buildAuxSeries(data, spreadSyms, interval) : undefined;
-  const full = runCompositeBacktest(args.tree, data, cfg(data, symbol, interval, aux));
+  const mtfNeeds = collectMtfConditions(args.tree);
+  const mtf = mtfNeeds.length ? await buildMtfSeries(data as unknown as MtfBar[], mtfNeeds, (tf, lim) => fetchKlines(symbol, tf, lim) as unknown as Promise<MtfBar[]>) : undefined;
+  const full = runCompositeBacktest(args.tree, data, cfg(data, symbol, interval, aux, mtf));
   let oos: Record<string, unknown> | null = null;
   const split = Math.floor(data.length * 0.7);
   if (split >= 30 && data.length - split >= 20) {
     const train = data.slice(0, split), test = data.slice(split);
-    const tr = runCompositeBacktest(args.tree, train, cfg(train, symbol, interval, sliceAux(aux, 0, split)));
-    const te = runCompositeBacktest(args.tree, test, cfg(test, symbol, interval, sliceAux(aux, split, data.length)));
+    const tr = runCompositeBacktest(args.tree, train, cfg(train, symbol, interval, sliceAux(aux, 0, split), sliceAux(mtf, 0, split)));
+    const te = runCompositeBacktest(args.tree, test, cfg(test, symbol, interval, sliceAux(aux, split, data.length), sliceAux(mtf, split, data.length)));
     const m = calcReturnMoments(te.equityCurve);
     const psr = probabilisticSharpe(m.perBarSharpe, m.n, m.skewness, m.kurtosis, 0);
     oos = {

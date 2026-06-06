@@ -56,6 +56,7 @@ const IndicatorConditionSchema = z.object({
   params: ParamsSchema,
   operator: ConditionOperatorSchema,
   value: z.number(),
+  timeframe: z.string().optional(), // 멀티타임프레임(상위TF 평가). 미지정 시 봇 기본 TF.
 });
 
 const TimeConditionSchema = z

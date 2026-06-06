@@ -295,6 +295,21 @@ export function runBacktest(
  */
 const MAX_RECURSION_DEPTH = 10;
 
+/**
+ * 평가 컨텍스트 — 메인 data 외 추가 시리즈 주입(전부 메인 data와 동일 길이·정렬).
+ * aux: 스프레드용 symbolB 종가. mtf: 멀티타임프레임용 (key=mtfKey) 상위TF 지표값(LTF로 전방채움, 룩어헤드 없음).
+ */
+export interface EvalContext {
+  aux?: Record<string, number[]>;
+  mtf?: Record<string, number[]>;
+}
+
+/** 멀티타임프레임 지표 조건의 안정 키(엔진·주입기 공유). timeframe|indicator|정렬된 params. */
+export function mtfKey(timeframe: string, indicator: string, params: Record<string, number>): string {
+  const p = Object.keys(params).sort().map((k) => `${k}=${params[k]}`).join(",");
+  return `${timeframe}|${indicator}|${p}`;
+}
+
 export function resolveActiveStrategy(
   node: StrategyNode,
   data: OHLCV[],
@@ -302,7 +317,7 @@ export function resolveActiveStrategy(
   prices: number[],
   volumes: number[],
   depth: number = 0,
-  aux?: Record<string, number[]>   // 스프레드 조건용 symbolB 종가 시리즈(config.auxSeries). 재귀 전파.
+  ctx?: EvalContext   // 멀티심볼(spread aux) + 멀티타임프레임(mtf) 주입 컨텍스트. 재귀 전파.
 ): Strategy | null {
   if (depth > MAX_RECURSION_DEPTH) {
     console.error(`[backtest] Max recursion depth (${MAX_RECURSION_DEPTH}) exceeded`);
@@ -314,16 +329,16 @@ export function resolveActiveStrategy(
       return node.strategy;
 
     case "condition": {
-      const met = evaluateNodeCondition(node.condition, data, index, prices, volumes, aux);
-      if (met) return resolveActiveStrategy(node.thenNode, data, index, prices, volumes, depth + 1, aux);
-      if (node.elseNode) return resolveActiveStrategy(node.elseNode, data, index, prices, volumes, depth + 1, aux);
+      const met = evaluateNodeCondition(node.condition, data, index, prices, volumes, ctx);
+      if (met) return resolveActiveStrategy(node.thenNode, data, index, prices, volumes, depth + 1, ctx);
+      if (node.elseNode) return resolveActiveStrategy(node.elseNode, data, index, prices, volumes, depth + 1, ctx);
       return null;
     }
 
     case "composite": {
       if (node.mode === "priority") {
         for (const child of node.children) {
-          const s = resolveActiveStrategy(child, data, index, prices, volumes, depth + 1, aux);
+          const s = resolveActiveStrategy(child, data, index, prices, volumes, depth + 1, ctx);
           if (s) return s;
         }
         return null;
@@ -337,7 +352,7 @@ export function resolveActiveStrategy(
       for (let i = 1; i < node.children.length; i++) {
         if ((weights[i] ?? 0) > (weights[maxIdx] ?? 0)) maxIdx = i;
       }
-      return resolveActiveStrategy(node.children[maxIdx], data, index, prices, volumes, depth + 1, aux);
+      return resolveActiveStrategy(node.children[maxIdx], data, index, prices, volumes, depth + 1, ctx);
     }
 
     default:
@@ -416,13 +431,21 @@ function evaluateNodeCondition(
   index: number,
   prices: number[],
   volumes: number[],
-  aux?: Record<string, number[]>
+  ctx?: EvalContext
 ): boolean {
   const highs = data.map((d) => d.high);
   const lows = data.map((d) => d.low);
   switch (condition.type) {
     case "indicator": {
-      const values = computeIndicator(prices, volumes, condition.indicator, condition.params, highs, lows);
+      // 멀티타임프레임: timeframe 지정 시 상위TF 지표값(LTF로 전방채움된 mtf 시리즈) 사용. 미주입 시 fail-closed.
+      let values: number[];
+      if (condition.timeframe) {
+        const series = ctx?.mtf?.[mtfKey(condition.timeframe, condition.indicator, condition.params)];
+        if (!series || series.length !== prices.length) return false; // HTF 미주입/미정렬 → 무거래
+        values = series;
+      } else {
+        values = computeIndicator(prices, volumes, condition.indicator, condition.params, highs, lows);
+      }
       const val = values[index];
       if (isNaN(val)) return false;
       switch (condition.operator) {
@@ -515,7 +538,7 @@ function evaluateNodeCondition(
     }
 
     case "spread": {
-      const b = aux?.[condition.symbolB];
+      const b = ctx?.aux?.[condition.symbolB];
       if (!b || b.length !== prices.length) return false; // B 데이터 부재/미정렬 → false(fail-closed, 무거래)
       const lb = condition.lookback ?? 20;
       const sv = spreadValue(prices, b, index, condition.expr, lb);
@@ -702,7 +725,7 @@ export function runCompositeBacktest(
 
   for (let i = 0; i < data.length; i++) {
     const price = data[i].close;
-    const activeStrategy = resolveActiveStrategy(rootNode, data, i, prices, volumes, 0, config.auxSeries);
+    const activeStrategy = resolveActiveStrategy(rootNode, data, i, prices, volumes, 0, { aux: config.auxSeries, mtf: config.mtfSeries });
 
     // 손절/익절 체크: 포지션 보유 중이면 활성 leaf 존재 여부와 무관하게 평가한다.
     // 우선순위 = 활성 leaf SL/TP ?? composite 레벨 SL/TP
