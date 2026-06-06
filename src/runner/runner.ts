@@ -20,7 +20,7 @@ import { liveGate, checkLimits, audit, type Broker } from "../brokers/safety.js"
 async function fillOrder(bot: store.BotRow, side: "buy" | "sell", qty: number, price: number, symbol: string = bot.symbol): Promise<{ live: boolean; price: number; orderId?: string; note: string }> {
   if (bot.mode !== "live") return { live: false, price, note: "페이퍼" };
   const broker = (["binance", "kis", "kiwoom"].includes(bot.broker) ? bot.broker : "binance") as Broker;
-  const market = (symbol.endsWith("USDT") ? "spot" : "spot") as "spot" | "futures";
+  const market = "spot" as "spot" | "futures"; // quant-mcp 러너는 현물만(선물 라이브는 stock-autotrade). 향후 선물 지원 시 심볼/설정 기반 분기.
   const gate = liveGate(broker, market);
   if (!gate.allowed) { store.insertLog(bot.id, "gate", `라이브 차단(${gate.reason}) → 페이퍼`); return { live: false, price, note: "게이트 차단→페이퍼" }; }
   // 하드리밋: 노셔널캡 + 심볼 allowlist + 일일손실 서킷(스캐너 멀티심볼도 심볼별로 통과해야 실주문).

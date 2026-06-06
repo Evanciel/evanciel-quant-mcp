@@ -48,8 +48,14 @@ export function alignMtfSeries(ltfBars: MtfBar[], htfBars: MtfBar[], indicator: 
   const htfLows = htfBars.map((b) => b.low);
   const htfVals = computeIndicator(htfCloses, htfVolumes, indicator, params, htfHighs, htfLows);
   const htfOpenMs = htfBars.map((b) => Date.parse(b.datetime));
-  // HTF 주기(ms): 연속 봉 오픈시각 차의 최빈/첫값. 1봉뿐이면 안전하게 큰 값(다음 봉 없음=마지막봉은 close 추정 불가→그 봉 close 시각 모름).
-  const htfMs = htfBars.length >= 2 ? (htfOpenMs[1] - htfOpenMs[0]) : Number.POSITIVE_INFINITY;
+  // HTF 주기(ms): 연속 봉 오픈시각 차의 '중앙값'(단일 이상 간격에 강건). 첫 간격만 쓰면 첫 봉이 비정상적으로
+  // 짧을 때 htfMs가 과소추정→아직 안 닫힌 봉을 닫힌 것으로 오인(룩어헤드). 중앙값은 그 위험을 막는다.
+  let htfMs = Number.POSITIVE_INFINITY;
+  if (htfBars.length >= 2) {
+    const deltas: number[] = [];
+    for (let k = 1; k < htfOpenMs.length; k++) { const d = htfOpenMs[k] - htfOpenMs[k - 1]; if (d > 0) deltas.push(d); }
+    if (deltas.length) { deltas.sort((a, b) => a - b); htfMs = deltas[Math.floor(deltas.length / 2)]; }
+  }
   const out = new Array<number>(n);
   let j = -1; // 현재까지 '닫힌' 가장 최근 HTF 인덱스
   for (let i = 0; i < n; i++) {
