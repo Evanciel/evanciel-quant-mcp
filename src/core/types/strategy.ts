@@ -1,3 +1,5 @@
+import type { RegimeLabel, RegimeParams } from "../backtest/regime";
+
 export type IndicatorType = "sma" | "ema" | "rsi" | "macd" | "bollinger" | "volume" | "stochastic" | "atr" | "obv" | "williams_r" | "stochastic_rsi" | "cci" | "adx" | "supertrend" | "vwap" | "mfi" | "parabolic_sar" | "ichimoku" | "roc" | "donchian" | "aroon";
 export type ConditionOperator = "gt" | "lt" | "gte" | "lte" | "cross_above" | "cross_below";
 export type ActionType = "buy" | "sell";
@@ -51,6 +53,7 @@ export interface BacktestConfig {
   commission: number; // %
   slippage?: number; // % (기본 0.05 — 시장가 체결 시 가격 변동)
   timeframe?: string; // 봉 주기(1m~1d). Sharpe 연환산에 사용. 미지정 시 일봉(크립토 365). (mig017 연계)
+  auxSeries?: Record<string, number[]>; // 스프레드 조건용: symbolB → 종가 배열(메인 data와 동일 길이·정렬). 러너/백테스트툴이 주입.
 }
 
 export interface BacktestTrade {
@@ -136,7 +139,7 @@ export interface CompositeNode {
   weights?: number[];
 }
 
-export type NodeCondition = IndicatorCondition | TimeCondition | PerformanceCondition;
+export type NodeCondition = IndicatorCondition | TimeCondition | PerformanceCondition | RegimeCondition | AnchorCondition | SpreadCondition;
 
 export interface IndicatorCondition {
   type: "indicator";
@@ -158,6 +161,39 @@ export interface PerformanceCondition {
   type: "performance";
   metric: "returnPercent" | "drawdown" | "winRate";
   lookbackDays: number;
+  operator: ConditionOperator;
+  value: number;
+}
+
+// 레짐 조건: 현재 봉까지의 시장 레짐(추세/횡보/고변동)이 화이트리스트에 들면 참.
+// computeRegime 재사용(순수함수 → backtest≡live). 진입 알파 아니라 '레짐 게이팅'(노출 스위칭).
+export interface RegimeCondition {
+  type: "regime";
+  in: RegimeLabel[];        // 허용 레짐: ["trend_up","high_vol"] 등 (최소 1개)
+  params?: RegimeParams;    // ADX/ER/ATR 임계값 오버라이드(옵션). 미지정 시 computeRegime 기본값.
+}
+
+// 세션 앵커 조건: 현재가(또는 지표)를 '세션 기준값'(시가/전일종가/세션고저/시가기준 VWAP)과 비교.
+// 갭앤고("현재가 > 당일시가×1.03"=갭3%)·오프닝레인지 돌파 표현. 인트라데이 봉(datetime) 필요.
+// 세션 경계 = tz 기준 자정(크립토 24/7도 UTC 일자로 분할). tz 미지정 시 UTC.
+export type AnchorRef = "dayOpen" | "prevClose" | "sessionHigh" | "sessionLow" | "vwapFromOpen";
+export interface AnchorCondition {
+  type: "anchor";
+  source?: "price";          // 비교 좌변. 현재 'price'(종가)만 지원. 기본 price.
+  anchor: AnchorRef;         // 비교 우변 기준값(세션에서 동적 산출)
+  operator: ConditionOperator;
+  multiplier?: number;       // 기준값 배수(기본 1). 예: 1.03 = 시가 대비 +3%
+  tz?: string;               // 세션(일자) 경계 기준 시간대. 없으면 UTC.
+}
+
+// 스프레드 조건(페어/스탯아브): 봇 심볼(A) vs 다른 심볼(B)의 비율/차이%/z-score를 비교.
+// 멀티심볼 데이터 필요 — 러너/백테스트 툴이 symbolB 종가를 동일 봉에 정렬해 주입(auxSeries).
+// B 데이터 부재 시 false(fail-closed, 무거래).
+export interface SpreadCondition {
+  type: "spread";
+  symbolB: string;           // 상대 심볼(A=봇 심볼). 예: A=ETHUSDT, B=BTCUSDT
+  expr: "ratio" | "diffPct" | "zscore";  // ratio=A/B, diffPct=(A/B-1)*100, zscore=정규화 스프레드
+  lookback?: number;         // zscore 롤링 윈도우(기본 20, 정수≥2). ratio/diffPct는 무시.
   operator: ConditionOperator;
   value: number;
 }

@@ -54,6 +54,25 @@ export async function fetchKlines(symbol: string, interval: string, limit: numbe
   return sorted.slice(-want).map(mapKline);
 }
 
+/**
+ * 스프레드 조건용 auxSeries 구축: 각 symbolB를 mainBars와 동일 interval로 페치 후 봉 오픈시각(datetime)으로 정렬.
+ * 정렬 키가 없으면 NaN(엔진이 fail-closed로 무거래 처리). 페치 실패 시도 전부 NaN. mainBars와 길이 동일 보장.
+ */
+export async function buildAuxSeries(mainBars: Bar[], symbols: string[], interval: string): Promise<Record<string, number[]>> {
+  const aux: Record<string, number[]> = {};
+  for (const sym of symbols) {
+    try {
+      const bars = await fetchKlines(sym, interval, Math.max(20, mainBars.length));
+      const byTime = new Map<string, number>();
+      for (const b of bars) byTime.set(b.datetime, b.close);
+      aux[sym] = mainBars.map((b) => { const v = byTime.get(b.datetime); return typeof v === "number" ? v : NaN; });
+    } catch {
+      aux[sym] = mainBars.map(() => NaN); // 페치 실패 → 전부 NaN → 무거래
+    }
+  }
+  return aux;
+}
+
 /** summarizeDerivatives 입력 형태(core/signals/derivatives.ts 와 구조 일치). 데이터 레이어는 core를 import하지 않음. */
 export interface DerivativesInput {
   symbol: string;

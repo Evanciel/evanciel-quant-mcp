@@ -85,10 +85,40 @@ const PerformanceConditionSchema = z.object({
   value: z.number(),
 });
 
+// 레짐 조건: 허용 레짐 화이트리스트(최소 1). params는 computeRegime 임계값 오버라이드(유한수만).
+const RegimeConditionSchema = z.object({
+  type: z.literal("regime"),
+  in: z.array(z.enum(["trend_up", "trend_down", "range", "high_vol"])).min(1),
+  params: z.record(z.string(), z.number().refine(Number.isFinite, { message: "params 값은 유한수여야 합니다" })).optional(),
+});
+
+// 세션 앵커 조건: price를 세션 기준값×multiplier와 비교. multiplier 유한(0/음수 허용 안 함 — 가격 배수).
+const AnchorConditionSchema = z.object({
+  type: z.literal("anchor"),
+  source: z.literal("price").optional(),
+  anchor: z.enum(["dayOpen", "prevClose", "sessionHigh", "sessionLow", "vwapFromOpen"]),
+  operator: ConditionOperatorSchema,
+  multiplier: z.number().refine((n) => Number.isFinite(n) && n > 0, { message: "multiplier는 0보다 큰 유한수여야 합니다" }).optional(),
+  tz: z.string().optional(),
+});
+
+// 스프레드 조건(페어): symbolB 필수, zscore는 lookback≥2 정수. backtest/live가 같은 윈도우라야 발산 없음.
+const SpreadConditionSchema = z.object({
+  type: z.literal("spread"),
+  symbolB: z.string().min(1),
+  expr: z.enum(["ratio", "diffPct", "zscore"]),
+  lookback: z.number().int().min(2).optional(),
+  operator: ConditionOperatorSchema,
+  value: z.number().refine(Number.isFinite, { message: "value는 유한수여야 합니다" }),
+});
+
 const NodeConditionSchema = z.discriminatedUnion("type", [
   IndicatorConditionSchema,
   TimeConditionSchema,
   PerformanceConditionSchema,
+  RegimeConditionSchema,
+  AnchorConditionSchema,
+  SpreadConditionSchema,
 ]);
 
 // ── 재귀 노드 트리 ──

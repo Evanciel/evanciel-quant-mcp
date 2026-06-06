@@ -10,6 +10,7 @@ import type {
 } from "../types/strategy";
 import { computeIndicator } from "./indicators";
 import { calcMaxDrawdown, calcSharpeRatio, calcTradeStats } from "./metrics";
+import { computeRegime } from "./regime";
 // 다단계 부분익절 라더 — 라이브(bot-runner)와 "동일 호출"로 backtest≡live (Design Ref: tp-ladder §2 Option C).
 import { evaluateLadderTick, openPosition, type PositionState, type LadderLevel, type ScaleInConfig, type PyramidConfig } from "../position/ladder";
 
@@ -300,7 +301,8 @@ export function resolveActiveStrategy(
   index: number,
   prices: number[],
   volumes: number[],
-  depth: number = 0
+  depth: number = 0,
+  aux?: Record<string, number[]>   // 스프레드 조건용 symbolB 종가 시리즈(config.auxSeries). 재귀 전파.
 ): Strategy | null {
   if (depth > MAX_RECURSION_DEPTH) {
     console.error(`[backtest] Max recursion depth (${MAX_RECURSION_DEPTH}) exceeded`);
@@ -312,16 +314,16 @@ export function resolveActiveStrategy(
       return node.strategy;
 
     case "condition": {
-      const met = evaluateNodeCondition(node.condition, data, index, prices, volumes);
-      if (met) return resolveActiveStrategy(node.thenNode, data, index, prices, volumes, depth + 1);
-      if (node.elseNode) return resolveActiveStrategy(node.elseNode, data, index, prices, volumes, depth + 1);
+      const met = evaluateNodeCondition(node.condition, data, index, prices, volumes, aux);
+      if (met) return resolveActiveStrategy(node.thenNode, data, index, prices, volumes, depth + 1, aux);
+      if (node.elseNode) return resolveActiveStrategy(node.elseNode, data, index, prices, volumes, depth + 1, aux);
       return null;
     }
 
     case "composite": {
       if (node.mode === "priority") {
         for (const child of node.children) {
-          const s = resolveActiveStrategy(child, data, index, prices, volumes, depth + 1);
+          const s = resolveActiveStrategy(child, data, index, prices, volumes, depth + 1, aux);
           if (s) return s;
         }
         return null;
@@ -335,7 +337,7 @@ export function resolveActiveStrategy(
       for (let i = 1; i < node.children.length; i++) {
         if ((weights[i] ?? 0) > (weights[maxIdx] ?? 0)) maxIdx = i;
       }
-      return resolveActiveStrategy(node.children[maxIdx], data, index, prices, volumes, depth + 1);
+      return resolveActiveStrategy(node.children[maxIdx], data, index, prices, volumes, depth + 1, aux);
     }
 
     default:
@@ -343,12 +345,78 @@ export function resolveActiveStrategy(
   }
 }
 
+// ── 세션 앵커 헬퍼 (순수함수) ──
+
+/** ISO 타임스탬프의 '세션 일자' 키(YYYY-MM-DD). tz 지정 시 시장 현지일자, 없으면 UTC 일자. */
+function localDayKey(iso: string, tz?: string): string {
+  const d = new Date(iso);
+  if (!tz) return d.toISOString().slice(0, 10);
+  // en-CA = YYYY-MM-DD 포맷
+  return new Intl.DateTimeFormat("en-CA", { timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit" }).format(d);
+}
+
+/**
+ * 세션 기준값 산출(룩어헤드 없음: idx까지의 당일 봉만 사용). 산출 불가(전일종가 없음/거래량0 VWAP)면 null.
+ * dayOpen=당일 첫봉 시가, prevClose=전일 마지막봉 종가, sessionHigh/Low=당일 고저, vwapFromOpen=당일 시가기준 VWAP(전형가격).
+ */
+function anchorValue(data: OHLCV[], idx: number, ref: string, tz?: string): number | null {
+  const keyAt = (j: number) => localDayKey(data[j].datetime ?? data[j].date, tz);
+  const today = keyAt(idx);
+  let start = idx;
+  while (start > 0 && keyAt(start - 1) === today) start--; // 당일 첫봉 인덱스
+  switch (ref) {
+    case "dayOpen":
+      return data[start].open;
+    case "prevClose":
+      return start === 0 ? null : data[start - 1].close; // 윈도우에 전일 없음 → null(fail-closed)
+    case "sessionHigh": {
+      let h = -Infinity;
+      for (let j = start; j <= idx; j++) h = Math.max(h, data[j].high);
+      return Number.isFinite(h) ? h : null;
+    }
+    case "sessionLow": {
+      let l = Infinity;
+      for (let j = start; j <= idx; j++) l = Math.min(l, data[j].low);
+      return Number.isFinite(l) ? l : null;
+    }
+    case "vwapFromOpen": {
+      let pv = 0, v = 0;
+      for (let j = start; j <= idx; j++) { const tp = (data[j].high + data[j].low + data[j].close) / 3; pv += tp * data[j].volume; v += data[j].volume; }
+      return v > 0 ? pv / v : null;
+    }
+    default:
+      return null;
+  }
+}
+
+/** 스프레드(페어) 값: a=A종가, b=B종가. ratio=A/B, diffPct=(A/B−1)×100, zscore=lookback 윈도우 표준화. 산출 불가면 null. */
+function spreadValue(a: number[], b: number[], idx: number, expr: string, lookback: number): number | null {
+  const av = a[idx], bv = b[idx];
+  if (!Number.isFinite(av) || !Number.isFinite(bv) || bv === 0) return null;
+  const ratio = av / bv;
+  if (expr === "ratio") return ratio;
+  if (expr === "diffPct") return (ratio - 1) * 100;
+  // zscore: 최근 lookback개 비율의 평균/표준편차로 현재 비율 표준화
+  if (idx < lookback - 1) return null;
+  const win: number[] = [];
+  for (let j = idx - lookback + 1; j <= idx; j++) {
+    if (!Number.isFinite(a[j]) || !Number.isFinite(b[j]) || b[j] === 0) return null;
+    win.push(a[j] / b[j]);
+  }
+  const mean = win.reduce((x, y) => x + y, 0) / win.length;
+  const variance = win.reduce((x, y) => x + (y - mean) * (y - mean), 0) / win.length;
+  const sd = Math.sqrt(variance);
+  if (sd === 0) return null;
+  return (ratio - mean) / sd;
+}
+
 function evaluateNodeCondition(
   condition: NodeCondition,
   data: OHLCV[],
   index: number,
   prices: number[],
-  volumes: number[]
+  volumes: number[],
+  aux?: Record<string, number[]>
 ): boolean {
   const highs = data.map((d) => d.high);
   const lows = data.map((d) => d.low);
@@ -408,6 +476,67 @@ function evaluateNodeCondition(
         case "lt": return metricValue < condition.value;
         case "gte": return metricValue >= condition.value;
         case "lte": return metricValue <= condition.value;
+        default: return false;
+      }
+    }
+
+    case "regime": {
+      // 현재 봉(index)까지의 데이터로 레짐 판정 — 룩어헤드 없음(computeRegime은 배열 마지막 원소 기준).
+      const upTo = index + 1;
+      const r = computeRegime(prices.slice(0, upTo), highs.slice(0, upTo), lows.slice(0, upTo), condition.params);
+      return condition.in.includes(r.label);
+    }
+
+    case "anchor": {
+      const m = condition.multiplier ?? 1;
+      const ref = anchorValue(data, index, condition.anchor, condition.tz);
+      if (ref === null || !Number.isFinite(ref)) return false; // 기준값 산출 불가 → false(fail-closed)
+      const target = ref * m;
+      const cur = prices[index];
+      switch (condition.operator) {
+        case "gt": return cur > target;
+        case "lt": return cur < target;
+        case "gte": return cur >= target;
+        case "lte": return cur <= target;
+        case "cross_above": {
+          if (index === 0) return false;
+          const refPrev = anchorValue(data, index - 1, condition.anchor, condition.tz);
+          if (refPrev === null || !Number.isFinite(refPrev)) return false;
+          return prices[index - 1] <= refPrev * m && cur > target;
+        }
+        case "cross_below": {
+          if (index === 0) return false;
+          const refPrev = anchorValue(data, index - 1, condition.anchor, condition.tz);
+          if (refPrev === null || !Number.isFinite(refPrev)) return false;
+          return prices[index - 1] >= refPrev * m && cur < target;
+        }
+        default: return false;
+      }
+    }
+
+    case "spread": {
+      const b = aux?.[condition.symbolB];
+      if (!b || b.length !== prices.length) return false; // B 데이터 부재/미정렬 → false(fail-closed, 무거래)
+      const lb = condition.lookback ?? 20;
+      const sv = spreadValue(prices, b, index, condition.expr, lb);
+      if (sv === null) return false;
+      switch (condition.operator) {
+        case "gt": return sv > condition.value;
+        case "lt": return sv < condition.value;
+        case "gte": return sv >= condition.value;
+        case "lte": return sv <= condition.value;
+        case "cross_above": {
+          if (index === 0) return false;
+          const prev = spreadValue(prices, b, index - 1, condition.expr, lb);
+          if (prev === null) return false;
+          return prev <= condition.value && sv > condition.value;
+        }
+        case "cross_below": {
+          if (index === 0) return false;
+          const prev = spreadValue(prices, b, index - 1, condition.expr, lb);
+          if (prev === null) return false;
+          return prev >= condition.value && sv < condition.value;
+        }
         default: return false;
       }
     }
@@ -573,7 +702,7 @@ export function runCompositeBacktest(
 
   for (let i = 0; i < data.length; i++) {
     const price = data[i].close;
-    const activeStrategy = resolveActiveStrategy(rootNode, data, i, prices, volumes);
+    const activeStrategy = resolveActiveStrategy(rootNode, data, i, prices, volumes, 0, config.auxSeries);
 
     // 손절/익절 체크: 포지션 보유 중이면 활성 leaf 존재 여부와 무관하게 평가한다.
     // 우선순위 = 활성 leaf SL/TP ?? composite 레벨 SL/TP

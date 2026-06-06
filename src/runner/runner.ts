@@ -5,7 +5,8 @@
  */
 import type { StrategyNode, BacktestConfig } from "../core/types/strategy.js";
 import { runCompositeBacktest } from "../core/backtest/engine.js";
-import { fetchKlines, type Bar } from "../data/binance-public.js";
+import { fetchKlines, buildAuxSeries, type Bar } from "../data/binance-public.js";
+import { collectSpreadSymbols } from "../core/strategy/spread-symbols.js";
 import * as store from "../store/db.js";
 import { getAdapter } from "../brokers/index.js";
 import { liveGate, checkLimits, audit, type Broker } from "../brokers/safety.js";
@@ -67,13 +68,18 @@ export async function tickBot(botId: string): Promise<{ action: "buy" | "sell" |
   if (data.length < 30) { store.setBotPositionState(botId, bot.position_state); return { action: "hold", detail: `데이터 부족(${data.length})` }; }
   const price = data[data.length - 1].close;
 
-  const cfg: BacktestConfig = { strategyId: "runner", symbol: bot.symbol, startDate: data[0].date, endDate: data[data.length - 1].date, initialCapital: bot.capital, commission: 0.1, timeframe: interval };
+  // 스프레드 조건이 있으면 상대심볼(symbolB)을 동일 봉에 정렬해 주입 → 라이브에서도 spread 평가(backtest≡live).
+  const root = comp.root_node as StrategyNode;
+  const spreadSyms = collectSpreadSymbols(root);
+  const auxSeries = spreadSyms.length ? await buildAuxSeries(data, spreadSyms, interval) : undefined;
+
+  const cfg: BacktestConfig = { strategyId: "runner", symbol: bot.symbol, startDate: data[0].date, endDate: data[data.length - 1].date, initialCapital: bot.capital, commission: 0.1, timeframe: interval, auxSeries };
   const risk = {
     stopLossPercent: comp.stop_loss_percent, takeProfitPercent: comp.take_profit_percent,
     tpLadder: comp.tp_ladder as never, scaleIn: comp.scale_in as never, pyramid: comp.pyramid as never,
     trailingStopPercent: comp.trailing_stop_percent,
   };
-  const res = runCompositeBacktest(comp.root_node as StrategyNode, data as unknown as Parameters<typeof runCompositeBacktest>[1], cfg, 0, risk);
+  const res = runCompositeBacktest(root, data as unknown as Parameters<typeof runCompositeBacktest>[1], cfg, 0, risk);
   const want = derivePosition(res.trades);
 
   const cur = bot.position_state as PaperPosition | null;
