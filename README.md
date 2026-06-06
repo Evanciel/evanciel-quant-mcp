@@ -1,6 +1,6 @@
 <div align="center">
 
-# quant-mcp
+<img src="docs/banner.svg" alt="quant-mcp" width="100%"/>
 
 **A composable backtesting, risk, and paper-trading engine for AI agents — over the Model Context Protocol.**
 
@@ -12,6 +12,8 @@ Let any MCP agent (Claude, Cursor, …) design a trading strategy as a validated
 [![MCP](https://img.shields.io/badge/MCP-stdio-blue.svg)](https://modelcontextprotocol.io)
 [![tests](https://img.shields.io/badge/tests-95%20passing-brightgreen.svg)](test)
 [![keys](https://img.shields.io/badge/data-keyless%20(Binance%20public)-orange.svg)](src/data/binance-public.ts)
+
+**English** · [한국어](README.ko.md)
 
 </div>
 
@@ -206,6 +208,12 @@ Deploy with `save_strategy({ tree, stopLossPercent: 5, tpLadder: [{pct:5,sellPct
 `save_strategy` → `create_bot` → `start_bot` runs a bot that re-evaluates on each closed bar using the **same backtest engine** (so live mirrors backtest, including ladder partial fills). State lives in a local `node:sqlite` store — no account, no cloud.
 
 `open_dashboard` serves a real-time HTML dashboard at `127.0.0.1` (random per-launch token, read-only, Binance public WS for live unrealized PnL). It's built for **non-experts**: plain-language strategy summaries ("only buys in an uptrend when oversold"), 🟢 winning / 🔴 losing / ⚪ idle pills, realized vs unrealized PnL, and multi-symbol scanner positions — with a "details" toggle for the raw strategy DSL.
+
+<div align="center">
+  <img src="docs/img/dashboard.png" alt="quant-mcp dashboard" width="80%"/>
+  <br/>
+  <sub>Plain-language live dashboard — strategy in human terms, win/loss pills, realized & unrealized PnL, multi-symbol scanner positions. (UI shown in Korean.)</sub>
+</div>
 
 ---
 
