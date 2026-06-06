@@ -40,14 +40,26 @@ npm test            # vitest
 
 ## Use with any MCP client
 
-quant-mcp is a stdio MCP server, so **any MCP-compatible agent** (Claude Desktop, Cursor, Claude Code, Continue, etc.) can use its 8 tools.
+quant-mcp is a stdio MCP server, so **any MCP-compatible agent** (Claude Desktop, Cursor, Claude Code, Continue, etc.) can use its 21 tools.
+
+### Quickest: npm (once published)
+```json
+{
+  "mcpServers": {
+    "quant-mcp": { "command": "npx", "args": ["-y", "quant-mcp"] }
+  }
+}
+```
+- **Claude Code (CLI)**: `claude mcp add quant-mcp -- npx -y quant-mcp`
+
+### From source (works today)
 
 **1. Get it running locally**
 ```bash
 git clone https://github.com/Evanciel/evanciel-quant-mcp.git
 cd evanciel-quant-mcp
 npm install          # installs the MCP SDK, zod, tsx
-npm test             # optional: confirms the server boots + tools work (14/14)
+npm test             # optional: confirms the server boots + tools work (76/76)
 ```
 
 **2. Register the server** — add to your client's MCP config (see [`examples/mcp-config.json`](examples/mcp-config.json)). Replace `ABSOLUTE_PATH` with your clone location:
@@ -65,7 +77,7 @@ npm test             # optional: confirms the server boots + tools work (14/14)
 - **Cursor**: `.cursor/mcp.json`
 - **Claude Code (CLI)**: `claude mcp add quant-mcp -- npx -y tsx ABSOLUTE_PATH/evanciel-quant-mcp/src/mcp-server/index.ts`
 
-**3. Verify** — the server announces `quant-mcp server ready (stdio) — 8 tools` on stderr, and your client should list 8 tools (`validate_strategy`, `backtest`, …).
+**3. Verify** — the server announces `quant-mcp server ready (stdio) — 21 tools` on stderr, and your client should list 21 tools (`validate_strategy`, `backtest`, `scan_universe`, `allocate_portfolio`, …).
 
 **4. Use it** — see [`examples/usage.md`](examples/usage.md) for example prompts + tool inputs/outputs. e.g. *"Backtest this RSI strategy on BTCUSDT 1d, and tell me if it survives the out-of-sample gate."*
 

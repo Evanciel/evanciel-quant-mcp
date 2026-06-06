@@ -4,10 +4,42 @@
   "description": "Open-source MIT quant MCP server — risk filter + expressiveness layer, not an alpha source.",
   "type": "module",
   "license": "MIT",
+  "main": "dist/index.js",
+  "bin": {
+    "quant-mcp": "dist/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "SETUP-LIVE.md",
+    ".env.example",
+    "LICENSE"
+  ],
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "trading",
+    "backtest",
+    "quant",
+    "binance",
+    "risk-management",
+    "claude"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Evanciel/evanciel-quant-mcp.git"
+  },
+  "homepage": "https://github.com/Evanciel/evanciel-quant-mcp#readme",
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "dev": "tsx src/mcp-server/index.ts"
+    "dev": "tsx src/mcp-server/index.ts",
+    "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\"",
+    "build": "npm run clean && esbuild src/mcp-server/index.ts --bundle --platform=node --format=esm --target=node22 --packages=external --outfile=dist/index.js --banner:js=\"#!/usr/bin/env node\"",
+    "prepublishOnly": "npm run typecheck && npm run build"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.4",
@@ -15,6 +47,7 @@
   },
   "devDependencies": {
     "@types/node": "^22.19.19",
+    "esbuild": "^0.28.0",
     "tsx": "^4.22.4",
     "typescript": "^5",
     "vitest": "^4.1.0"
