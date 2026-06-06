@@ -87,7 +87,10 @@ export async function tickBot(botId: string): Promise<{ action: "buy" | "sell" |
   }
 
   const interval = secsToInterval(bot.interval_seconds); // 폴링 주기 → kline 타임프레임(인트라데이 자동). 시간대 조건 해금.
-  const data = await fetchKlines(bot.symbol, interval, 300);
+  const fetched = await fetchKlines(bot.symbol, interval, 300);
+  // 마지막 봉은 '형성 중'(미완결) → 백테스트는 닫힌 봉만 보므로 제거(backtest≡live). 닫힌 봉마다 최대 1회 정착 행동
+  //  → 같은 형성봉의 재틱마다 넷이 다단계로 변해 멱등키가 충돌·드롭되던 문제(2차 동일방향 델타 누락) 제거.
+  const data = fetched.length > 1 ? fetched.slice(0, -1) : fetched;
   if (data.length < 30) { store.setBotPositionState(botId, bot.position_state); return { action: "hold", detail: `데이터 부족(${data.length})` }; }
   const price = data[data.length - 1].close;
 
@@ -109,6 +112,12 @@ export async function tickBot(botId: string): Promise<{ action: "buy" | "sell" |
   const want = derivePosition(res.trades);
   const cur = bot.position_state as PaperPosition | null;
   const curQty = cur && cur.status === "open" ? cur.qty : 0;
+  // (B) 윈도우 안전장치: 보유 중인데 엔진이 윈도우(300봉) 내에서 어떤 체결도 못 봤다면(진입이 윈도우 밖으로 밀려남)
+  //  넷=0을 '청산 신호'로 오인해 전량 덤핑하지 말고 보유 유지(무정보 청산 방지). 실제 청산은 res.trades에 매도가 잡힐 때만.
+  if (curQty > 1e-9 && res.trades.length === 0) {
+    store.setBotPositionState(botId, cur);
+    return { action: "hold", detail: `보유 유지 ${curQty} @ ${price}(윈도우 내 신호 없음, 진입 봉 윈도우 밖 가능)` };
+  }
   // 멱등키는 봉 오픈시각(datetime, 전체 ISO) 기준 — date(YYYY-MM-DD)면 인트라데이 봇이 하루 1회 매매만 기록되어
   // 같은 날 재진입이 영구 차단됨(backtest≠live). 스캐너 경로와 동일 granularity.
   const idem = (sfx: string) => `${botId}:${data[data.length - 1].datetime}:${sfx}`;
@@ -174,7 +183,7 @@ function inSchedule(iso: string, schedule?: { hour: number[]; tz?: string }): bo
 async function tickScanner(bot: store.BotRow, node: ScannerNode): Promise<{ action: "buy" | "sell" | "hold"; detail: string }> {
   const interval = secsToInterval(bot.interval_seconds);
   const fetched = await Promise.all(node.universe.map(async (sym) => {
-    try { const bars = await fetchKlines(sym, interval, 300); return { symbol: sym, bars }; }
+    try { const raw = await fetchKlines(sym, interval, 300); const bars = raw.length > 1 ? raw.slice(0, -1) : raw; return { symbol: sym, bars }; } // 형성 중 봉 제거(닫힌 봉 기준)
     catch { return null; }
   }));
   const entries = fetched.filter((x): x is { symbol: string; bars: Bar[] } => !!x && x.bars.length >= 30);
