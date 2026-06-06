@@ -357,10 +357,19 @@ export class BinanceBrokerAdapter extends BaseBrokerAdapter {
    */
   async placeOrder(order: OrderRequest): Promise<OrderResult> {
     const o = order as FuturesOrderRequest;
+    const fut = this.market === "futures";
+    // 주문 타입 매핑(spot/futures 상이). 보호주문(stop_*/take_profit_*)은 stopPrice 트리거 필요.
+    const typeMap: Record<string, string> = {
+      market: "MARKET",
+      limit: "LIMIT",
+      stop_market: fut ? "STOP_MARKET" : "STOP_LOSS",
+      stop_limit: fut ? "STOP" : "STOP_LOSS_LIMIT",
+      take_profit_market: fut ? "TAKE_PROFIT_MARKET" : "TAKE_PROFIT",
+    };
     const params: Record<string, string> = {
       symbol: o.symbol,
       side: o.side.toUpperCase(),
-      type: o.type.toUpperCase(),
+      type: typeMap[o.type] ?? o.type.toUpperCase(),
       quantity: String(o.quantity),
     };
 
@@ -369,8 +378,14 @@ export class BinanceBrokerAdapter extends BaseBrokerAdapter {
       params.timeInForce = "GTC";
     }
 
-    // 선물 전용: 포지션 축소 전용 플래그(반대방향 신규 진입 방지).
-    if (this.market === "futures" && o.reduceOnly) {
+    // 보호주문: 트리거 가격(stopPrice) 필수. stop_limit은 지정가(price)도 필요.
+    if ((o.type === "stop_market" || o.type === "stop_limit" || o.type === "take_profit_market") && o.stopPrice != null) {
+      params.stopPrice = String(o.stopPrice);
+      if (o.type === "stop_limit" && o.price != null) { params.price = String(o.price); params.timeInForce = "GTC"; }
+    }
+
+    // 포지션 축소 전용(보호주문·숏커버). 선물 reduceOnly 플래그.
+    if (fut && o.reduceOnly) {
       params.reduceOnly = "true";
     }
 

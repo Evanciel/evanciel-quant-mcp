@@ -42,7 +42,12 @@ async function fillOrder(bot: store.BotRow, side: "buy" | "sell", qty: number, p
   }
 }
 
-export interface PaperPosition { status: "open"; entryAvg: number; qty: number; openedAt: string; }
+export interface PaperPosition {
+  status: "open"; entryAvg: number; qty: number; openedAt: string;
+  // P0 실행 레이어(라이브) 준비 필드 — 게이트 ON 시 사용. 페이퍼/게이트OFF에선 미사용(하위호환).
+  protectiveIds?: string[];  // 거래소에 걸린 상주 보호주문(SL/TP) clientOrderId 목록(syncProtective 추적)
+  peakPrice?: number;        // 진입 후 고점(롱)/저점(숏) — 트레일링 스탑 기준(planProtectiveOrders extremeSinceEntry)
+}
 
 /** 폴링 주기(초) → Binance kline 타임프레임. 인트라데이 봉이라야 시간대(hour) 조건이 의미. */
 function secsToInterval(s: number): string {

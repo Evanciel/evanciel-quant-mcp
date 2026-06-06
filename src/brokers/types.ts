@@ -35,9 +35,13 @@ export interface Position {
 export interface OrderRequest {
   symbol: string;
   side: "buy" | "sell";
-  type: "market" | "limit";
+  // market/limit + 거래소 상주 보호주문(트리거 시 발동): stop_market(손절 시장가), stop_limit(손절 지정가),
+  // take_profit_market(익절 시장가). 보호주문은 stopPrice(트리거가) 필수 + reduceOnly 권장.
+  type: "market" | "limit" | "stop_market" | "stop_limit" | "take_profit_market";
   quantity: number;
   price?: number;
+  stopPrice?: number;     // 보호주문 트리거 가격(stop_*/take_profit_*).
+  reduceOnly?: boolean;   // 포지션 축소 전용(보호주문·숏커버). 선물에서 의미.
   // 거래소 레벨 멱등키. 동일 clientOrderId 재전송은 거래소가 중복으로 거부/기존주문 반환 →
   // 같은 슬롯 재시도 시 중복 주문 방지. 모호한 실패 후 주문조회(reconcile)에도 사용.
   clientOrderId?: string;
