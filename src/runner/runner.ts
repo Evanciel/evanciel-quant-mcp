@@ -17,21 +17,22 @@ import { liveGate, checkLimits, audit, type Broker } from "../brokers/safety.js"
  * 봇 체결: mode=live + 게이트 통과면 실주문(어댑터), 아니면 페이퍼. 자율봇이라 2단계토큰 없음
  * (생성 시 mode=live=사전승인). 안전=마스터스위치+testnet기본+하드리밋+멱등. 실패 시 페이퍼 폴백+로그.
  */
-async function fillOrder(bot: store.BotRow, side: "buy" | "sell", qty: number, price: number): Promise<{ live: boolean; price: number; orderId?: string; note: string }> {
+async function fillOrder(bot: store.BotRow, side: "buy" | "sell", qty: number, price: number, symbol: string = bot.symbol): Promise<{ live: boolean; price: number; orderId?: string; note: string }> {
   if (bot.mode !== "live") return { live: false, price, note: "페이퍼" };
   const broker = (["binance", "kis", "kiwoom"].includes(bot.broker) ? bot.broker : "binance") as Broker;
-  const market = (bot.symbol.endsWith("USDT") ? "spot" : "spot") as "spot" | "futures";
+  const market = (symbol.endsWith("USDT") ? "spot" : "spot") as "spot" | "futures";
   const gate = liveGate(broker, market);
   if (!gate.allowed) { store.insertLog(bot.id, "gate", `라이브 차단(${gate.reason}) → 페이퍼`); return { live: false, price, note: "게이트 차단→페이퍼" }; }
-  const lim = checkLimits({ symbol: bot.symbol, notional: price * qty });
-  if (!lim.ok) { store.insertLog(bot.id, "gate", `하드리밋(${lim.reason}) → 페이퍼`); return { live: false, price, note: "리밋→페이퍼" }; }
+  // 하드리밋: 노셔널캡 + 심볼 allowlist + 일일손실 서킷(스캐너 멀티심볼도 심볼별로 통과해야 실주문).
+  const lim = checkLimits({ symbol, notional: price * qty });
+  if (!lim.ok) { store.insertLog(bot.id, "gate", `하드리밋(${symbol} ${lim.reason}) → 페이퍼`); return { live: false, price, note: "리밋→페이퍼" }; }
   const got = getAdapter(broker, market);
   if (!got) { store.insertLog(bot.id, "gate", "어댑터 없음 → 페이퍼"); return { live: false, price, note: "어댑터없음→페이퍼" }; }
-  audit({ event: "bot_order_attempt", botId: bot.id, broker, env: gate.env, symbol: bot.symbol, side, qty, price });
+  audit({ event: "bot_order_attempt", botId: bot.id, broker, env: gate.env, symbol, side, qty, price });
   try {
-    const r = await got.adapter.placeOrder({ symbol: bot.symbol, side, type: "market", quantity: qty, clientOrderId: `${bot.id}-${side}-${Date.now()}` });
+    const r = await got.adapter.placeOrder({ symbol, side, type: "market", quantity: qty, clientOrderId: `${bot.id}-${symbol}-${side}-${Date.now()}` });
     audit({ event: "bot_order_result", botId: bot.id, env: gate.env, orderId: r.orderId, status: r.status });
-    store.insertLog(bot.id, "live", `[${gate.env}] 실주문 ${side} qty=${qty} → ${r.status} (${r.orderId})`);
+    store.insertLog(bot.id, "live", `[${gate.env}] 실주문 ${symbol} ${side} qty=${qty} → ${r.status} (${r.orderId})`);
     return { live: true, price: r.price || price, orderId: r.orderId, note: `${gate.env} 실주문` };
   } catch (e) {
     audit({ event: "bot_order_error", botId: bot.id, error: e instanceof Error ? e.message : String(e) });
@@ -165,8 +166,10 @@ function inSchedule(iso: string, schedule?: { hour: number[]; tz?: string }): bo
 }
 
 /**
- * 스캐너 봇 1틱: 유니버스 멀티심볼 페치 → 랭킹 → 상위 N → then 전략 평가 → 종목별 페이퍼 진입/청산.
- * 스캐너는 페이퍼 전용(v1) — 멀티심볼 실거래 리스크 회피(정직: 라이브는 단일심볼 봇만). position_state=심볼→포지션 맵.
+ * 스캐너 봇 1틱: 유니버스 멀티심볼 페치 → 랭킹 → 상위 N → then 전략 평가 → 종목별 진입/청산.
+ * 체결은 fillOrder 경유 — mode=live+게이트통과(마스터스위치+심볼allowlist+노셔널캡+일일손실서킷)면 심볼별 실주문,
+ * 아니면 페이퍼 폴백(fail-closed). 기본(키없음/마스터OFF)은 전부 페이퍼. position_state=심볼→포지션 맵.
+ * 안전: 멀티심볼 실거래는 심볼 allowlist가 통제 — allowlist에 없는 심볼은 자동 페이퍼.
  */
 async function tickScanner(bot: store.BotRow, node: ScannerNode): Promise<{ action: "buy" | "sell" | "hold"; detail: string }> {
   const interval = secsToInterval(bot.interval_seconds);
@@ -208,14 +211,15 @@ async function tickScanner(bot: store.BotRow, node: ScannerNode): Promise<{ acti
   // 멱등키는 각 심볼 자기 봉의 datetime 기준(entries[0] 공유 시각은 선두 심볼 페치 실패 시 비결정적).
   const barIso = (sym: string) => (barsOf[sym]?.[barsOf[sym].length - 1]?.datetime ?? nowIso);
   let opens = 0, closes = 0;
-  // 청산 먼저(자본 회수)
+  // 청산 먼저(자본 회수). mode=live + 게이트통과면 심볼별 실주문(allowlist·하드리밋), 아니면 페이퍼 폴백(fail-closed).
   for (const sym of toClose) {
     const pos = positions[sym]; const price = priceOf[sym];
     if (!pos) { delete positions[sym]; continue; }
     if (price === undefined) { store.insertLog(bot.id, "gate", `${sym} 청산 보류(가격 없음, 다음 틱 재시도)`); continue; } // 데이터 부재 → 다음 틱
-    const realPnl = (price - pos.entryAvg) * pos.qty;
-    const t = store.insertTrade({ bot_id: bot.id, side: "sell", price, qty: pos.qty, pnl: realPnl, is_paper: 1, reason: `스캐너 청산(${sym})`, idempotency_key: `${bot.id}:${sym}:${barIso(sym)}:sell` });
-    if (t) { delete positions[sym]; closes++; store.insertLog(bot.id, "sell", `[페이퍼] ${sym} 청산 qty=${pos.qty} @ ${price} pnl=${realPnl.toFixed(2)}`); }
+    const fill = await fillOrder(bot, "sell", pos.qty, price, sym);
+    const realPnl = (fill.price - pos.entryAvg) * pos.qty;
+    const t = store.insertTrade({ bot_id: bot.id, side: "sell", price: fill.price, qty: pos.qty, pnl: realPnl, is_paper: fill.live ? 0 : 1, reason: `스캐너 청산(${sym})`, idempotency_key: `${bot.id}:${sym}:${barIso(sym)}:sell` });
+    if (t) { delete positions[sym]; closes++; store.insertLog(bot.id, "sell", `[${fill.live ? "실거래" : "페이퍼"}] ${sym} 청산 qty=${pos.qty} @ ${fill.price} pnl=${realPnl.toFixed(2)}`); }
   }
   // 신규 진입
   for (const sym of toOpen) {
@@ -223,8 +227,9 @@ async function tickScanner(bot: store.BotRow, node: ScannerNode): Promise<{ acti
     if (price === undefined || price <= 0) continue;
     const qty = Math.floor(perSymCapital / price);
     if (qty <= 0) continue;
-    const t = store.insertTrade({ bot_id: bot.id, side: "buy", price, qty, pnl: 0, is_paper: 1, reason: `스캐너 진입(${sym}, ${node.rank.metric} 상위)`, idempotency_key: `${bot.id}:${sym}:${barIso(sym)}:buy` });
-    if (t) { positions[sym] = { status: "open", entryAvg: price, qty, openedAt: new Date().toISOString() }; opens++; store.insertLog(bot.id, "buy", `[페이퍼] ${sym} 진입 qty=${qty} @ ${price}`); }
+    const fill = await fillOrder(bot, "buy", qty, price, sym);
+    const t = store.insertTrade({ bot_id: bot.id, side: "buy", price: fill.price, qty, pnl: 0, is_paper: fill.live ? 0 : 1, reason: `스캐너 진입(${sym}, ${node.rank.metric} 상위)`, idempotency_key: `${bot.id}:${sym}:${barIso(sym)}:buy` });
+    if (t) { positions[sym] = { status: "open", entryAvg: fill.price, qty, openedAt: new Date().toISOString() }; opens++; store.insertLog(bot.id, "buy", `[${fill.live ? "실거래" : "페이퍼"}] ${sym} 진입 qty=${qty} @ ${fill.price}`); }
   }
 
   store.setBotPositionState(bot.id, positions, true, opens + closes > 0);
