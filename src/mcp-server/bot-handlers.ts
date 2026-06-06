@@ -2,7 +2,7 @@
  * bot-handlers.ts — v2 봇/전략 MCP 툴 핸들러(로컬 스토어 + 페이퍼 러너).
  * 에이전트가 전략 조립 → 로컬 봇 생성 → 페이퍼 실행 → 대시보드. 라이브 실행은 v2.5(키+게이트).
  */
-import { validateRootNode } from "../core/validation/composite-node.js";
+import { validateBotRoot } from "../core/validation/composite-node.js";
 import * as store from "../store/db.js";
 import { runner } from "../runner/runner.js";
 import { startDashboard } from "../dashboard/server.js";
@@ -12,7 +12,7 @@ export function saveComposite(a: {
   name: string; tree: unknown; symbol?: string; market?: "spot" | "futures"; leverage?: number;
   stopLossPercent?: number; takeProfitPercent?: number; tpLadder?: unknown; scaleIn?: unknown; pyramid?: unknown; trailingStopPercent?: number;
 }) {
-  const err = validateRootNode(a.tree);
+  const err = validateBotRoot(a.tree); // scanner 노드도 허용(validateScannerNode 분기)
   if (err) return { ok: false, error: `검증 실패: ${err}` };
   const row = store.insertComposite({
     name: a.name, root_node: a.tree, symbol: a.symbol || "BTCUSDT",

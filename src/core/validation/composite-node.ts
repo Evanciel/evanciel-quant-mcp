@@ -182,6 +182,55 @@ function exceedsBounds(node: unknown): string | null {
   return null;
 }
 
+// ── 스캐너 노드(봇 최상위 전용) ──
+const ScannerNodeSchema = z.object({
+  id: z.string(),
+  type: z.literal("scanner"),
+  name: z.string(),
+  universe: z.array(z.string().min(1)).min(2), // 최소 2종목(랭킹 의미)
+  rank: z.object({
+    metric: z.enum(["gapPct", "roc", "relVolume", "rangePct"]),
+    top: z.number().int().min(1),
+    order: z.enum(["desc", "asc"]).optional(),
+    period: z.number().int().min(1).optional(),
+  }),
+  then: StrategyNodeSchema, // 선정 종목에 적용할 복합전략(재귀 검증)
+  schedule: z.object({
+    hour: z.array(z.number().int().min(0).max(23)),
+    tz: z.string().optional(),
+  }).optional(),
+});
+
+/**
+ * 스캐너 노드 검증. 실패 시 에러 메시지, 성공 시 null. then 트리는 깊이/사이클 사전차단 후 검증.
+ */
+export function validateScannerNode(data: unknown): string | null {
+  const o = data as { then?: unknown } | null;
+  if (o && typeof o === "object" && o.then) {
+    const bound = exceedsBounds(o.then);
+    if (bound) return `스캐너 검증 실패: then ${bound}`;
+  }
+  let result: ReturnType<typeof ScannerNodeSchema.safeParse>;
+  try {
+    result = ScannerNodeSchema.safeParse(data);
+  } catch (e) {
+    return `스캐너 검증 실패: 구조 파싱 오류 (${e instanceof Error ? e.message : String(e)})`;
+  }
+  if (result.success) return null;
+  const first = result.error.issues[0];
+  return first ? `스캐너 검증 실패: ${first.path.join(".")} — ${first.message}` : "스캐너 구조가 올바르지 않습니다";
+}
+
+/**
+ * 봇 root_node 검증 — scanner면 validateScannerNode, 아니면 validateRootNode. 봇 생성/배포의 단일 게이트.
+ */
+export function validateBotRoot(data: unknown): string | null {
+  if (data && typeof data === "object" && (data as { type?: unknown }).type === "scanner") {
+    return validateScannerNode(data);
+  }
+  return validateRootNode(data);
+}
+
 /**
  * root_node를 검증하고, 실패 시 첫 번째 에러 메시지를 반환.
  * 성공 시 null 반환. 어떤 입력에도 throw하지 않는다(깊이/사이클 사전차단 + safeParse try/catch).

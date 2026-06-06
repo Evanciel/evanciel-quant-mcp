@@ -1,4 +1,5 @@
 import type { RegimeLabel, RegimeParams } from "../backtest/regime";
+import type { RankMetric } from "../scanner/rank";
 
 export type IndicatorType = "sma" | "ema" | "rsi" | "macd" | "bollinger" | "volume" | "stochastic" | "atr" | "obv" | "williams_r" | "stochastic_rsi" | "cci" | "adx" | "supertrend" | "vwap" | "mfi" | "parabolic_sar" | "ichimoku" | "roc" | "donchian" | "aroon";
 export type ConditionOperator = "gt" | "lt" | "gte" | "lte" | "cross_above" | "cross_below";
@@ -197,6 +198,24 @@ export interface SpreadCondition {
   operator: ConditionOperator;
   value: number;
 }
+
+// ── 스캐너 (유니버스 스크리닝 봇) ──
+// 봇 root_node가 scanner면 러너가 멀티심볼 랭킹→상위 N에 then 전략 적용(종목별 단명 페이퍼 포지션).
+// StrategyNode 트리에 중첩 불가(봇 최상위 전용 형태). validateScannerNode로 별도 검증.
+export interface ScannerSchedule {
+  hour: number[];  // 활성 시각(0~23). 비면 매 틱 활성.
+  tz?: string;     // 시각 기준 시간대(예: "Asia/Seoul"). 없으면 UTC.
+}
+export interface ScannerNode {
+  id: string;
+  type: "scanner";
+  name: string;
+  universe: string[];  // 평가할 심볼 리스트(예: ["BTCUSDT","ETHUSDT",...]). 최소 2.
+  rank: { metric: RankMetric; top: number; order?: "desc" | "asc"; period?: number };
+  then: StrategyNode;  // 선정 종목에 적용할 복합전략
+  schedule?: ScannerSchedule;
+}
+export type BotRootNode = StrategyNode | ScannerNode;
 
 export interface MultiBacktestResult {
   results: {

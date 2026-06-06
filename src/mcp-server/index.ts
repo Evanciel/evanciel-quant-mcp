@@ -70,6 +70,12 @@ export function buildServer(): McpServer {
     inputSchema: S.strategyFactoryShape,
   }, guard((a) => H.strategyFactory(a as Parameters<typeof H.strategyFactory>[0])));
 
+  server.registerTool("scan_universe", {
+    title: "유니버스 스크리닝 + 크로스섹셔널 랭킹",
+    description: `여러 종목을 메트릭(gapPct/roc/relVolume/rangePct)으로 평가→랭킹→상위 N 반환. "아침 급등주 스크리닝"의 읽기 도구. 스캐너 봇(save_strategy에 scanner 노드)으로 자동화 가능. ${DISCLAIMER}`,
+    inputSchema: S.scanUniverseShape, annotations: { readOnlyHint: true },
+  }, guard((a) => H.scanUniverse(a as Parameters<typeof H.scanUniverse>[0])));
+
   // ── v2: 봇/전략/대시보드 (로컬 스토어 + 페이퍼 러너) ──
   server.registerTool("save_strategy", {
     title: "전략(복합전략) 저장",
@@ -142,7 +148,7 @@ async function main() {
   const shutdown = () => { runner().shutdown(); process.exit(0); };
   process.on("SIGINT", shutdown); process.on("SIGTERM", shutdown);
   // stdio 서버는 stdout=프로토콜 채널 → 로그는 stderr로.
-  process.stderr.write("quant-mcp server ready (stdio) — 19 tools (8 analysis + 7 bot + 4 live). paper mode. risk filter, not alpha source.\n");
+  process.stderr.write("quant-mcp server ready (stdio) — 20 tools (8 analysis + scan_universe + 7 bot + 4 live). paper mode. risk filter, not alpha source.\n");
 }
 
 // 직접 실행 시에만 기동(테스트 import 시엔 buildServer만 사용).

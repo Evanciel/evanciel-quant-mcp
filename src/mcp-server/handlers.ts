@@ -15,6 +15,7 @@ import { evaluatePortfolioRisk } from "../core/risk/portfolio.js";
 import { summarizeDerivatives } from "../core/signals/derivatives.js";
 import { validateRootNode } from "../core/validation/composite-node.js";
 import { collectSpreadSymbols } from "../core/strategy/spread-symbols.js";
+import { rankUniverse, computeRankMetric, type RankBar, type RankMetric } from "../core/scanner/rank.js";
 import { fetchKlines, fetchDerivatives, buildAuxSeries, type Bar } from "../data/binance-public.js";
 
 const cfg = (d: Bar[], symbol: string, interval: string, auxSeries?: Record<string, number[]>): BacktestConfig => ({
@@ -37,6 +38,35 @@ const statOf = (r: ReturnType<typeof runCompositeBacktest>) => ({
 export function validateStrategy(args: { tree: unknown }) {
   const err = validateRootNode(args.tree);
   return { ok: err === null, valid: err === null, error: err };
+}
+
+// ── scan_universe: 유니버스 스크리닝 + 크로스섹셔널 랭킹(읽기전용) ──
+// "아침 9시 급등주" 스크리닝의 읽기 절반. 상위 N + 점수 반환. 데이터부족 종목은 제외.
+export async function scanUniverse(args: { universe: string[]; metric?: RankMetric; top?: number; order?: "desc" | "asc"; interval?: string; period?: number; bars?: number }) {
+  const universe = Array.isArray(args.universe) ? [...new Set(args.universe.filter((s) => typeof s === "string" && s))] : [];
+  if (universe.length < 2) return { ok: false, error: "universe는 최소 2개 심볼이 필요합니다" };
+  const metric = (args.metric || "roc") as RankMetric;
+  const top = Math.max(1, Math.floor(args.top || 5));
+  const order = args.order === "asc" ? "asc" : "desc";
+  const interval = args.interval || "1d";
+  const period = Math.max(1, Math.floor(args.period || 14));
+  const want = Math.max(period + 2, Math.floor(args.bars || 60));
+  const fetched = await Promise.all(universe.map(async (sym) => {
+    try { const b = await fetchKlines(sym, interval, want); return { symbol: sym, bars: b }; }
+    catch { return null; }
+  }));
+  const entries = fetched.filter((x): x is { symbol: string; bars: Bar[] } => !!x && x.bars.length >= 2);
+  const skipped = universe.filter((s) => !entries.some((e) => e.symbol === s));
+  const ranked = rankUniverse(entries.map((e) => ({ symbol: e.symbol, bars: e.bars as unknown as RankBar[] })), metric, top, order, period);
+  // 전체 점수(랭킹 밖 포함)도 투명하게 노출
+  const allScores = entries.map((e) => ({ symbol: e.symbol, score: computeRankMetric(e.bars as unknown as RankBar[], metric, period) }))
+    .filter((x) => x.score !== null).map((x) => ({ symbol: x.symbol, score: +(x.score as number).toFixed(4) }));
+  return {
+    ok: true, metric, order, interval, top, evaluated: entries.length, skipped,
+    ranked: ranked.map((r) => ({ symbol: r.symbol, score: +r.score.toFixed(4) })),
+    allScores,
+    note: "스크리닝은 아이디어 후보 생성이지 알파 보장이 아님. 인트라데이일수록 수수료·슬리피지·과적합 리스크↑.",
+  };
 }
 
 // ── 2. backtest (walk-forward OOS 70/30 + PSR) ──

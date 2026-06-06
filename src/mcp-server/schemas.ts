@@ -102,6 +102,14 @@ export const createBotShape = {
   broker: z.string().default("binance"),
   intervalSeconds: z.number().int().default(60).describe("평가 주기(최소 15초)"),
 };
+export const scanUniverseShape = {
+  universe: z.array(z.string()).min(2).describe("스크리닝할 심볼 리스트(최소 2). 예: [\"BTCUSDT\",\"ETHUSDT\",\"SOLUSDT\"]"),
+  metric: z.enum(["gapPct", "roc", "relVolume", "rangePct"]).default("roc").describe("랭킹 메트릭(gapPct=갭, roc=모멘텀, relVolume=거래량급증, rangePct=장중변동성)"),
+  top: z.number().int().positive().default(5).describe("상위 N개"),
+  order: z.enum(["desc", "asc"]).default("desc"),
+  interval, period: z.number().int().positive().default(14).describe("roc/relVolume 룩백 봉수"),
+  bars: z.number().int().positive().default(60).describe("페치할 봉 수"),
+};
 export const botIdShape = { botId: z.string().describe("봇 id") };
 export const listBotsShape = {};
 export const openDashboardShape = { port: z.number().int().default(7788).describe("대시보드 로컬 포트(127.0.0.1)") };

@@ -3,10 +3,11 @@
  * core 엔진(runCompositeBacktest) 재사용 → backtest≡live. 페이퍼 가상체결을 스토어에 기록.
  * 라이브 실행은 v2.5(브로커 어댑터 + 2단계 토큰 + 하드게이트)에서. 현재는 paper만.
  */
-import type { StrategyNode, BacktestConfig } from "../core/types/strategy.js";
+import type { StrategyNode, ScannerNode, BacktestConfig } from "../core/types/strategy.js";
 import { runCompositeBacktest } from "../core/backtest/engine.js";
 import { fetchKlines, buildAuxSeries, type Bar } from "../data/binance-public.js";
 import { collectSpreadSymbols } from "../core/strategy/spread-symbols.js";
+import { rankUniverse, decideScannerActions, type RankBar } from "../core/scanner/rank.js";
 import * as store from "../store/db.js";
 import { getAdapter } from "../brokers/index.js";
 import { liveGate, checkLimits, audit, type Broker } from "../brokers/safety.js";
@@ -63,6 +64,11 @@ export async function tickBot(botId: string): Promise<{ action: "buy" | "sell" |
   const comp = store.getComposite(bot.composite_strategy_id);
   if (!comp) { store.insertLog(botId, "error", "복합전략 없음"); return { action: "hold", detail: "no composite" }; }
 
+  // 스캐너 봇: root_node가 scanner면 멀티심볼 랭킹 경로로 분기.
+  if ((comp.root_node as { type?: string })?.type === "scanner") {
+    return tickScanner(bot, comp.root_node as ScannerNode);
+  }
+
   const interval = secsToInterval(bot.interval_seconds); // 폴링 주기 → kline 타임프레임(인트라데이 자동). 시간대 조건 해금.
   const data = await fetchKlines(bot.symbol, interval, 300);
   if (data.length < 30) { store.setBotPositionState(botId, bot.position_state); return { action: "hold", detail: `데이터 부족(${data.length})` }; }
@@ -104,6 +110,81 @@ export async function tickBot(botId: string): Promise<{ action: "buy" | "sell" |
   }
   store.setBotPositionState(botId, cur);
   return { action: "hold", detail: holding ? `보유중 @ ${price}` : `관망 @ ${price}` };
+}
+
+type ScannerPositions = Record<string, PaperPosition>;
+
+/** 최신 봉 시각이 스케줄 hour에 드는지(tz 적용). schedule 없거나 hour 비면 항상 활성. */
+function inSchedule(iso: string, schedule?: { hour: number[]; tz?: string }): boolean {
+  if (!schedule || !Array.isArray(schedule.hour) || schedule.hour.length === 0) return true;
+  const d = new Date(iso);
+  const h = schedule.tz
+    ? Number(new Intl.DateTimeFormat("en-GB", { timeZone: schedule.tz, hour: "2-digit", hour12: false }).formatToParts(d).find((x) => x.type === "hour")?.value ?? "0") % 24
+    : d.getUTCHours();
+  return schedule.hour.includes(h);
+}
+
+/**
+ * 스캐너 봇 1틱: 유니버스 멀티심볼 페치 → 랭킹 → 상위 N → then 전략 평가 → 종목별 페이퍼 진입/청산.
+ * 스캐너는 페이퍼 전용(v1) — 멀티심볼 실거래 리스크 회피(정직: 라이브는 단일심볼 봇만). position_state=심볼→포지션 맵.
+ */
+async function tickScanner(bot: store.BotRow, node: ScannerNode): Promise<{ action: "buy" | "sell" | "hold"; detail: string }> {
+  const interval = secsToInterval(bot.interval_seconds);
+  const fetched = await Promise.all(node.universe.map(async (sym) => {
+    try { const bars = await fetchKlines(sym, interval, 300); return { symbol: sym, bars }; }
+    catch { return null; }
+  }));
+  const entries = fetched.filter((x): x is { symbol: string; bars: Bar[] } => !!x && x.bars.length >= 30);
+  const positions: ScannerPositions = (bot.position_state as ScannerPositions | null) || {};
+  const held = Object.keys(positions);
+  if (entries.length < 2) { store.setBotPositionState(bot.id, positions); return { action: "hold", detail: `유니버스 데이터 부족(${entries.length})` }; }
+
+  const barsOf: Record<string, Bar[]> = {};
+  for (const e of entries) barsOf[e.symbol] = e.bars;
+  const nowIso = entries[0].bars[entries[0].bars.length - 1].datetime;
+  const active = inSchedule(nowIso, node.schedule);
+
+  const ranked = rankUniverse(entries.map((e) => ({ symbol: e.symbol, bars: e.bars as unknown as RankBar[] })), node.rank.metric, node.rank.top, node.rank.order, node.rank.period);
+  const topSymbols = active ? ranked.map((r) => r.symbol) : []; // 비활성 시각엔 신규 진입 0(보유는 then 신호로만 청산)
+
+  // 보유 + 상위N 종목의 then 전략 평가 → 보유 희망 여부
+  const evalSet = new Set<string>([...held, ...topSymbols]);
+  const wantHold: Record<string, boolean> = {};
+  const priceOf: Record<string, number> = {};
+  const perSymCapital = bot.capital / Math.max(1, node.rank.top);
+  for (const sym of evalSet) {
+    const bars = barsOf[sym];
+    if (!bars) { wantHold[sym] = false; continue; } // 데이터 없음 → 청산쪽
+    priceOf[sym] = bars[bars.length - 1].close;
+    const cfg: BacktestConfig = { strategyId: "scanner", symbol: sym, startDate: bars[0].date, endDate: bars[bars.length - 1].date, initialCapital: perSymCapital, commission: 0.1, timeframe: interval };
+    const res = runCompositeBacktest(node.then, bars as unknown as Parameters<typeof runCompositeBacktest>[1], cfg);
+    wantHold[sym] = derivePosition(res.trades).holding;
+  }
+
+  const { toOpen, toClose } = decideScannerActions(topSymbols, held, wantHold);
+  let opens = 0, closes = 0;
+  // 청산 먼저(자본 회수)
+  for (const sym of toClose) {
+    const pos = positions[sym]; const price = priceOf[sym];
+    if (!pos) { delete positions[sym]; continue; }
+    if (price === undefined) { store.insertLog(bot.id, "gate", `${sym} 청산 보류(가격 없음, 다음 틱 재시도)`); continue; } // 데이터 부재 → 다음 틱
+    const realPnl = (price - pos.entryAvg) * pos.qty;
+    const t = store.insertTrade({ bot_id: bot.id, side: "sell", price, qty: pos.qty, pnl: realPnl, is_paper: 1, reason: `스캐너 청산(${sym})`, idempotency_key: `${bot.id}:${sym}:${nowIso}:sell` });
+    if (t) { delete positions[sym]; closes++; store.insertLog(bot.id, "sell", `[페이퍼] ${sym} 청산 qty=${pos.qty} @ ${price} pnl=${realPnl.toFixed(2)}`); }
+  }
+  // 신규 진입
+  for (const sym of toOpen) {
+    const price = priceOf[sym];
+    if (price === undefined || price <= 0) continue;
+    const qty = Math.floor(perSymCapital / price);
+    if (qty <= 0) continue;
+    const t = store.insertTrade({ bot_id: bot.id, side: "buy", price, qty, pnl: 0, is_paper: 1, reason: `스캐너 진입(${sym}, ${node.rank.metric} 상위)`, idempotency_key: `${bot.id}:${sym}:${nowIso}:buy` });
+    if (t) { positions[sym] = { status: "open", entryAvg: price, qty, openedAt: new Date().toISOString() }; opens++; store.insertLog(bot.id, "buy", `[페이퍼] ${sym} 진입 qty=${qty} @ ${price}`); }
+  }
+
+  store.setBotPositionState(bot.id, positions, true, opens + closes > 0);
+  const detail = `랭킹 상위[${topSymbols.join(",") || "-"}] 진입${opens}/청산${closes} 보유[${Object.keys(positions).join(",") || "-"}]${active ? "" : " (스케줄 비활성)"}`;
+  return { action: opens > 0 ? "buy" : closes > 0 ? "sell" : "hold", detail };
 }
 
 /** 러너 데몬: 가동 봇을 interval마다 tick. graceful shutdown 지원. */
