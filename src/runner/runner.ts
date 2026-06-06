@@ -47,6 +47,21 @@ function secsToInterval(s: number): string {
   if (s <= 1800) return "30m"; if (s <= 3600) return "1h"; if (s <= 14400) return "4h"; if (s <= 86400) return "1d"; return "1d";
 }
 
+/**
+ * 수량 델타 정합 계획(순수). 엔진 넷 포지션(want)을 라이브 보유수량(curQty)에 추종.
+ * dq>0=매수(진입/스케일인/피라미딩), dq<0=매도(부분익절/청산), 0=유지. 라더류 부분체결을 라이브에 반영.
+ */
+export function planPositionDelta(
+  curQty: number, want: { holding: boolean; qty: number; entryAvg: number }, price: number, capital: number
+): { side: "buy" | "sell" | "hold"; qty: number; partial: boolean; wantQty: number } {
+  const wantQty = want.holding ? (want.qty > 0 ? want.qty : Math.max(1, Math.floor(capital / price))) : 0;
+  const EPS = 1e-9;
+  const dq = wantQty - curQty;
+  if (dq > EPS) return { side: "buy", qty: dq, partial: curQty > EPS, wantQty };   // partial=추가매수
+  if (dq < -EPS) return { side: "sell", qty: -dq, partial: wantQty > EPS, wantQty }; // partial=부분익절
+  return { side: "hold", qty: 0, partial: false, wantQty };
+}
+
 /** 백테스트 결과의 trade 시퀀스에서 "현재 보유 여부 + 평단/수량"을 도출(net). */
 function derivePosition(trades: { action: string; price: number; quantity: number }[]): { holding: boolean; entryAvg: number; qty: number } {
   let qty = 0, cost = 0;
@@ -87,36 +102,50 @@ export async function tickBot(botId: string): Promise<{ action: "buy" | "sell" |
   };
   const res = runCompositeBacktest(root, data as unknown as Parameters<typeof runCompositeBacktest>[1], cfg, 0, risk);
   const want = derivePosition(res.trades);
-  // ⚠️ 알려진 한계(v1 독립 러너): derivePosition은 엔진의 체결열을 '순(net) 보유 1개'로 축약한다.
-  // tpLadder(부분익절 50/25/25)·scaleIn(물타기)·pyramid(추가매수)처럼 보유 중 수량이 단계적으로 변하는 전략은
-  // 엔진 백테스트에선 중간 부분체결이 발생하지만, 여기선 flat↔holding 이진 전이만 처리해 중간 단계가 라이브에 반영되지 않는다
-  // (넷 보유가 0이 될 때 한 번에 청산). 단순 진입/청산 전략은 backtest≡live지만, 라더/스케일인/피라미딩 봇은 발산.
-  // 페이퍼 전용이라 실자금 위험은 없으나, 라이브 정합을 위해선 러너를 엔진 PositionState로 구동하는 리팩토링 필요(별도 작업).
-
   const cur = bot.position_state as PaperPosition | null;
-  const holding = !!cur && cur.status === "open";
+  const curQty = cur && cur.status === "open" ? cur.qty : 0;
   // 멱등키는 봉 오픈시각(datetime, 전체 ISO) 기준 — date(YYYY-MM-DD)면 인트라데이 봇이 하루 1회 매매만 기록되어
   // 같은 날 재진입이 영구 차단됨(backtest≠live). 스캐너 경로와 동일 granularity.
   const idem = (sfx: string) => `${botId}:${data[data.length - 1].datetime}:${sfx}`;
 
-  // 전이: flat→holding = 페이퍼 진입 / holding→flat = 페이퍼 청산
-  if (!holding && want.holding) {
-    const qty = want.qty > 0 ? want.qty : Math.max(1, Math.floor(bot.capital / price));
-    const fill = await fillOrder(bot, "buy", qty, price);
-    const t = store.insertTrade({ bot_id: botId, side: "buy", price: fill.price, qty, pnl: 0, is_paper: fill.live ? 0 : 1, reason: "전략 진입", idempotency_key: idem("buy") });
-    if (t) { store.setBotPositionState(botId, { status: "open", entryAvg: fill.price, qty, openedAt: new Date().toISOString() } satisfies PaperPosition, true, true); store.insertLog(botId, "buy", `[${fill.live ? "실거래" : "페이퍼"}] 진입 qty=${qty} @ ${fill.price}`); return { action: "buy", detail: `진입 ${qty} @ ${fill.price} (${fill.note})` }; }
-    return { action: "hold", detail: "진입 중복 스킵" };
+  // ── 수량 델타(qty-delta) 정합 ──
+  // 엔진의 넷 포지션(want.qty)을 라이브 보유수량(curQty)에 봉마다 추종 → tpLadder(부분익절)·scaleIn(물타기)·
+  // pyramid(추가매수)의 단계적 수량 변화가 라이브에도 부분 체결로 반영됨(이전엔 flat↔holding 이진 전이라
+  // 라더/스케일인/피라미딩이 발산했음). 단순 진입/청산은 dq=전량이라 기존 동작과 동일 → backtest≡live.
+  const plan = planPositionDelta(curQty, want, price, bot.capital);
+
+  if (plan.side === "buy") {
+    // 신규 진입 또는 추가매수(스케일인/피라미딩). entryAvg는 엔진 가중평단(want.entryAvg)으로 갱신.
+    const fill = await fillOrder(bot, "buy", plan.qty, price);
+    const reason = plan.partial ? "추가매수(스케일인/피라미딩)" : "전략 진입";
+    const t = store.insertTrade({ bot_id: botId, side: "buy", price: fill.price, qty: plan.qty, pnl: 0, is_paper: fill.live ? 0 : 1, reason, idempotency_key: idem("buy") });
+    if (t) {
+      const entryAvg = want.entryAvg > 0 ? want.entryAvg : fill.price;
+      store.setBotPositionState(botId, { status: "open", entryAvg, qty: plan.wantQty, openedAt: cur?.openedAt ?? new Date().toISOString() } satisfies PaperPosition, true, true);
+      store.insertLog(botId, "buy", `[${fill.live ? "실거래" : "페이퍼"}] ${reason} +${plan.qty} → 보유 ${plan.wantQty} @ ${fill.price}(평단 ${entryAvg.toFixed(2)})`);
+      return { action: "buy", detail: `${reason} +${plan.qty} (보유 ${plan.wantQty}, ${fill.note})` };
+    }
+    return { action: "hold", detail: "매수 중복 스킵" };
   }
-  if (holding && !want.holding) {
-    const pnl = (price - cur!.entryAvg) * cur!.qty;
-    const fill = await fillOrder(bot, "sell", cur!.qty, price);
-    const realPnl = (fill.price - cur!.entryAvg) * cur!.qty;
-    const t = store.insertTrade({ bot_id: botId, side: "sell", price: fill.price, qty: cur!.qty, pnl: realPnl, is_paper: fill.live ? 0 : 1, reason: "전략 청산", idempotency_key: idem("sell") });
-    if (t) { store.setBotPositionState(botId, null, true, true); store.insertLog(botId, "sell", `[${fill.live ? "실거래" : "페이퍼"}] 청산 qty=${cur!.qty} @ ${fill.price} pnl=${realPnl.toFixed(2)}`); return { action: "sell", detail: `청산 pnl=${realPnl.toFixed(2)} (${fill.note})` }; }
-    return { action: "hold", detail: "청산 중복 스킵" };
+
+  if (plan.side === "sell") {
+    // 부분 익절(라더) 또는 전량 청산. 실현손익은 매도분 × (체결가 − 진입평단). 평단은 부분매도 시 불변.
+    const fill = await fillOrder(bot, "sell", plan.qty, price);
+    const refAvg = cur?.entryAvg ?? fill.price;
+    const realPnl = (fill.price - refAvg) * plan.qty;
+    const reason = plan.partial ? "부분 익절(라더)" : "전략 청산";
+    const t = store.insertTrade({ bot_id: botId, side: "sell", price: fill.price, qty: plan.qty, pnl: realPnl, is_paper: fill.live ? 0 : 1, reason, idempotency_key: idem("sell") });
+    if (t) {
+      const next: PaperPosition | null = plan.partial ? { status: "open", entryAvg: refAvg, qty: plan.wantQty, openedAt: cur?.openedAt ?? new Date().toISOString() } : null;
+      store.setBotPositionState(botId, next, true, true);
+      store.insertLog(botId, "sell", `[${fill.live ? "실거래" : "페이퍼"}] ${reason} -${plan.qty} → 보유 ${plan.wantQty} @ ${fill.price} pnl=${realPnl.toFixed(2)}`);
+      return { action: "sell", detail: `${reason} -${plan.qty} (보유 ${plan.wantQty}, pnl=${realPnl.toFixed(2)}, ${fill.note})` };
+    }
+    return { action: "hold", detail: "매도 중복 스킵" };
   }
+
   store.setBotPositionState(botId, cur);
-  return { action: "hold", detail: holding ? `보유중 @ ${price}` : `관망 @ ${price}` };
+  return { action: "hold", detail: curQty > 1e-9 ? `보유중 ${curQty} @ ${price}` : `관망 @ ${price}` };
 }
 
 type ScannerPositions = Record<string, PaperPosition>;
