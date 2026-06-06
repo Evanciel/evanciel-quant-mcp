@@ -12,6 +12,7 @@ import { computeRegime, type RegimeParams } from "../core/backtest/regime.js";
 import { atr } from "../core/strategy/indicators.js";
 import { computeEwmaVol, annualizeVol, toLogReturns, computePositionSize, type SizingMethod } from "../core/risk/sizing.js";
 import { evaluatePortfolioRisk } from "../core/risk/portfolio.js";
+import { allocatePortfolio, type AllocationMethod } from "../core/risk/allocation.js";
 import { summarizeDerivatives } from "../core/signals/derivatives.js";
 import { validateRootNode } from "../core/validation/composite-node.js";
 import { collectSpreadSymbols } from "../core/strategy/spread-symbols.js";
@@ -39,6 +40,22 @@ const statOf = (r: ReturnType<typeof runCompositeBacktest>) => ({
 export function validateStrategy(args: { tree: unknown }) {
   const err = validateRootNode(args.tree);
   return { ok: err === null, valid: err === null, error: err };
+}
+
+// ── allocate_portfolio: 다자산 자본 배분 제안(읽기전용) ──
+// equal/inverse_vol(리스크패리티 대각근사)/vol_target. 실시세 로그수익률로 EWMA 변동성 산출.
+export async function allocatePortfolioTool(args: { symbols: string[]; method?: AllocationMethod; interval?: string; days?: number; targetVolAnnual?: number; lambda?: number }) {
+  const symbols = Array.isArray(args.symbols) ? [...new Set(args.symbols.filter((s) => typeof s === "string" && s))] : [];
+  if (symbols.length < 2) return { ok: false, error: "symbols는 최소 2개가 필요합니다" };
+  const method = (args.method || "inverse_vol") as AllocationMethod;
+  const interval = args.interval || "1d";
+  const days = Math.max(20, Math.floor(args.days || 120));
+  const fetched = await Promise.all(symbols.map(async (sym) => {
+    try { const b = await fetchKlines(sym, interval, days); return { symbol: sym, returns: toLogReturns(b.map((x) => x.close)) }; }
+    catch { return { symbol: sym, returns: [] as number[] }; }
+  }));
+  const res = allocatePortfolio(fetched, method, { timeframe: interval, targetVolAnnual: args.targetVolAnnual ?? 0.2, lambda: args.lambda ?? 0.94 });
+  return { ok: true, interval, days, ...res };
 }
 
 // ── scan_universe: 유니버스 스크리닝 + 크로스섹셔널 랭킹(읽기전용) ──

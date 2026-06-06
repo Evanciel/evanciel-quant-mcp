@@ -102,6 +102,13 @@ export const createBotShape = {
   broker: z.string().default("binance"),
   intervalSeconds: z.number().int().default(60).describe("평가 주기(최소 15초)"),
 };
+export const allocatePortfolioShape = {
+  symbols: z.array(z.string()).min(2).describe("배분할 심볼 리스트(최소 2)"),
+  method: z.enum(["equal", "inverse_vol", "vol_target"]).default("inverse_vol").describe("equal=동등, inverse_vol=변동성역가중(리스크패리티 대각근사), vol_target=목표변동성"),
+  interval, days: z.number().int().positive().default(120).describe("변동성 추정용 봉 수"),
+  targetVolAnnual: z.number().positive().default(0.2).describe("vol_target: 목표 연환산 변동성(0.2=20%)"),
+  lambda: z.number().optional().describe("EWMA 감쇠(기본 0.94)"),
+};
 export const scanUniverseShape = {
   universe: z.array(z.string()).min(2).describe("스크리닝할 심볼 리스트(최소 2). 예: [\"BTCUSDT\",\"ETHUSDT\",\"SOLUSDT\"]"),
   metric: z.enum(["gapPct", "roc", "relVolume", "rangePct"]).default("roc").describe("랭킹 메트릭(gapPct=갭, roc=모멘텀, relVolume=거래량급증, rangePct=장중변동성)"),
