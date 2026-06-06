@@ -83,6 +83,66 @@ function extractPositions(ps: unknown, botSymbol: string, market: string, isScan
   return open(ps) ? [{ symbol: botSymbol.toUpperCase(), side: market === "futures" ? "short" : "long", entryAvg: (ps as { entryAvg: number }).entryAvg, qty: (ps as { qty: number }).qty }] : [];
 }
 
+// ── 일반인용 쉬운 말 번역 ──
+const REGIME_KO: Record<string, string> = { trend_up: "상승 추세", trend_down: "하락 추세", range: "횡보장", high_vol: "변동성 큰 장" };
+/** 노드 조건 → 일반인이 읽는 쉬운 한 구절. */
+function plainCondition(c: Record<string, unknown>): string {
+  const o = String(c?.operator ?? "");
+  switch (c?.type) {
+    case "indicator": {
+      const ind = String(c.indicator).toLowerCase();
+      const tf = c.timeframe ? `${c.timeframe} 흐름에서 ` : "";
+      if (ind === "rsi" || ind === "stochastic" || ind === "stochastic_rsi" || ind === "mfi" || ind === "williams_r" || ind === "cci")
+        return `${tf}${o.includes("lt") ? "가격이 많이 빠졌을 때(과매도)" : o.includes("gt") ? "가격이 많이 올랐을 때(과매수)" : "지표 조건일 때"}`;
+      if (ind === "sma" || ind === "ema" || ind === "macd" || ind === "supertrend" || ind === "ichimoku")
+        return `${tf}${o.includes("cross") ? "추세가 바뀔 때" : "추세 방향이 맞을 때"}`;
+      if (ind === "volume") return `${tf}거래량이 터질 때`;
+      return `${tf}${ind.toUpperCase()} 조건일 때`;
+    }
+    case "regime": return `시장이 ${(c.in as string[] ?? []).map((x) => REGIME_KO[x] ?? x).join("·")}일 때만`;
+    case "event": return `${c.calendar ? String(c.calendar) : "주요"} 발표 시간대`;
+    case "time": return "정해진 시간대에만";
+    case "anchor": return "시초가 대비 급등락할 때";
+    case "spread": return `${c.symbolB} 대비 가격차 기준`;
+    case "performance": return "최근 성과 기준";
+    default: return "특정 조건";
+  }
+}
+/** 전략 트리 → 일반인이 읽는 한 문장("이 봇이 뭘 하는지"). */
+function plainStrategy(node: unknown, depth = 0): string {
+  const n = node as Record<string, unknown>;
+  if (!n || depth > 4) return "";
+  if (n.type === "scanner") {
+    const rk = (n.rank ?? {}) as { metric?: string; top?: number };
+    const m: Record<string, string> = { roc: "가장 많이 오른", gapPct: "갭이 큰", relVolume: "거래량 급증한", rangePct: "변동성 큰" };
+    return `여러 종목 중 ${m[rk.metric ?? ""] ?? "조건에 맞는"} 상위 ${rk.top ?? "몇"}개를 자동으로 골라, ${plainStrategy(n.then, depth + 1)}`;
+  }
+  if (n.type === "condition") {
+    const cond = plainCondition(n.condition as Record<string, unknown>);
+    const then = plainStrategy(n.thenNode, depth + 1);
+    const els = n.elseNode ? plainStrategy(n.elseNode, depth + 1) : "";
+    // elseNode가 "거래 안 함"이면 회피 전략으로 읽기
+    if (els && /매매하지|거래 안|쉬|관망/.test(then) && depth === 0) return `${cond}엔 쉬고, 평소엔 ${els}`;
+    return els ? `${cond}이면 ${then}, 아니면 ${els}` : `${cond}, ${then}`;
+  }
+  if (n.type === "composite") {
+    const kids = (n.children as unknown[] ?? []).map((c) => plainStrategy(c, depth + 1)).filter(Boolean);
+    return `여러 전략을 ${n.mode === "weighted" ? "비중대로 섞어" : "우선순위로"} 운용`;
+  }
+  // leaf
+  const s = (n.strategy ?? n) as { rules?: { action: string; conditions: { indicator?: string; operator?: string; value?: unknown }[] }[] };
+  const rules = s.rules ?? [];
+  const buy = rules.find((r) => r.action === "buy");
+  const sell = rules.find((r) => r.action === "sell");
+  // 매수 조건이 사실상 항상거짓(value 음수 큰값)이면 "거래 안 함"으로
+  const neverBuy = buy && buy.conditions?.[0] && typeof buy.conditions[0].value === "number" && (buy.conditions[0].value as number) <= -100;
+  if (neverBuy) return "매매하지 않고 쉼";
+  const buyTxt = buy ? plainCondition({ type: "indicator", ...buy.conditions?.[0] }) : "";
+  if (buy && sell) return `${buyTxt} 사고, 반대 신호엔 파는 전략`;
+  if (buy) return `${buyTxt} 매수하는 전략`;
+  return "전략 운용";
+}
+
 function snapshot() {
   const bots = store.listBots().map((b) => {
     const comp = store.getComposite(b.composite_strategy_id);
@@ -92,6 +152,7 @@ function snapshot() {
     return {
       id: b.id, name: b.name, symbol: b.symbol.toUpperCase(), mode: b.mode, status: b.status,
       strategy: comp ? summarizeStrategy(comp.root_node) : "(전략 없음)",
+      plain: comp ? plainStrategy(comp.root_node) : "전략 없음",
       market, isScanner,
       positions: extractPositions(b.position_state, b.symbol, market, isScanner),
       realizedPnl: +st.realizedPnl.toFixed(2), closes: st.closes, winRate: st.closes > 0 ? +(st.wins / st.closes * 100).toFixed(0) : null,
@@ -166,19 +227,27 @@ h1{font-size:18px;margin:0 0 2px}.sub{color:#8a94a6;font-size:12px;margin-bottom
 .st{font-size:10px;padding:1px 5px;border-radius:4px;margin-left:6px}.run{background:rgba(122,162,247,.15);color:#7aa2f7}.stop{background:#222838;color:#8a94a6}
 .short{background:rgba(244,63,94,.15);color:#f43f5e}.live{background:rgba(245,158,11,.18);color:#f59e0b}
 .sc{background:rgba(168,85,247,.18);color:#a855f7}
-.plist{margin-top:8px}.prow{background:#0e1320;border:1px solid #222838;border-radius:8px;padding:8px 10px;margin-top:6px;font-size:12px}
-.psym{font-weight:600;font-size:13px}.prow .g3{margin-top:6px}
-@media(max-width:560px){.wrap{padding:14px}.hdr{grid-template-columns:1fr 1fr}.pos{grid-template-columns:1fr}.v{font-size:20px}}
+.plist{margin-top:8px}.prow{background:#0e1320;border:1px solid #222838;border-radius:8px;padding:9px 11px;margin-top:6px;font-size:13px}
+.prow b{font-size:14px}.qty{font-size:11px;color:#8a94a6;background:#1a2030;padding:1px 6px;border-radius:4px;margin-left:4px}
+.pmeta{margin-top:5px;font-size:12px;color:#8a94a6}
+.hint{font-size:11px;color:#6b7588;font-weight:400}
+.pill{font-size:12px;font-weight:700;padding:3px 9px;border-radius:999px;margin-left:8px;white-space:nowrap}
+.pill.win{background:rgba(16,185,129,.16);color:#10b981}.pill.lose{background:rgba(244,63,94,.16);color:#f43f5e}.pill.wait{background:#222838;color:#8a94a6}
+.tags{margin-top:7px;display:flex;gap:5px;flex-wrap:wrap}
+.plain{margin-top:10px;font-size:14px;line-height:1.55;color:#dfe6f1}
+.earn{margin-top:9px;font-size:13px;font-weight:600}
+.more{margin-top:10px;font-size:11px;color:#6b7588;cursor:pointer;user-select:none}.more:hover{color:#8a94a6}
+@media(max-width:560px){.wrap{padding:14px}.hdr{grid-template-columns:1fr 1fr}.pos{grid-template-columns:1fr}.v{font-size:20px}.sym{font-size:14px}}
 </style></head><body><div class="wrap">
-<h1>quant-mcp 라이브 대시보드 <span class="dot"></span></h1>
-<div class="sub">봇별 전략 · 포지션 · 실시간 미실현손익(Binance WS) · 움직임 로그</div>
+<h1>내 자동매매 현황 <span class="dot"></span></h1>
+<div class="sub">봇이 알아서 사고팔아요 · 실시간 시세 반영 <span id="upd" style="color:#8a94a6">—</span></div>
 <div class="hdr">
-  <div class="card"><div class="k">봇 / 오픈 포지션</div><div class="v"><span id="bcnt">0</span><span style="font-size:14px;color:#8a94a6"> / </span><span id="cnt">0</span></div></div>
-  <div class="card"><div class="k">미실현 손익 (실시간)</div><div class="v" id="tot">+0.00</div></div>
-  <div class="card"><div class="k">실현 손익 (누적) <span id="upd" style="font-size:10px;color:#8a94a6;font-weight:400">—</span></div><div class="v" id="rtot">+0.00</div></div>
+  <div class="card"><div class="k">작동 중인 봇 / 보유 중</div><div class="v"><span id="bcnt">0</span><span style="font-size:14px;color:#8a94a6"> / </span><span id="cnt">0</span></div></div>
+  <div class="card"><div class="k">지금 손익 <span class="hint">(안 팔았을 때)</span></div><div class="v" id="tot">+0.00</div></div>
+  <div class="card"><div class="k">확정 수익 <span class="hint">(이미 번 돈)</span></div><div class="v" id="rtot">+0.00</div></div>
 </div>
 <div class="pos" id="pos"></div>
-<div class="empty" id="empty">봇이 없습니다. create_bot으로 봇을 만들고 start_bot으로 가동하세요.</div>
+<div class="empty" id="empty">아직 봇이 없어요. 자비스에게 "전략 만들어서 봇 돌려줘"라고 말해보세요.</div>
 <script>
 const TOKEN=${JSON.stringify(token)};
 let bots=[];const prices=new Map();let ws=null;
@@ -192,33 +261,39 @@ function subscribe(){const syms=allSyms().sort();const sig=syms.join(',');
  if(!syms.length){ws=null;return;}const streams=syms.map(s=>s.toLowerCase()+'@ticker').join('/');
  ws=new WebSocket('wss://stream.binance.com:9443/ws/'+streams);
  ws.onmessage=e=>{const d=JSON.parse(e.data);if(d.e==='24hrTicker'){prices.set(d.s,parseFloat(d.c));render()}}}
+function tgl(el){const s=el.nextElementSibling;s.style.display=s.style.display==='block'?'none':'block';}
+const ACT={buy:'🟢 샀어요',sell:'🔴 팔았어요',hold:'유지',create:'봇 생성',start:'시작',stop:'정지',gate:'안내',error:'⚠ 오류'};
+function coin(s){return String(s).replace('USDT','').replace('USDC','')}
 function posRow(p){const cur=prices.get(p.symbol)??p.entryAvg;const sign=p.side==='short'?-1:1;
  const up=sign*(cur-p.entryAvg)/p.entryAvg*100;const abs=sign*(cur-p.entryAvg)*p.qty;
- const badge='<span class="badge '+(p.side==='short'?'short':'')+'">'+(p.side==='short'?'숏':'롱')+'</span>';
- const html='<div class="prow"><div class="row"><div><span class="psym">'+esc(p.symbol)+'</span>'+badge+'</div>'+
+ const dir=p.side==='short'?' <span class="qty">하락베팅</span>':'';
+ const html='<div class="prow"><div class="row"><div><b>'+esc(coin(p.symbol))+'</b>'+dir+' <span class="qty">'+p.qty+'개 보유</span></div>'+
    '<span class="pl '+(up>=0?'up':'dn')+'">'+(up>=0?'+':'')+fmt(up)+'%</span></div>'+
-   '<div class="g3"><div><div class="k">진입</div>'+fmt(p.entryAvg)+'</div><div><div class="k">현재</div>'+fmt(cur)+'</div>'+
-   '<div><div class="k">미실현</div><span class="'+(abs>=0?'up':'dn')+'">'+(abs>=0?'+':'')+fmt(abs)+'</span></div></div></div>';
+   '<div class="pmeta">산 가격 '+fmt(p.entryAvg)+' → 지금 '+fmt(cur)+' · 평가 <span class="'+(abs>=0?'up':'dn')+'">'+(abs>=0?'+':'')+fmt(abs)+'</span></div></div>';
  return {html,abs};}
+function statusPill(sum,hasPos){if(!hasPos)return '<span class="pill wait">⚪ 대기 중</span>';
+ return sum>=0?'<span class="pill win">🟢 수익 중</span>':'<span class="pill lose">🔴 손실 중</span>';}
 function render(){const pos=document.getElementById('pos');let tot=0,n=0,rtot=0;pos.innerHTML='';
  for(const b of bots){const live=b.mode==='live';const ps=b.positions||[];rtot+=b.realizedPnl||0;
-  let body='';
-  if(ps.length){for(const p of ps){const r=posRow(p);tot+=r.abs;n++;body+=r.html;}}
-  else body='<div class="prow" style="color:#8a94a6">관망 중 (포지션 없음)</div>';
-  const rp=b.realizedPnl||0;const wr=b.winRate!=null?' · 승률 '+b.winRate+'%':'';
-  const statBadge=b.closes>0?'<span class="st '+(rp>=0?'run':'stop')+'" title="누적 실현손익">실현 '+(rp>=0?'+':'')+fmt(rp)+' ('+b.closes+'회'+wr+')</span>':'';
-  const scBadge=b.isScanner?'<span class="st sc">스캐너</span>':'';
+  let body='',bsum=0;
+  if(ps.length){for(const p of ps){const r=posRow(p);tot+=r.abs;bsum+=r.abs;n++;body+=r.html;}}
+  else body='<div class="prow" style="color:#8a94a6">지금은 대기 중이에요 (가진 것 없음)</div>';
+  const rp=b.realizedPnl||0;const wr=b.winRate!=null?', '+b.closes+'번 중 '+Math.round(b.winRate*b.closes/100)+'번 수익':'';
+  const earn=b.closes>0?'<div class="earn '+(rp>=0?'up':'dn')+'">💰 지금까지 '+(rp>=0?'+':'')+fmt(rp)+' '+(rp>=0?'벌었어요':'잃었어요')+' <span class="hint">('+b.closes+'번 거래'+wr+')</span></div>':'';
+  const tags=(live?'<span class="st live">실거래</span>':'<span class="st stop">모의</span>')+
+    '<span class="st '+(b.status==='running'?'run':'stop')+'">'+(b.status==='running'?'작동중':'멈춤')+'</span>'+
+    (b.isScanner?'<span class="st sc">자동선별</span>':'');
+  const acts=b.activity.slice(0,2).map(a=>'<div><span class="a">'+(ACT[a.action]||esc(a.action))+'</span><span>'+esc((a.detail||'').replace(/\[페이퍼\]|\[실거래\]/g,''))+'</span></div>').join('');
   const el=document.createElement('div');el.className='card';
-  el.innerHTML='<div class="row"><div><span class="sym">'+esc(b.name)+'</span>'+scBadge+
-    '<span class="st '+(b.status==='running'?'run':'stop')+'">'+(b.status==='running'?'가동중':'중지')+'</span>'+
-    (live?'<span class="st live">실거래</span>':'<span class="st stop">페이퍼</span>')+'</div>'+
-    (ps.length?'<span class="mode">'+ps.length+'개 포지션</span>':'')+'</div>'+
-   '<div class="strat"><b>전략</b> '+esc(b.strategy)+'</div>'+
-   (statBadge?'<div style="margin-top:6px">'+statBadge+'</div>':'')+
-   '<div class="plist">'+body+'</div>'+
-   '<div class="act">'+(b.activity.length?b.activity.map(a=>'<div><span class="a">'+esc(a.action)+'</span><span>'+esc(a.detail||'')+'</span></div>').join(''):'<div>아직 활동 없음</div>')+'</div>';
+  el.innerHTML='<div class="row"><div><span class="sym">'+esc(b.name)+'</span> '+statusPill(bsum,ps.length)+'</div></div>'+
+   '<div class="tags">'+tags+'</div>'+
+   '<div class="plain">📋 '+esc(b.plain)+'</div>'+
+   '<div class="plist">'+body+'</div>'+earn+
+   (acts?'<div class="act">'+acts+'</div>':'')+
+   '<div class="more" onclick="tgl(this)">전략 자세히 ▾</div>'+
+   '<div class="strat" style="display:none"><b>전문 표기</b> '+esc(b.strategy)+'</div>';
   pos.appendChild(el)}
- document.getElementById('bcnt').textContent=bots.length;
+ document.getElementById('bcnt').textContent=bots.filter(b=>b.status==='running').length;
  document.getElementById('cnt').textContent=n;
  const t=document.getElementById('tot');t.textContent=(tot>=0?'+':'')+fmt(tot);t.className='v '+(tot>=0?'up':'dn');
  const rt=document.getElementById('rtot');rt.textContent=(rtot>=0?'+':'')+fmt(rtot);rt.className='v '+(rtot>=0?'up':'dn');
