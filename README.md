@@ -19,6 +19,32 @@ Let any MCP agent (Claude, Cursor, …) design a trading strategy as a validated
 
 ---
 
+## In plain words
+
+**You describe a trading idea in chat. quant-mcp lets the AI actually build it, stress-test it on real past prices, and run it as a practice bot — with no coding and no exchange keys.**
+
+- 🗣️ **Say it** — *"Buy ETH when it dips during an uptrend, but stay out around FOMC announcements."*
+- 🧪 **Test it** — it replays real Binance price history to see if the idea would have held up, and **warns you if the good result is probably just luck**.
+- 🤖 **Run it** — deploy it as a 24/7 *paper* (fake-money) bot and watch a simple, plain-language dashboard.
+
+It's deliberately honest: **it never promises profit.** Its real value is keeping you safe (risk controls) and telling you when a backtest is fooling you (overfitting filters). New to the jargon? Jump to the [Glossary](#glossary--no-finance-degree-needed).
+
+## How it works (3 steps)
+
+```
+  Describe  ─►  Backtest  ─►  Run & watch
+  (your words)  (real prices,   (paper bot +
+                 honest check)   live dashboard)
+```
+
+1. **Describe** — your agent turns your words into a *validated strategy tree* (a small JSON spec it builds for you).
+2. **Backtest** — it runs the strategy over real historical prices, then re-checks on data it never saw ("out-of-sample") so you aren't fooled by overfitting.
+3. **Run & watch** — deploy a paper bot that trades on each new candle, and open a dashboard that explains everything in plain language.
+
+The **same engine** powers all three steps, so what you backtest is exactly what runs — no surprises.
+
+---
+
 ## ⚠️ Honest positioning: a risk filter, not an alpha source
 
 quant-mcp does **not** claim to find alpha. Deep research on this kind of retail infra concluded directional alpha ≈ 0 (243 out-of-sample optimizations → robust alpha of 0; overfitting confirmed). What it gives you that is *genuinely* valuable:
@@ -33,6 +59,8 @@ No tool advertises expected returns. Ever.
 
 ## Table of Contents
 
+- [In plain words](#in-plain-words)
+- [How it works](#how-it-works-3-steps)
 - [Quick start](#quick-start)
 - [What can an agent build?](#what-can-an-agent-build)
 - [Tool reference (22 tools)](#tool-reference-22-tools)
@@ -42,6 +70,7 @@ No tool advertises expected returns. Ever.
 - [Architecture](#architecture)
 - [Roadmap](#roadmap)
 - [Safety](#safety)
+- [Glossary](#glossary--no-finance-degree-needed)
 - [Contributing](#contributing)
 - [License](#license)
 
@@ -272,6 +301,33 @@ src/mcp-server/   stdio MCP server + 22 tools
 - **Dashboard** — binds to `127.0.0.1` only, random per-launch token, read-only, no secrets transmitted.
 
 See [`SETUP-LIVE.md`](SETUP-LIVE.md) before enabling live trading.
+
+---
+
+## Glossary — no finance degree needed
+
+The tables above use some trading jargon. Here's what it all means, in plain words:
+
+| Term | In plain words |
+|---|---|
+| **Backtest** | Replay a strategy over past prices to see how it *would* have done. |
+| **Out-of-sample (OOS)** | Test on data the strategy never "saw" — the honest way to check it isn't just memorizing the past. |
+| **Overfitting** | A strategy that looks amazing on past data only because it was tuned to that exact data — it falls apart live. |
+| **Sharpe ratio** | Return per unit of risk. Higher = smoother gains. |
+| **PSR / DSR** (Probabilistic / Deflated Sharpe) | Stats that estimate the chance a good-looking result was just luck. We use them to **reject false discoveries**. |
+| **Regime** | The market's current "mood" — trending up, trending down, choppy/sideways, or wildly volatile. |
+| **Position sizing** | *How much* to buy. Sizing by volatility / ATR / Kelly stops one bad trade from blowing you up. |
+| **Vol-target · ATR · Kelly** | Three ways to set trade size based on how risky things are right now. |
+| **Drawdown (MDD)** | How far you've fallen from your peak. A circuit breaker cuts risk when this gets big. |
+| **Stop-loss · trailing stop** | Auto-sell orders that cap your loss (trailing = follows the price up to lock in gains). |
+| **TP ladder · scale-in · pyramid** | Take profit in chunks · average down · add to winners — built-in position management. |
+| **Pairs / spread / z-score** | Bet on the *gap* between two coins instead of their direction. |
+| **Regime / anchor / MTF / event conditions** | Trade only in an uptrend · vs the day's open (gap plays) · confirm on a higher timeframe · avoid/trade around FOMC. |
+| **Scanner** | Auto-pick the top N coins from a list (e.g. biggest movers) and trade them. |
+| **Paper trading** | Practice mode with fake money — same logic, zero risk. |
+| **Live / backtest parity** | What you tested is exactly what runs — no hidden differences. |
+| **MCP (Model Context Protocol)** | The open standard that lets AI agents (Claude, Cursor…) use external tools like this. |
+| **BYOK** | "Bring your own keys" — you supply exchange API keys for real trading (off by default). |
 
 ---
 
