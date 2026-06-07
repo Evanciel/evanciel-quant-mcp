@@ -14,7 +14,7 @@ process.env.BINANCE_API_KEY = "x".repeat(64);
 process.env.BINANCE_API_SECRET = "y".repeat(64);
 
 // 주문/취소 기록용(hoisted).
-const calls = vi.hoisted(() => ({ placed: [] as any[], cancelled: [] as string[] }));
+const calls = vi.hoisted(() => ({ placed: [] as any[], cancelled: [] as string[], cashBalance: 100000, throwNextPlace: false, reconcileFilled: false, lastClientId: "" }));
 const klinesMock = vi.hoisted(() => vi.fn());
 
 vi.mock("../src/data/binance-public.js", async (orig) => {
@@ -24,10 +24,15 @@ vi.mock("../src/data/binance-public.js", async (orig) => {
 vi.mock("../src/brokers/index.js", () => ({
   getAdapter: () => ({
     adapter: {
-      async placeOrder(o: any) { calls.placed.push(o); return { orderId: "oid-" + calls.placed.length, symbol: o.symbol, side: o.side, quantity: o.quantity, price: o.price ?? 100, status: "filled", timestamp: new Date() }; },
+      async placeOrder(o: any) {
+        if (calls.throwNextPlace) { calls.throwNextPlace = false; throw new Error("network timeout(mock)"); }
+        calls.placed.push(o); calls.lastClientId = o.clientOrderId;
+        return { orderId: "oid-" + calls.placed.length, symbol: o.symbol, side: o.side, quantity: o.quantity, price: o.price ?? 100, status: "filled", timestamp: new Date() };
+      },
+      async getOrderByClientId(_s: string, cid: string) { return calls.reconcileFilled ? { orderId: "rec-" + cid, symbol: "BTCUSDT", side: "buy", quantity: 0.01, price: 100, status: "filled" as const, timestamp: new Date() } : null; },
       async cancelOrderByClientId(_s: string, cid: string) { calls.cancelled.push(cid); return true; },
       async cancelOrder() { return true; },
-      async getBalance() { return { totalAsset: 100000, cashBalance: 100000, currency: "USDT" }; },
+      async getBalance() { return { totalAsset: calls.cashBalance, cashBalance: calls.cashBalance, currency: "USDT" }; },
       async getPositions() { return []; },
     },
   }),
@@ -81,5 +86,36 @@ describe("라이브 봇 상주 보호주문 배선", () => {
     expect(calls.cancelled.length).toBeGreaterThanOrEqual(1); // 보호주문 취소됨(고아주문 0)
     const st = store.getBot(liveBotId)?.position_state;
     expect(st).toBeNull(); // 청산 → flat
+  });
+});
+
+describe("fillOrder 강화(실잔고 캡 + 체결 reconcile)", () => {
+  const mkBot = (name: string) => {
+    const comp = store.insertComposite({ name, root_node: buyLowSellHigh, symbol: "BTCUSDT", market: "spot", leverage: 1, stop_loss_percent: 5, take_profit_percent: null, tp_ladder: null, scale_in: null, pyramid: null, trailing_stop_percent: null });
+    return store.insertBot({ name, symbol: "BTCUSDT", composite_strategy_id: comp.id, mode: "live", capital: 1000, broker: "binance", interval_seconds: 3600 }).id;
+  };
+
+  it("③ 실잔고 캡: 가용현금이 적으면 주문 수량이 잔고 한도로 축소", async () => {
+    calls.placed.length = 0; calls.cashBalance = 50; // capital 1000이지만 현금 $50만
+    const id = mkBot("cap");
+    klinesMock.mockResolvedValue(barsAt(50, () => 90)); // 가격 90 → engine want ~11, 현금 $50 → ~0.55로 캡
+    const r = await tickBot(id);
+    expect(r.action).toBe("buy");
+    const buy = calls.placed.find((o) => o.type === "market" && o.side === "buy")!;
+    expect(buy.quantity).toBeLessThan(1); // 잔고 한도로 축소(이전 정수floor면 0/미적용)
+    expect(buy.quantity).toBeGreaterThan(0);
+    calls.cashBalance = 100000; // 복원
+  });
+
+  it("④ 체결 reconcile: placeOrder가 모호하게 실패해도 실제 체결됐으면 live 인정(중복 방지)", async () => {
+    calls.placed.length = 0; calls.throwNextPlace = true; calls.reconcileFilled = true; // 첫 매수 throw + 조회는 filled
+    const id = mkBot("recon");
+    klinesMock.mockResolvedValue(barsAt(50, () => 90));
+    const r = await tickBot(id);
+    expect(r.action).toBe("buy");
+    // is_paper=0(실거래 인정)으로 기록 → reconcile이 live로 살림
+    const trades = store.recentTrades(id, 5).filter((t) => t.side === "buy");
+    expect(trades[0].is_paper).toBe(0); // 페이퍼 폴백 아님(reconcile로 live)
+    calls.throwNextPlace = false; calls.reconcileFilled = false; // 복원
   });
 });

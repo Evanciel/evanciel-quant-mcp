@@ -40,8 +40,8 @@ export function sizeFromBalance(cashBalance: number, price: number, fractionPerc
   if (!(cashBalance > 0) || !(price > 0) || !(fractionPercent > 0)) return 0;
   const budget = cashBalance * (Math.min(100, fractionPercent) / 100);
   let qty = budget / price;
-  if (lotStep > 0) qty = Math.floor(qty / lotStep) * lotStep;
-  else qty = Math.floor(qty);
+  // lotStep 지정 시 그 격자로, 아니면 8자리(크립토 분수 — 정수 floor 금지: BTC 소액=0 방지).
+  qty = lotStep > 0 ? Math.floor(qty / lotStep) * lotStep : Math.floor(qty * 1e8) / 1e8;
   return qty > 0 ? qty : 0;
 }
 

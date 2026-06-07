@@ -93,7 +93,8 @@ describe("computePositionDrift", () => {
 describe("sizeFromBalance", () => {
   it("가용현금×비율/가격 lot 절사", () => {
     expect(sizeFromBalance(10000, 100, 50, 0)).toBe(50); // 5000/100
-    expect(sizeFromBalance(10000, 333, 100, 0)).toBe(30); // floor(10000/333)=30
+    expect(sizeFromBalance(10000, 333, 100, 0)).toBeCloseTo(30.03003003, 6); // 분수(정수 floor 아님)
+    expect(sizeFromBalance(50, 60000, 99, 0)).toBeCloseTo(0.000825, 6); // 소액 BTC = 분수(이전 정수floor면 0)
     expect(sizeFromBalance(0, 100, 50)).toBe(0); // 현금 0
     expect(sizeFromBalance(10000, 100, 50, 5)).toBe(50); // lot 5 정렬
   });
