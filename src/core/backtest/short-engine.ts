@@ -14,6 +14,7 @@ import { resolveActiveStrategy, evalLadderSignals } from "./engine";
 interface OHLCV { date: string; open: number; high: number; low: number; close: number; volume: number }
 import { calcMaxDrawdown, calcSharpeRatio } from "./metrics";
 import { openShort, evaluateShortTick, computeShortPnl, type ShortPosition } from "../position/short";
+import { floorQty } from "../position/qty";
 
 export interface ShortRisk {
   stopLossPercent?: number | null;
@@ -75,7 +76,7 @@ export function runShortBacktest(
     if (!pos && sig.sell && !sig.buyRule) {
       // 약세 신호 → 숏 진입(노레버: notional=capital)
       const entryPrice = price * (1 - slip); // 숏 매도 = 슬리피지 불리(가격↓ 체결)
-      const qty = Math.floor(config.initialCapital / entryPrice);
+      const qty = floorQty(config.initialCapital / entryPrice);
       if (qty > 0) {
         pos = openShort({
           entryPrice, qty,

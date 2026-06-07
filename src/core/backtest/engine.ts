@@ -13,6 +13,7 @@ import { calcMaxDrawdown, calcSharpeRatio, calcTradeStats } from "./metrics";
 import { computeRegime } from "./regime";
 // 다단계 부분익절 라더 — 라이브(bot-runner)와 "동일 호출"로 backtest≡live (Design Ref: tp-ladder §2 Option C).
 import { evaluateLadderTick, openPosition, type PositionState, type LadderLevel, type ScaleInConfig, type PyramidConfig } from "../position/ladder";
+import { floorQty } from "../position/qty";
 
 interface OHLCV {
   date: string;
@@ -231,7 +232,7 @@ export function runBacktest(
       if (rule.action === "buy" && position === 0) {
         const investAmount = balance * (rule.quantityPercent / 100);
         // 수수료 예약 후 수량 산정(과거: floor(invest/price) 직후 cost에 수수료 가산 → cost>invest → 잔고 음수/과레버리지)
-        const qty = Math.floor(investAmount / (fillPrice * (1 + config.commission / 100)));
+        const qty = floorQty(investAmount / (fillPrice * (1 + config.commission / 100)));
         if (qty > 0) {
           const cost = qty * fillPrice * (1 + config.commission / 100);
           balance -= cost;
@@ -795,7 +796,7 @@ export function runCompositeBacktest(
           const buyPrice = price * (1 + slip);
           const investAmount = balance * (rule.quantityPercent / 100);
           // 수수료 예약 후 수량 산정(잔고 음수/과레버리지 방지)
-          const qty = Math.floor(investAmount / (buyPrice * (1 + (config.commission ?? 0.1) / 100)));
+          const qty = floorQty(investAmount / (buyPrice * (1 + (config.commission ?? 0.1) / 100)));
           if (qty > 0) {
             balance -= qty * buyPrice * (1 + (config.commission ?? 0.1) / 100);
             position = qty;
@@ -853,7 +854,7 @@ export function runCompositeBacktest(
           const slip = (config.slippage ?? 0.05) / 100;
           const buyPrice = price * (1 + slip);
           const investAmount = balance * (buyRule.quantityPercent / 100);
-          const qty = Math.floor(investAmount / (buyPrice * (1 + (config.commission ?? 0.1) / 100)));
+          const qty = floorQty(investAmount / (buyPrice * (1 + (config.commission ?? 0.1) / 100)));
           if (qty > 0) {
             balance -= qty * buyPrice * (1 + (config.commission ?? 0.1) / 100);
             position = qty;
