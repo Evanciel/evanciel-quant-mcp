@@ -11,6 +11,8 @@ import { collectMtfConditions, buildMtfSeries, type MtfBar } from "../core/strat
 import { collectEventCalendars, buildEventCalendars } from "../core/calendar/calendars.js";
 import { rankUniverse, decideScannerActions, type RankBar } from "../core/scanner/rank.js";
 import { planProtectiveOrders, syncProtective } from "../core/execution/protective.js";
+import { sizeFromBalance, classifyFillStatus } from "../core/execution/reconcile.js";
+// 주: computePositionDrift(포지션 드리프트 정정)는 선물(심볼별 순포지션) 개념. 현물은 공유 잔고라 봇별 귀속 불가 → 선물 봇 도입 시 배선.
 import * as store from "../store/db.js";
 import { getAdapter } from "../brokers/index.js";
 import { liveGate, checkLimits, audit, type Broker } from "../brokers/safety.js";
@@ -31,16 +33,40 @@ async function fillOrder(bot: store.BotRow, side: "buy" | "sell", qty: number, p
   const got = getAdapter(broker, market);
   if (!got) { store.insertLog(bot.id, "gate", "어댑터 없음 → 페이퍼"); return { live: false, price, note: "어댑터없음→페이퍼" }; }
   // 거래소 LOT_SIZE(stepSize)로 수량 정규화 — 안 하면 -1013(LOT_SIZE) 거부. minQty/minNotional 보정 포함.
-  const nq = got.adapter.normalizeQuantity ? await got.adapter.normalizeQuantity(symbol, qty, price) : qty;
-  if (!(nq > 0)) { store.insertLog(bot.id, "gate", `수량 정규화 0(${qty}→${nq}) → 페이퍼`); return { live: false, price, note: "수량0→페이퍼" }; }
+  let nq = got.adapter.normalizeQuantity ? await got.adapter.normalizeQuantity(symbol, qty, price) : qty;
+  // 실잔고 사이징(P0-2): 매수는 가용현금 초과 못 함(insufficient funds 거부 예방). 정적 capital이 실잔고보다 클 때.
+  if (side === "buy" && got.adapter.getBalance) {
+    try {
+      const bal = await got.adapter.getBalance();
+      const affordable = sizeFromBalance(bal.cashBalance, price, 99); // 수수료 여유 1%
+      if (affordable > 0 && affordable < nq) {
+        nq = got.adapter.normalizeQuantity ? await got.adapter.normalizeQuantity(symbol, affordable, price) : affordable;
+        store.insertLog(bot.id, "gate", `실잔고 제한: 주문 ${qty}→${nq}(가용현금 ${bal.cashBalance})`);
+      }
+    } catch { /* 잔고조회 실패 시 정규화수량 그대로(하드리밋이 상한) */ }
+  }
+  if (!(nq > 0)) { store.insertLog(bot.id, "gate", `수량 정규화/잔고 0(${qty}→${nq}) → 페이퍼`); return { live: false, price, note: "수량0→페이퍼" }; }
+  // clientOrderId ≤36자([a-zA-Z0-9-_]): botId 앞 8자 + side + base36 시각(~18자). 모호한 실패 후 reconcile에 재사용.
+  const cid = `o${bot.id.slice(0, 8)}${side[0]}${Date.now().toString(36)}`;
   audit({ event: "bot_order_attempt", botId: bot.id, broker, env: gate.env, symbol, side, qty: nq, price });
   try {
-    // clientOrderId ≤36자([a-zA-Z0-9-_]): botId 앞 8자 + side + base36 시각(~18자).
-    const r = await got.adapter.placeOrder({ symbol, side, type: "market", quantity: nq, clientOrderId: `o${bot.id.slice(0, 8)}${side[0]}${Date.now().toString(36)}` });
+    const r = await got.adapter.placeOrder({ symbol, side, type: "market", quantity: nq, clientOrderId: cid });
     audit({ event: "bot_order_result", botId: bot.id, env: gate.env, orderId: r.orderId, status: r.status });
     store.insertLog(bot.id, "live", `[${gate.env}] 실주문 ${symbol} ${side} qty=${nq} → ${r.status} (${r.orderId})`);
     return { live: true, price: r.price || price, orderId: r.orderId, note: `${gate.env} 실주문`, filledQty: r.quantity || nq };
   } catch (e) {
+    // P0-4 체결 reconcile: 모호한 실패(타임아웃/네트워크)여도 주문이 실제 나갔을 수 있음 → 같은 clientOrderId로 조회.
+    //   실제 체결/접수됐으면 live 인정(다음 틱 중복주문 방지). 안 나갔으면(not_placed) 안전하게 페이퍼 폴백.
+    if (got.adapter.getOrderByClientId) {
+      try {
+        const o = await got.adapter.getOrderByClientId(symbol, cid);
+        const v = classifyFillStatus(o);
+        if (v === "filled" || v === "open") {
+          store.insertLog(bot.id, "live", `[${gate.env}] reconcile: 주문 실제 ${v}(${o?.orderId}) → live 인정(중복방지)`);
+          return { live: true, price: o?.price || price, orderId: o?.orderId, note: `${gate.env} reconcile-${v}`, filledQty: o?.quantity || nq };
+        }
+      } catch { /* reconcile 실패 → 보수적 페이퍼 */ }
+    }
     audit({ event: "bot_order_error", botId: bot.id, error: e instanceof Error ? e.message : String(e) });
     store.insertLog(bot.id, "error", `실주문 실패(${e instanceof Error ? e.message : e}) → 페이퍼 폴백`);
     return { live: false, price, note: "실주문실패→페이퍼" };

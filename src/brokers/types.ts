@@ -76,6 +76,8 @@ export interface BrokerAdapter {
   cancelOrder(orderId: string, symbol?: string): Promise<boolean>;
   // clientOrderId로 취소(상주 보호주문 정리/트레일링 교체). 미구현 어댑터는 undefined.
   cancelOrderByClientId?(symbol: string, clientOrderId: string): Promise<boolean>;
+  // 심볼의 미체결(상주) 주문 목록. 고아 주문 정리/점검용. 미구현 어댑터는 undefined.
+  getOpenOrders?(symbol: string): Promise<OrderResult[]>;
   // clientOrderId로 주문 조회 (모호한 placeOrder 실패 후 실제 체결 여부 reconcile).
   // 미구현 어댑터는 undefined → 호출측은 reconcile 불가로 간주(보수적 처리). 주문 없으면 null.
   getOrderByClientId?(symbol: string, clientOrderId: string): Promise<OrderResult | null>;

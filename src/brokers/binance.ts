@@ -496,4 +496,19 @@ export class BinanceBrokerAdapter extends BaseBrokerAdapter {
       throw e;
     }
   }
+
+  /** 심볼의 미체결(상주) 주문 목록. 고아 보호주문 정리·점검용. spot=/api/v3/openOrders, futures=/fapi/v1/openOrders. */
+  async getOpenOrders(symbol: string): Promise<OrderResult[]> {
+    const path = this.market === "futures" ? "/fapi/v1/openOrders" : "/api/v3/openOrders";
+    const data = await this.request<Array<Record<string, unknown>>>(path, { method: "GET", signed: true, params: { symbol } });
+    return (Array.isArray(data) ? data : []).map((d) => ({
+      orderId: String(d.orderId ?? ""),
+      symbol,
+      side: String(d.side ?? "").toUpperCase() === "SELL" ? "sell" : "buy",
+      quantity: parseFloat(String(d.origQty ?? d.executedQty ?? "0")),
+      price: parseFloat(String(d.stopPrice ?? d.price ?? "0")),
+      status: this.mapStatus(String(d.status ?? "")),
+      timestamp: new Date(Number(d.time ?? d.updateTime ?? Date.now())),
+    }));
+  }
 }
