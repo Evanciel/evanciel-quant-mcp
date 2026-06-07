@@ -6,6 +6,8 @@
 
 `live_status` 툴로 현재 무엇이 설정됐는지 언제든 확인할 수 있습니다(키는 노출 안 됨).
 
+> **✅ 검증 상태 (2026-06-08)**: 머니패스가 **Binance testnet에서 E2E 검증 완료** — 봇 진입 시 거래소에 **상주 손절/익절(STOP/TP) 주문 자동 배치**(봇이 죽어도 거래소가 손절 보호), 트레일링 갱신, 청산 시 자동 취소(고아주문 0), 모호한 실패 시 체결 reconcile(중복주문 방지), 실잔고 기반 사이징(잔고초과 예방), 가격/수량 거래소 필터 정규화. 검증 스크립트: `scripts/verify-testnet-{connection,order-e2e,bot-e2e}.ts`. 상주주문 점검/정리: `scripts/testnet-cleanup-orders.ts`.
+
 ---
 
 ## 0. 페이퍼 (기본, 키 0개) — 이미 작동
@@ -41,6 +43,15 @@
 3. **수동 주문(`place_order`)은 2단계**: 1차 호출=프리뷰+`confirmToken` 반환 → 검토 → 동일 인자 + `confirmToken`으로 2차 호출해야 실제 주문(5분 TTL, 단일사용). 토큰 없이는 **절대 실행 안 됨(fail-closed)**.
 4. **자율 봇(`create_bot mode=live`)**은 사전승인 모델: 마스터 스위치 + 하드리밋 + 멱등으로 통제(봇은 2단계 토큰 없이 돌되, 게이트/리밋이 막음).
 
+### 메인넷 파일럿 체크리스트 (실돈 첫 가동 전)
+- [ ] testnet 봇 E2E 통과 확인(`npx tsx scripts/verify-testnet-bot-e2e.ts` → 매수·상주스톱·정리 PASS).
+- [ ] 메인넷 키 = **출금권한 OFF + IP 화이트리스트** (거래 권한만).
+- [ ] `BINANCE_ENV=live` + `LIVE_TRADING_ENABLED=true` + **`LIVE_MAX_NOTIONAL` 소액**(예: 20~50) + `LIVE_SYMBOL_ALLOWLIST` + `LIVE_DAILY_LOSS_LIMIT`.
+- [ ] 메인넷 연결 확인: `BINANCE_ENV=live`로 `verify-testnet-connection.ts` 실행(읽기전용, 잔고 확인).
+- [ ] 봇 1개·소액·`stop_loss_percent` 설정으로 시작 → `open_dashboard`로 모니터 + 거래소 앱에서 상주 스톱 확인.
+- [ ] 며칠 관찰 후 점진 확대. `audit.jsonl` + `testnet-cleanup-orders.ts`(심볼만 바꿔 메인넷 점검)로 고아주문 0 확인.
+- [ ] ⚠️ **현물만 라이브 지원**(선물 보호주문은 미지원). **지정가 라이브는 v2**(현재 시장가 체결).
+
 ## 3. 라이브 — 한국투자증권(KIS, 한투)
 1. KIS Developers(apiportal.koreainvestment.com)에서 앱키/시크릿 + **모의투자** 신청
 2. 환경변수:
@@ -71,6 +82,9 @@
 | env 기본 | 미설정 시 testnet/mock(안전). 메인넷은 명시 `=live`만 |
 | 2단계 확인토큰 | `place_order`는 토큰 없이 실행 0 (fail-closed, 5분 TTL, 단일사용, 주문해시 바인딩) |
 | 하드리밋 | 노셔널 캡 / 심볼 allowlist / 일일손실 서킷브레이커 (서버측 강제) |
+| 상주 보호주문 | 봇 진입 시 거래소에 SL/TP STOP 주문 자동 배치 → **봇이 죽어도 거래소가 손절 보호**. 트레일링 갱신, 청산 시 자동 취소 |
+| 실잔고 사이징 | 매수는 가용현금 초과 못 함(잔고초과 거부 예방) |
+| 체결 reconcile | 모호한 실패 후 실제 체결여부 조회 → 중복주문 방지 |
 | 멱등 | 동일 주문 중복체결 0 |
 | 감사로그 | 모든 주문 시도/결과를 `~/.quant-mcp/audit.jsonl`에 기록 |
 | 키 위생 | env 런타임만, 로그 마스킹, 출금권한 OFF·IP화이트리스트 권장 |
