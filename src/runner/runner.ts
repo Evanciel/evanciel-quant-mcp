@@ -10,6 +10,7 @@ import { collectSpreadSymbols } from "../core/strategy/spread-symbols.js";
 import { collectMtfConditions, buildMtfSeries, type MtfBar } from "../core/strategy/mtf.js";
 import { collectEventCalendars, buildEventCalendars } from "../core/calendar/calendars.js";
 import { rankUniverse, decideScannerActions, type RankBar } from "../core/scanner/rank.js";
+import { planProtectiveOrders, syncProtective } from "../core/execution/protective.js";
 import * as store from "../store/db.js";
 import { getAdapter } from "../brokers/index.js";
 import { liveGate, checkLimits, audit, type Broker } from "../brokers/safety.js";
@@ -40,6 +41,41 @@ async function fillOrder(bot: store.BotRow, side: "buy" | "sell", qty: number, p
     store.insertLog(bot.id, "error", `실주문 실패(${e instanceof Error ? e.message : e}) → 페이퍼 폴백`);
     return { live: false, price, note: "실주문실패→페이퍼" };
   }
+}
+
+type LiveAdapter = NonNullable<ReturnType<typeof getAdapter>>["adapter"];
+/** 라이브 봇의 어댑터 해석(mode=live + 게이트 통과 + 어댑터 존재 시). 아니면 null(페이퍼=엔진이 스톱 시뮬레이트). */
+function liveAdapterFor(bot: store.BotRow): { adapter: LiveAdapter; env: string } | null {
+  if (bot.mode !== "live") return null;
+  const broker = (["binance", "kis", "kiwoom"].includes(bot.broker) ? bot.broker : "binance") as Broker;
+  const market = "spot" as "spot" | "futures"; // 현물(페이퍼봇과 일치). 선물 보호주문은 후속.
+  const gate = liveGate(broker, market);
+  if (!gate.allowed) return null; // 게이트가 메인넷(LIVE_TRADING_ENABLED) 등 통제. testnet/mock만 통과.
+  const got = getAdapter(broker, market);
+  if (!got) return null;
+  return { adapter: got.adapter, env: gate.env ?? "testnet" };
+}
+
+interface RiskCfg { stopLossPercent?: number | null; takeProfitPercent?: number | null; trailingStopPercent?: number | null }
+
+/**
+ * 라이브 봇의 거래소 상주 보호주문(SL/TP/트레일링)을 현 포지션에 맞게 동기화. 페이퍼/게이트OFF면 no-op(restingIds 그대로).
+ * posQty 0이면 desired=[] → 전부 취소(청산 정리). 트레일링은 peakPrice로 stopPrice 갱신 → 옛 주문 취소+새 주문.
+ */
+async function syncBotProtective(bot: store.BotRow, symbol: string, posQty: number, entryAvg: number, peakPrice: number, risk: RiskCfg, restingIds: string[]): Promise<string[]> {
+  const live = liveAdapterFor(bot);
+  if (!live) return restingIds; // 페이퍼 → 보호주문 없음(엔진이 시뮬레이트)
+  const adapter = live.adapter as { placeOrder: (o: unknown) => Promise<{ orderId: string }>; cancelOrderByClientId?: (s: string, c: string) => Promise<boolean> };
+  const desired = posQty > 1e-9 && entryAvg > 0
+    ? planProtectiveOrders({ botId: bot.id, symbol, positionSide: "long", qty: posQty, entryAvg, extremeSinceEntry: peakPrice, stopLossPercent: risk.stopLossPercent, takeProfitPercent: risk.takeProfitPercent, trailingStopPercent: risk.trailingStopPercent })
+    : [];
+  const res = await syncProtective(
+    desired, restingIds,
+    async (o) => { try { await adapter.placeOrder({ symbol, side: o.side, type: o.type, quantity: o.quantity, stopPrice: o.stopPrice, reduceOnly: o.reduceOnly, clientOrderId: o.clientOrderId }); return o.clientOrderId; } catch (e) { store.insertLog(bot.id, "error", `보호주문 배치 실패(${o.kind} @${o.stopPrice}): ${e instanceof Error ? e.message : e}`); return null; } },
+    async (cid) => { try { return adapter.cancelOrderByClientId ? await adapter.cancelOrderByClientId(symbol, cid) : false; } catch { return false; } },
+  );
+  if (res.placed || res.cancelled) store.insertLog(bot.id, "live", `[${live.env}] 상주 보호주문 ${symbol}: 배치 ${res.placed} / 취소 ${res.cancelled}${res.failed ? ` / 실패 ${res.failed}` : ""}`);
+  return res.restingIds;
 }
 
 export interface PaperPosition {
@@ -144,7 +180,10 @@ export async function tickBot(botId: string): Promise<{ action: "buy" | "sell" |
     const t = store.insertTrade({ bot_id: botId, side: "buy", price: fill.price, qty: plan.qty, pnl: 0, is_paper: fill.live ? 0 : 1, reason, idempotency_key: idem("buy") });
     if (t) {
       const entryAvg = want.entryAvg > 0 ? want.entryAvg : fill.price;
-      store.setBotPositionState(botId, { status: "open", entryAvg, qty: plan.wantQty, openedAt: cur?.openedAt ?? new Date().toISOString() } satisfies PaperPosition, true, true);
+      const peakPrice = Math.max(cur?.peakPrice ?? entryAvg, price);
+      // 라이브: 거래소 상주 보호주문(SL/TP/트레일링) 배치/갱신. 페이퍼: no-op(엔진이 시뮬레이트).
+      const protectiveIds = await syncBotProtective(bot, bot.symbol, plan.wantQty, entryAvg, peakPrice, risk, cur?.protectiveIds ?? []);
+      store.setBotPositionState(botId, { status: "open", entryAvg, qty: plan.wantQty, openedAt: cur?.openedAt ?? new Date().toISOString(), peakPrice, protectiveIds } satisfies PaperPosition, true, true);
       store.insertLog(botId, "buy", `[${fill.live ? "실거래" : "페이퍼"}] ${reason} +${plan.qty} → 보유 ${plan.wantQty} @ ${fill.price}(평단 ${entryAvg.toFixed(2)})`);
       return { action: "buy", detail: `${reason} +${plan.qty} (보유 ${plan.wantQty}, ${fill.note})` };
     }
@@ -159,7 +198,10 @@ export async function tickBot(botId: string): Promise<{ action: "buy" | "sell" |
     const reason = plan.partial ? "부분 익절(라더)" : "전략 청산";
     const t = store.insertTrade({ bot_id: botId, side: "sell", price: fill.price, qty: plan.qty, pnl: realPnl, is_paper: fill.live ? 0 : 1, reason, idempotency_key: idem("sell") });
     if (t) {
-      const next: PaperPosition | null = plan.partial ? { status: "open", entryAvg: refAvg, qty: plan.wantQty, openedAt: cur?.openedAt ?? new Date().toISOString() } : null;
+      // 부분이면 줄어든 수량으로 보호주문 재동기화, 전량 청산이면 desired=[]→전부 취소(고아주문 0).
+      const peakPrice = plan.partial ? Math.max(cur?.peakPrice ?? refAvg, price) : 0;
+      const protectiveIds = await syncBotProtective(bot, bot.symbol, plan.wantQty, refAvg, peakPrice, risk, cur?.protectiveIds ?? []);
+      const next: PaperPosition | null = plan.partial ? { status: "open", entryAvg: refAvg, qty: plan.wantQty, openedAt: cur?.openedAt ?? new Date().toISOString(), peakPrice, protectiveIds } : null;
       store.setBotPositionState(botId, next, true, true);
       store.insertLog(botId, "sell", `[${fill.live ? "실거래" : "페이퍼"}] ${reason} -${plan.qty} → 보유 ${plan.wantQty} @ ${fill.price} pnl=${realPnl.toFixed(2)}`);
       return { action: "sell", detail: `${reason} -${plan.qty} (보유 ${plan.wantQty}, pnl=${realPnl.toFixed(2)}, ${fill.note})` };
@@ -167,8 +209,15 @@ export async function tickBot(botId: string): Promise<{ action: "buy" | "sell" |
     return { action: "hold", detail: "매도 중복 스킵" };
   }
 
+  // 유지(hold). 보유 중이면 트레일링 갱신: peakPrice 올리고 상주 보호주문 재동기화(고점 추종 → 손절가 상향).
+  if (curQty > 1e-9 && cur) {
+    const peakPrice = Math.max(cur.peakPrice ?? cur.entryAvg, price);
+    const protectiveIds = await syncBotProtective(bot, bot.symbol, curQty, cur.entryAvg, peakPrice, risk, cur.protectiveIds ?? []);
+    store.setBotPositionState(botId, { ...cur, peakPrice, protectiveIds });
+    return { action: "hold", detail: `보유중 ${curQty} @ ${price}` };
+  }
   store.setBotPositionState(botId, cur);
-  return { action: "hold", detail: curQty > 1e-9 ? `보유중 ${curQty} @ ${price}` : `관망 @ ${price}` };
+  return { action: "hold", detail: `관망 @ ${price}` };
 }
 
 type ScannerPositions = Record<string, PaperPosition>;

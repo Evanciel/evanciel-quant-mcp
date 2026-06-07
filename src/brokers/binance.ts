@@ -479,4 +479,21 @@ export class BinanceBrokerAdapter extends BaseBrokerAdapter {
     });
     return data.status === "CANCELED";
   }
+
+  /**
+   * clientOrderId로 주문 취소(상주 보호주문 정리/트레일링 교체용). Binance DELETE origClientOrderId + symbol.
+   * 이미 체결/취소/없음(-2011)이면 false(throw 안 함) — 정리는 멱등적으로.
+   */
+  async cancelOrderByClientId(symbol: string, clientOrderId: string): Promise<boolean> {
+    try {
+      const data = await this.request<{ status?: string }>(this.paths.order, {
+        method: "DELETE", signed: true, params: { origClientOrderId: clientOrderId, symbol },
+      });
+      return data.status === "CANCELED";
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      if (msg.includes("-2011") || msg.toLowerCase().includes("unknown order")) return false; // 이미 없음
+      throw e;
+    }
+  }
 }

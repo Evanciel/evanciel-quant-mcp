@@ -74,6 +74,8 @@ export interface BrokerAdapter {
   placeOrder(order: OrderRequest): Promise<OrderResult>;
   // 주문 취소. symbol 필수(Binance 등 거래소가 요구). 미지정 시 어댑터가 credentials.symbol 폴백 시도.
   cancelOrder(orderId: string, symbol?: string): Promise<boolean>;
+  // clientOrderId로 취소(상주 보호주문 정리/트레일링 교체). 미구현 어댑터는 undefined.
+  cancelOrderByClientId?(symbol: string, clientOrderId: string): Promise<boolean>;
   // clientOrderId로 주문 조회 (모호한 placeOrder 실패 후 실제 체결 여부 reconcile).
   // 미구현 어댑터는 undefined → 호출측은 reconcile 불가로 간주(보수적 처리). 주문 없으면 null.
   getOrderByClientId?(symbol: string, clientOrderId: string): Promise<OrderResult | null>;
