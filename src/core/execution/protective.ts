@@ -116,6 +116,10 @@ function num(x: number | null | undefined): number | null {
   return typeof x === "number" && Number.isFinite(x) && x > 0 ? x : null;
 }
 function coid(botId: string, symbol: string, kind: string, price: number): string {
-  // 가격을 멱등키에 포함 → 트레일링 갱신 시 새 슬롯. 8자 해시 대용으로 가격을 정수화.
-  return `${botId}-${symbol}-${kind}-${Math.round(price * 1e2)}`;
+  // 거래소 clientOrderId 한도(≤36자, [a-zA-Z0-9-_])라 botId(UUID 36자)+접미사를 그대로 못 씀.
+  // (botId|symbol|kind|price)의 32비트 해시를 base36으로 → 가격 포함이라 트레일링 갱신 시 새 슬롯(취소+재배치). 안정적·짧음.
+  const key = `${botId}|${symbol}|${kind}|${Math.round(price * 1e2)}`;
+  let h = 0;
+  for (let i = 0; i < key.length; i++) h = (Math.imul(h, 31) + key.charCodeAt(i)) >>> 0;
+  return `p${kind === "sl" ? "S" : "T"}${h.toString(36)}`; // 예: pS1a2b3c (≤10자, kind는 해시키에도 포함)
 }

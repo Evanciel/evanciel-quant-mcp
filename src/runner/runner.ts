@@ -19,7 +19,7 @@ import { liveGate, checkLimits, audit, type Broker } from "../brokers/safety.js"
  * 봇 체결: mode=live + 게이트 통과면 실주문(어댑터), 아니면 페이퍼. 자율봇이라 2단계토큰 없음
  * (생성 시 mode=live=사전승인). 안전=마스터스위치+testnet기본+하드리밋+멱등. 실패 시 페이퍼 폴백+로그.
  */
-async function fillOrder(bot: store.BotRow, side: "buy" | "sell", qty: number, price: number, symbol: string = bot.symbol): Promise<{ live: boolean; price: number; orderId?: string; note: string }> {
+async function fillOrder(bot: store.BotRow, side: "buy" | "sell", qty: number, price: number, symbol: string = bot.symbol): Promise<{ live: boolean; price: number; orderId?: string; note: string; filledQty?: number }> {
   if (bot.mode !== "live") return { live: false, price, note: "페이퍼" };
   const broker = (["binance", "kis", "kiwoom"].includes(bot.broker) ? bot.broker : "binance") as Broker;
   const market = "spot" as "spot" | "futures"; // quant-mcp 러너는 현물만(선물 라이브는 stock-autotrade). 향후 선물 지원 시 심볼/설정 기반 분기.
@@ -30,12 +30,16 @@ async function fillOrder(bot: store.BotRow, side: "buy" | "sell", qty: number, p
   if (!lim.ok) { store.insertLog(bot.id, "gate", `하드리밋(${symbol} ${lim.reason}) → 페이퍼`); return { live: false, price, note: "리밋→페이퍼" }; }
   const got = getAdapter(broker, market);
   if (!got) { store.insertLog(bot.id, "gate", "어댑터 없음 → 페이퍼"); return { live: false, price, note: "어댑터없음→페이퍼" }; }
-  audit({ event: "bot_order_attempt", botId: bot.id, broker, env: gate.env, symbol, side, qty, price });
+  // 거래소 LOT_SIZE(stepSize)로 수량 정규화 — 안 하면 -1013(LOT_SIZE) 거부. minQty/minNotional 보정 포함.
+  const nq = got.adapter.normalizeQuantity ? await got.adapter.normalizeQuantity(symbol, qty, price) : qty;
+  if (!(nq > 0)) { store.insertLog(bot.id, "gate", `수량 정규화 0(${qty}→${nq}) → 페이퍼`); return { live: false, price, note: "수량0→페이퍼" }; }
+  audit({ event: "bot_order_attempt", botId: bot.id, broker, env: gate.env, symbol, side, qty: nq, price });
   try {
-    const r = await got.adapter.placeOrder({ symbol, side, type: "market", quantity: qty, clientOrderId: `${bot.id}-${symbol}-${side}-${Date.now()}` });
+    // clientOrderId ≤36자([a-zA-Z0-9-_]): botId 앞 8자 + side + base36 시각(~18자).
+    const r = await got.adapter.placeOrder({ symbol, side, type: "market", quantity: nq, clientOrderId: `o${bot.id.slice(0, 8)}${side[0]}${Date.now().toString(36)}` });
     audit({ event: "bot_order_result", botId: bot.id, env: gate.env, orderId: r.orderId, status: r.status });
-    store.insertLog(bot.id, "live", `[${gate.env}] 실주문 ${symbol} ${side} qty=${qty} → ${r.status} (${r.orderId})`);
-    return { live: true, price: r.price || price, orderId: r.orderId, note: `${gate.env} 실주문` };
+    store.insertLog(bot.id, "live", `[${gate.env}] 실주문 ${symbol} ${side} qty=${nq} → ${r.status} (${r.orderId})`);
+    return { live: true, price: r.price || price, orderId: r.orderId, note: `${gate.env} 실주문`, filledQty: r.quantity || nq };
   } catch (e) {
     audit({ event: "bot_order_error", botId: bot.id, error: e instanceof Error ? e.message : String(e) });
     store.insertLog(bot.id, "error", `실주문 실패(${e instanceof Error ? e.message : e}) → 페이퍼 폴백`);
@@ -65,13 +69,13 @@ interface RiskCfg { stopLossPercent?: number | null; takeProfitPercent?: number 
 async function syncBotProtective(bot: store.BotRow, symbol: string, posQty: number, entryAvg: number, peakPrice: number, risk: RiskCfg, restingIds: string[]): Promise<string[]> {
   const live = liveAdapterFor(bot);
   if (!live) return restingIds; // 페이퍼 → 보호주문 없음(엔진이 시뮬레이트)
-  const adapter = live.adapter as { placeOrder: (o: unknown) => Promise<{ orderId: string }>; cancelOrderByClientId?: (s: string, c: string) => Promise<boolean> };
+  const adapter = live.adapter as { placeOrder: (o: unknown) => Promise<{ orderId: string }>; cancelOrderByClientId?: (s: string, c: string) => Promise<boolean>; normalizeQuantity?: (s: string, q: number, p: number) => Promise<number> };
   const desired = posQty > 1e-9 && entryAvg > 0
     ? planProtectiveOrders({ botId: bot.id, symbol, positionSide: "long", qty: posQty, entryAvg, extremeSinceEntry: peakPrice, stopLossPercent: risk.stopLossPercent, takeProfitPercent: risk.takeProfitPercent, trailingStopPercent: risk.trailingStopPercent })
     : [];
   const res = await syncProtective(
     desired, restingIds,
-    async (o) => { try { await adapter.placeOrder({ symbol, side: o.side, type: o.type, quantity: o.quantity, stopPrice: o.stopPrice, reduceOnly: o.reduceOnly, clientOrderId: o.clientOrderId }); return o.clientOrderId; } catch (e) { store.insertLog(bot.id, "error", `보호주문 배치 실패(${o.kind} @${o.stopPrice}): ${e instanceof Error ? e.message : e}`); return null; } },
+    async (o) => { try { const nq = adapter.normalizeQuantity ? await adapter.normalizeQuantity(symbol, o.quantity, o.stopPrice) : o.quantity; await adapter.placeOrder({ symbol, side: o.side, type: o.type, quantity: nq, stopPrice: o.stopPrice, reduceOnly: o.reduceOnly, clientOrderId: o.clientOrderId }); return o.clientOrderId; } catch (e) { store.insertLog(bot.id, "error", `보호주문 배치 실패(${o.kind} @${o.stopPrice}): ${e instanceof Error ? e.message : e}`); return null; } },
     async (cid) => { try { return adapter.cancelOrderByClientId ? await adapter.cancelOrderByClientId(symbol, cid) : false; } catch { return false; } },
   );
   if (res.placed || res.cancelled) store.insertLog(bot.id, "live", `[${live.env}] 상주 보호주문 ${symbol}: 배치 ${res.placed} / 취소 ${res.cancelled}${res.failed ? ` / 실패 ${res.failed}` : ""}`);
