@@ -163,7 +163,7 @@ export class BinanceBrokerAdapter extends BaseBrokerAdapter {
   // ── 수량 정규화(LOT_SIZE / MIN_NOTIONAL) ──
   private filterCache = new Map<
     string,
-    { stepSize: number; minQty: number; minNotional: number }
+    { stepSize: number; minQty: number; minNotional: number; tickSize: number }
   >();
 
   private async symbolFilters(symbol: string) {
@@ -186,14 +186,28 @@ export class BinanceBrokerAdapter extends BaseBrokerAdapter {
       filters.find(
         (x) => x.filterType === "NOTIONAL" || x.filterType === "MIN_NOTIONAL",
       ) || {};
+    const price = filters.find((x) => x.filterType === "PRICE_FILTER") || {};
 
     const f = {
       stepSize: parseFloat(lot.stepSize || "0"),
       minQty: parseFloat(lot.minQty || "0"),
       minNotional: parseFloat(notional.notional || notional.minNotional || "0"),
+      tickSize: parseFloat(price.tickSize || "0"),
     };
     this.filterCache.set(symbol, f);
     return f;
+  }
+
+  /**
+   * 가격을 거래소 tickSize(PRICE_FILTER) 격자로 라운딩. 지정가·스톱가에 적용해야 -1013(PRICE_FILTER) 거부 방지.
+   * tickSize 미상 시 원본 반환.
+   */
+  async normalizePrice(symbol: string, price: number): Promise<number> {
+    const { tickSize } = await this.symbolFilters(symbol);
+    if (!tickSize || !(price > 0)) return price;
+    const rounded = Math.round(price / tickSize) * tickSize;
+    const decimals = Math.max(0, Math.round(-Math.log10(tickSize)));
+    return parseFloat(rounded.toFixed(decimals));
   }
 
   /**
@@ -374,14 +388,14 @@ export class BinanceBrokerAdapter extends BaseBrokerAdapter {
     };
 
     if (o.type === "limit" && o.price != null) {
-      params.price = String(o.price);
+      params.price = String(await this.normalizePrice(o.symbol, o.price)); // tickSize 라운딩(-1013 방지)
       params.timeInForce = "GTC";
     }
 
-    // 보호주문: 트리거 가격(stopPrice) 필수. stop_limit은 지정가(price)도 필요.
+    // 보호주문: 트리거 가격(stopPrice) 필수. stop_limit은 지정가(price)도 필요. 둘 다 tickSize 라운딩.
     if ((o.type === "stop_market" || o.type === "stop_limit" || o.type === "take_profit_market") && o.stopPrice != null) {
-      params.stopPrice = String(o.stopPrice);
-      if (o.type === "stop_limit" && o.price != null) { params.price = String(o.price); params.timeInForce = "GTC"; }
+      params.stopPrice = String(await this.normalizePrice(o.symbol, o.stopPrice));
+      if (o.type === "stop_limit" && o.price != null) { params.price = String(await this.normalizePrice(o.symbol, o.price)); params.timeInForce = "GTC"; }
     }
 
     // 포지션 축소 전용(보호주문·숏커버). 선물 reduceOnly 플래그.
@@ -452,22 +466,16 @@ export class BinanceBrokerAdapter extends BaseBrokerAdapter {
   }
 
   /**
-   * 주문 취소. 현물은 orderId만으로 가능하나 선물은 symbol이 필요하다.
-   * 선물에서 symbol을 모르는 경우 안전하게 실패(메인넷 취소를 임의 심볼로 시도하지 않음).
+   * 주문 취소. **현물·선물 모두 symbol 필수**(Binance DELETE /order). 이전엔 현물에서 symbol 누락 →
+   * -1102(symbol 누락)로 취소 실패(testnet 검증서 적발). symbol 인자 우선, 없으면 credentials.symbol 폴백.
    */
-  async cancelOrder(orderId: string): Promise<boolean> {
-    const params: Record<string, string> = { orderId };
-    if (this.market === "futures") {
-      const symbol = String(this.credentials.symbol || "");
-      if (!symbol) {
-        throw new Error("선물 주문 취소에는 symbol이 필요합니다(credentials.symbol).");
-      }
-      params.symbol = symbol;
-    }
+  async cancelOrder(orderId: string, symbol?: string): Promise<boolean> {
+    const sym = String(symbol || this.credentials.symbol || "");
+    if (!sym) throw new Error("주문 취소에는 symbol이 필요합니다(인자 또는 credentials.symbol).");
     const data = await this.request<{ status?: string }>(this.paths.order, {
       method: "DELETE",
       signed: true,
-      params,
+      params: { orderId, symbol: sym },
     });
     return data.status === "CANCELED";
   }
