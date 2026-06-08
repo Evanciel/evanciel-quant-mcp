@@ -79,27 +79,21 @@ describe("loadCredentialsFile (no-override)", () => {
 });
 
 describe("enableLive / disableLive (라이브 친화 원스톱)", () => {
-  it("enableLive: 마스터 ON + 안전 기본값(캡50/서킷50) 자동 채움, process.env 즉시 반영", async () => {
+  it("enableLive: 마스터 ON만(캡/서킷 미지정 시 미저장 → safety가 통화별 기본 적용)", async () => {
     const C = await load();
     const { written } = C.enableLive();
     expect(written).toContain("LIVE_TRADING_ENABLED");
     expect(process.env.LIVE_TRADING_ENABLED).toBe("true");
-    expect(process.env.LIVE_MAX_NOTIONAL).toBe(C.LIVE_DEFAULTS.LIVE_MAX_NOTIONAL);
-    expect(process.env.LIVE_DAILY_LOSS_LIMIT).toBe(C.LIVE_DEFAULTS.LIVE_DAILY_LOSS_LIMIT);
+    expect(process.env.LIVE_MAX_NOTIONAL).toBeUndefined();   // 통화별 기본은 safety.ts에서(여기 저장 안 함=KRW버그 방지)
+    expect(process.env.LIVE_DAILY_LOSS_LIMIT).toBeUndefined();
   });
-  it("enableLive(opts): 지정 캡/allowlist 적용", async () => {
+  it("enableLive(opts): 지정 캡/allowlist만 적용", async () => {
     const C = await load();
     C.enableLive({ maxNotional: "30", allowlist: "BTCUSDT" });
     expect(process.env.LIVE_MAX_NOTIONAL).toBe("30");
     expect(process.env.LIVE_SYMBOL_ALLOWLIST).toBe("BTCUSDT");
   });
-  it("기존 캡이 있으면 enableLive가 덮어쓰지 않음(유지)", async () => {
-    const C = await load();
-    C.upsertCredentials({ LIVE_MAX_NOTIONAL: "20" });
-    C.enableLive();
-    expect(process.env.LIVE_MAX_NOTIONAL).toBe("20");
-  });
-  it("disableLive: 마스터 OFF(긴급 정지), 캡 등은 유지", async () => {
+  it("disableLive: 마스터 OFF(긴급 정지), 명시 캡은 유지", async () => {
     const C = await load();
     C.enableLive({ maxNotional: "30" });
     C.disableLive();
@@ -108,16 +102,27 @@ describe("enableLive / disableLive (라이브 친화 원스톱)", () => {
   });
 });
 
-describe("checkLimits 안전 기본 캡(친화+안전)", () => {
-  it("마스터 ON + 캡 미설정 → DEFAULT_LIVE_MAX_NOTIONAL로 자동 캡(무제한 금지)", async () => {
+describe("checkLimits 통화 인식 안전 기본 캡(KRW 버그 수정)", () => {
+  it("USDT 마스터 ON + 캡 미설정 → USDT 기본 캡(100)으로 자동", async () => {
     const S = await import("../src/brokers/safety.js");
     process.env.LIVE_TRADING_ENABLED = "true";
     delete process.env.LIVE_MAX_NOTIONAL;
-    const over = S.checkLimits({ symbol: "BTCUSDT", notional: S.DEFAULT_LIVE_MAX_NOTIONAL + 1 });
-    expect(over.ok).toBe(false);
-    expect(over.reason).toContain("기본값");
-    const under = S.checkLimits({ symbol: "BTCUSDT", notional: S.DEFAULT_LIVE_MAX_NOTIONAL - 1 });
-    expect(under.ok).toBe(true);
+    expect(S.checkLimits({ symbol: "BTCUSDT", notional: 101, quoteCurrency: "USDT" }).ok).toBe(false);
+    expect(S.checkLimits({ symbol: "BTCUSDT", notional: 99, quoteCurrency: "USDT" }).ok).toBe(true);
+  });
+  it("🐛수정: KRW 봇은 USDT 캡(100) 아닌 KRW 기본 캡(150,000) 적용 → 7만원 주식 1주 통과", async () => {
+    const S = await import("../src/brokers/safety.js");
+    process.env.LIVE_TRADING_ENABLED = "true";
+    delete process.env.LIVE_MAX_NOTIONAL;
+    // 삼성전자 1주 ~70,000원: 이전(USDT 50/100 캡)이면 거부됐음 → 이제 KRW 기본 150,000으로 통과
+    expect(S.checkLimits({ symbol: "005930", notional: 70000, quoteCurrency: "KRW" }).ok).toBe(true);
+    expect(S.checkLimits({ symbol: "005930", notional: 150001, quoteCurrency: "KRW" }).ok).toBe(false);
+  });
+  it("명시 LIVE_MAX_NOTIONAL은 통화 불문 그대로 적용(사용자 의도 우선)", async () => {
+    const S = await import("../src/brokers/safety.js");
+    process.env.LIVE_TRADING_ENABLED = "true";
+    process.env.LIVE_MAX_NOTIONAL = "200000";
+    expect(S.checkLimits({ symbol: "005930", notional: 150000, quoteCurrency: "KRW" }).ok).toBe(true);
   });
   it("마스터 OFF(페이퍼/testnet) + 캡 미설정 → 캡 없음(가짜돈이라 제한 불필요)", async () => {
     const S = await import("../src/brokers/safety.js");

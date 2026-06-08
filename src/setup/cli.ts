@@ -73,8 +73,10 @@ export async function runSetup(): Promise<void> {
       console.log("     출금 끈 뒤 다시 'npx quant-mcp setup' 실행하면 실거래가 켜집니다.");
       rl.close(); return;
     }
-    const capIn = (await ask(`  주문당 최대 금액(USDT) [${LIVE_DEFAULTS.LIVE_MAX_NOTIONAL}]: `)).trim();
-    const allowIn = (await ask("  거래 허용 종목(쉼표, 비우면 전체 허용) [예: BTCUSDT,ETHUSDT]: ")).trim();
+    const ccy = broker === "binance" ? "USDT" : "KRW";
+    const capHint = broker === "binance" ? LIVE_DEFAULTS.USDT.cap : LIVE_DEFAULTS.KRW.cap;
+    const capIn = (await ask(`  주문당 최대 금액(${ccy}) [Enter=기본 ${capHint}]: `)).trim();
+    const allowIn = (await ask(`  거래 허용 종목(쉼표, 비우면 전체 허용) [예: ${broker === "binance" ? "BTCUSDT,ETHUSDT" : "005930,000660"}]: `)).trim();
     const r = enableLive({ maxNotional: capIn || undefined, allowlist: allowIn || undefined });
     console.log(`  🟢 실거래 ON — 마스터 스위치 + 안전 기본값 적용(${r.written.join(", ")}).`);
     const ls = liveSettingsStatus();

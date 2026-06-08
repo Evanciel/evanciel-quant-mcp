@@ -11,8 +11,11 @@
  *   - Order: POST /uapi/domestic-stock/v1/trading/order-cash with headers
  *     authorization Bearer + appkey + appsecret + tr_id + custtype 'P' + hashkey.
  *   - hashkey: POST /uapi/hashkey of the JSON body → HASH header value.
- *   - tr_id 2x2: T=live / V=mock; buy 0802U / sell 0801U; balance 8434R.
- *   - Body fields are UPPER_SNAKE: CANO / ACNT_PRDT_CD / PDNO / ORD_DVSN / ORD_QTY / ORD_UNPR.
+ *   - tr_id 2x2: T=live / V=mock. Order codes updated for the 2025 NXT(대체거래소) revision —
+ *     buy TTTC0012U / sell TTTC0011U / cancel TTTC0013U / balance TTTC8434R (mock = V-prefix).
+ *     (Verified 2026-06 against official koreainvestment/open-trading-api examples_llm.)
+ *   - Body fields are UPPER_SNAKE: CANO / ACNT_PRDT_CD / PDNO / ORD_DVSN / ORD_QTY / ORD_UNPR
+ *     + EXCG_ID_DVSN_CD='KRX' (now REQUIRED on order-cash AND order-rvsecncl since the NXT revision).
  *   - Host:port — mock 29443 / live 9443. Success = rt_cd === '0'.
  *
  * Credentials (Record<string,string>, injected by caller — never read process.env here):
@@ -44,11 +47,18 @@ const URLS: Record<KisEnv, string> = {
   live: "https://openapi.koreainvestment.com:9443",
 };
 
-/** tr_id table (2x2 + reads). T-prefix = live, V-prefix = mock (design §7). */
+/**
+ * tr_id table (2x2 + reads). T-prefix = live, V-prefix = mock.
+ * Order tr_ids follow the 2025 NXT revision (buy 0012U / sell 0011U / cancel 0013U); balance 8434R unchanged.
+ * Source: official koreainvestment/open-trading-api examples_llm/domestic_stock (order_cash, order_rvsecncl).
+ */
 const TR_IDS: Record<KisEnv, { buy: string; sell: string; balance: string; cancel: string }> = {
-  live: { buy: "TTTC0802U", sell: "TTTC0801U", balance: "TTTC8434R", cancel: "TTTC0803U" },
-  mock: { buy: "VTTC0802U", sell: "VTTC0801U", balance: "VTTC8434R", cancel: "VTTC0803U" },
+  live: { buy: "TTTC0012U", sell: "TTTC0011U", balance: "TTTC8434R", cancel: "TTTC0013U" },
+  mock: { buy: "VTTC0012U", sell: "VTTC0011U", balance: "VTTC8434R", cancel: "VTTC0013U" },
 };
+
+/** 거래소 ID 구분 코드. 2025 NXT(대체거래소) 개편 이후 주문/취소 바디 필수 필드. KRX=한국거래소. */
+const EXCG_ID_DVSN_CD = "KRX";
 
 /** inquire-price tr_id is identical for live and mock (read-only quotation). */
 const TR_ID_PRICE = "FHKST01010100";
@@ -434,6 +444,7 @@ export class KisBrokerAdapter extends BaseBrokerAdapter {
       ORD_DVSN: ordDvsn,
       ORD_QTY: String(Math.trunc(order.quantity)),
       ORD_UNPR: ordUnpr,
+      EXCG_ID_DVSN_CD, // NXT 개편 이후 필수(없으면 주문 거부)
     };
 
     const hashkey = await this.getHashkey(body);
@@ -457,13 +468,14 @@ export class KisBrokerAdapter extends BaseBrokerAdapter {
     };
   }
 
-  async cancelOrder(orderId: string): Promise<boolean> {
+  async cancelOrder(orderId: string, _symbol?: string): Promise<boolean> {
     this.assertAccount("cancel order");
 
     if (!orderId) {
       throw new Error("Cannot cancel order: orderId is required");
     }
 
+    // KIS cancel keys off ORGN_ODNO (original order no), not the stock code → _symbol unused (kept for port symmetry).
     const body: Record<string, string> = {
       CANO: this.cano,
       ACNT_PRDT_CD: this.acntPrdtCd,
@@ -474,6 +486,7 @@ export class KisBrokerAdapter extends BaseBrokerAdapter {
       ORD_QTY: "0",
       ORD_UNPR: "0",
       QTY_ALL_ORD_YN: "Y", // cancel the full remaining quantity
+      EXCG_ID_DVSN_CD, // NXT 개편 이후 필수
     };
 
     const hashkey = await this.getHashkey(body);

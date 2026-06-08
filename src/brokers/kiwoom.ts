@@ -396,15 +396,15 @@ export class KiwoomBrokerAdapter extends BaseBrokerAdapter {
 
   /**
    * 주문 취소(/api/dostk/ordr, api-id kt10003). 원주문번호=orig_ord_no.
-   * 취소도 종목/수량을 요구할 수 있어 알 수 없는 값은 안전 디폴트('0'=전량 취소 의미).
+   * 키움 kt10003은 **stk_cd 필수**(공식 가이드 + .NET 래퍼 확인) → symbol 인자로 채움. cncl_qty '0'=잔량 전부.
    */
-  async cancelOrder(orderId: string): Promise<boolean> {
+  async cancelOrder(orderId: string, symbol?: string): Promise<boolean> {
     try {
       const body: Record<string, unknown> = {
         dmst_stex_tp: "KRX",
         orig_ord_no: orderId,
-        // 종목코드 미상 시 빈 값(키움 취소는 원주문번호 기준). 수량 '0'=잔량 전부.
-        stk_cd: "",
+        // 키움 취소는 종목코드 필수. symbol 미지정 시 빈 값(거래소가 거부할 수 있음 → 호출측이 symbol 전달 권장).
+        stk_cd: symbol ? this.normalizeSymbol(symbol) : "",
         cncl_qty: "0",
       };
       const { data } = await this.post("/api/dostk/ordr", API_ID.cancel, body);

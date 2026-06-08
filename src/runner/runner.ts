@@ -28,7 +28,9 @@ async function fillOrder(bot: store.BotRow, side: "buy" | "sell", qty: number, p
   const gate = liveGate(broker, market);
   if (!gate.allowed) { store.insertLog(bot.id, "gate", `라이브 차단(${gate.reason}) → 페이퍼`); return { live: false, price, note: "게이트 차단→페이퍼" }; }
   // 하드리밋: 노셔널캡 + 심볼 allowlist + 일일손실 서킷(스캐너 멀티심볼도 심볼별로 통과해야 실주문).
-  const lim = checkLimits({ symbol, notional: price * qty });
+  // 통화 인식: Binance=USDT, 한투/키움=KRW → 통화별 안전 기본 캡(KRW 봇에 달러캡 적용 버그 방지).
+  const quoteCurrency = broker === "binance" ? "USDT" : "KRW";
+  const lim = checkLimits({ symbol, notional: price * qty, quoteCurrency });
   if (!lim.ok) { store.insertLog(bot.id, "gate", `하드리밋(${symbol} ${lim.reason}) → 페이퍼`); return { live: false, price, note: "리밋→페이퍼" }; }
   const got = getAdapter(broker, market);
   if (!got) { store.insertLog(bot.id, "gate", "어댑터 없음 → 페이퍼"); return { live: false, price, note: "어댑터없음→페이퍼" }; }

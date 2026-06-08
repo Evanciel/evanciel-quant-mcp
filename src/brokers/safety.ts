@@ -54,23 +54,38 @@ export function liveGate(broker: Broker, market: "spot" | "futures" = "spot"): {
 }
 
 /**
- * 라이브 안전 기본 캡(USDT). 마스터 ON인데 LIVE_MAX_NOTIONAL을 안 정했어도 무제한이 아니라 이 값으로 캡.
- * "키만 넣으면 바로 매매"의 친화성 + 안전을 동시에: 사용자가 안 정해도 소액으로 보호. 올리려면 LIVE_MAX_NOTIONAL 설정.
+ * 통화별 라이브 안전 기본값. 마스터 ON인데 LIVE_MAX_NOTIONAL/LIVE_DAILY_LOSS_LIMIT을 안 정했어도
+ * 무제한이 아니라 이 값으로 보호. **통화 인식 필수**: Binance=USDT(달러), 한투/키움=KRW(원).
+ * 이전 버그: KRW 봇에 USDT 기준 캡(50)을 적용 → 1주(수만 원)도 거부 → KR 거래 불가. 통화별 분기로 해결.
  */
-export const DEFAULT_LIVE_MAX_NOTIONAL = 100;
+export const LIVE_DEFAULTS_BY_CCY: Record<string, { cap: number; dailyLoss: number }> = {
+  USDT: { cap: 100, dailyLoss: 50 },
+  USD: { cap: 100, dailyLoss: 50 },
+  KRW: { cap: 150_000, dailyLoss: 75_000 }, // 소액이되 KRW 주식 1주는 살 수 있게(원 단위)
+};
+const DEFAULT_CCY = "USDT";
+function ccyDefaults(quoteCurrency?: string) { return LIVE_DEFAULTS_BY_CCY[(quoteCurrency || DEFAULT_CCY).toUpperCase()] ?? LIVE_DEFAULTS_BY_CCY[DEFAULT_CCY]; }
+/** @deprecated 통화 인식 LIVE_DEFAULTS_BY_CCY 사용. 하위호환용 USDT 기본 캡. */
+export const DEFAULT_LIVE_MAX_NOTIONAL = LIVE_DEFAULTS_BY_CCY.USDT.cap;
 
-/** 서버측 하드리밋(LLM 우회 불가 pre-trade). 노셔널캡 + 심볼 allowlist + 일일손실 서킷. */
-export function checkLimits(order: { symbol: string; notional: number }): { ok: boolean; reason: string } {
+/**
+ * 서버측 하드리밋(LLM 우회 불가 pre-trade). 노셔널캡 + 심볼 allowlist + 일일손실 서킷.
+ * quoteCurrency: 주문 통화(USDT/KRW). 명시 캡/서킷 미설정 시 통화별 안전 기본값 적용(KRW 버그 방지).
+ */
+export function checkLimits(order: { symbol: string; notional: number; quoteCurrency?: string }): { ok: boolean; reason: string } {
   const liveActive = trim(process.env.LIVE_TRADING_ENABLED) === "true";
-  // 명시 캡 우선. 라이브 마스터 ON인데 미설정이면 안전 기본 캡(무제한 금지). 페이퍼/testnet 마스터 OFF면 0(캡 없음).
-  const cap = Number(trim(process.env.LIVE_MAX_NOTIONAL) || "0") || (liveActive ? DEFAULT_LIVE_MAX_NOTIONAL : 0);
-  if (cap > 0 && order.notional > cap) return { ok: false, reason: `노셔널 ${order.notional} > 캡 ${cap}(LIVE_MAX_NOTIONAL${Number(trim(process.env.LIVE_MAX_NOTIONAL) || "0") ? "" : " 기본값"})` };
+  const def = ccyDefaults(order.quoteCurrency);
+  // 명시 캡 우선. 라이브 마스터 ON인데 미설정이면 통화별 안전 기본 캡(무제한 금지). 페이퍼/testnet 마스터 OFF면 0(캡 없음).
+  const explicitCap = Number(trim(process.env.LIVE_MAX_NOTIONAL) || "0");
+  const cap = explicitCap || (liveActive ? def.cap : 0);
+  if (cap > 0 && order.notional > cap) return { ok: false, reason: `노셔널 ${order.notional} > 캡 ${cap}(LIVE_MAX_NOTIONAL${explicitCap ? "" : ` ${order.quoteCurrency || DEFAULT_CCY} 기본값`})` };
   const allow = trim(process.env.LIVE_SYMBOL_ALLOWLIST);
   if (allow && !allow.split(",").map((s) => s.trim().toUpperCase()).includes(order.symbol.toUpperCase()))
     return { ok: false, reason: `${order.symbol} 미허용(LIVE_SYMBOL_ALLOWLIST)` };
   const dl = dailyRealizedLoss();
-  const circuit = Number(trim(process.env.LIVE_DAILY_LOSS_LIMIT) || "0");
-  if (circuit > 0 && dl <= -Math.abs(circuit)) return { ok: false, reason: `일일 손실 ${dl} ≤ 서킷 -${circuit}(LIVE_DAILY_LOSS_LIMIT) → 거래중단` };
+  const explicitCircuit = Number(trim(process.env.LIVE_DAILY_LOSS_LIMIT) || "0");
+  const circuit = explicitCircuit || (liveActive ? def.dailyLoss : 0);
+  if (circuit > 0 && dl <= -Math.abs(circuit)) return { ok: false, reason: `일일 손실 ${dl} ≤ 서킷 -${circuit}(LIVE_DAILY_LOSS_LIMIT${explicitCircuit ? "" : " 기본값"}) → 거래중단` };
   return { ok: true, reason: "ok" };
 }
 

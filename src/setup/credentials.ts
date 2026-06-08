@@ -40,19 +40,19 @@ export const LIVE_SETTING_KEYS = ["LIVE_TRADING_ENABLED", "LIVE_MAX_NOTIONAL", "
 
 const ALL_KEYS = new Set([...Object.values(BROKER_FIELDS).flat().map((f) => f.key), ...LIVE_SETTING_KEYS]);
 
-/** 안전 기본 라이브 설정(사용자가 따로 안 정해도 소액·보호되게). 캡 미지정 시 50, 일일손실 서킷 50. */
-export const LIVE_DEFAULTS = { LIVE_MAX_NOTIONAL: "50", LIVE_DAILY_LOSS_LIMIT: "50" } as const;
+/** 통화 인식 안전 기본값(표시/안내용 라벨). 실제 캡 적용은 safety.ts LIVE_DEFAULTS_BY_CCY(USDT/KRW). */
+export const LIVE_DEFAULTS = { USDT: { cap: "100", dailyLoss: "50" }, KRW: { cap: "150000", dailyLoss: "75000" } } as const;
 
 /**
- * 실거래 원스톱 활성화: 마스터 스위치 ON + 안전 기본값 채움(이미 있으면 유지). 키는 별도 upsert로 이미 저장됨.
- * maxNotional 지정 시 그 값으로 캡. 반환=실제 기록된 키.
+ * 실거래 원스톱 활성화: 마스터 스위치 ON(+ 사용자가 명시한 캡/allowlist만 저장). 키는 별도 upsert로 이미 저장됨.
+ * 캡/서킷을 비우면 **저장하지 않음** → safety.ts가 통화별 안전 기본값 적용(KRW 봇에 USDT 캡 박히는 버그 방지).
+ * 반환=실제 기록된 키.
  */
 export function enableLive(opts?: { maxNotional?: string; allowlist?: string; dailyLossLimit?: string }): { written: string[]; path: string } {
-  const cur = parseEnvFile(credentialsPath());
   const up: Record<string, string> = { LIVE_TRADING_ENABLED: "true" };
-  up.LIVE_MAX_NOTIONAL = opts?.maxNotional || cur.LIVE_MAX_NOTIONAL || LIVE_DEFAULTS.LIVE_MAX_NOTIONAL;
-  up.LIVE_DAILY_LOSS_LIMIT = opts?.dailyLossLimit || cur.LIVE_DAILY_LOSS_LIMIT || LIVE_DEFAULTS.LIVE_DAILY_LOSS_LIMIT;
-  if (opts?.allowlist || cur.LIVE_SYMBOL_ALLOWLIST) up.LIVE_SYMBOL_ALLOWLIST = opts?.allowlist || cur.LIVE_SYMBOL_ALLOWLIST;
+  if (opts?.maxNotional) up.LIVE_MAX_NOTIONAL = opts.maxNotional;       // 비우면 미저장 → 통화별 기본 캡
+  if (opts?.dailyLossLimit) up.LIVE_DAILY_LOSS_LIMIT = opts.dailyLossLimit;
+  if (opts?.allowlist) up.LIVE_SYMBOL_ALLOWLIST = opts.allowlist;
   return upsertCredentials(up);
 }
 
@@ -67,9 +67,9 @@ export function liveSettingsStatus(): { masterOn: boolean; env: string; maxNotio
   return {
     masterOn: T(process.env.LIVE_TRADING_ENABLED) === "true",
     env: T(process.env.BINANCE_ENV) || "testnet",
-    maxNotional: T(process.env.LIVE_MAX_NOTIONAL) || `${LIVE_DEFAULTS.LIVE_MAX_NOTIONAL}(기본)`,
+    maxNotional: T(process.env.LIVE_MAX_NOTIONAL) || "통화별 기본(USDT 100 / KRW 150,000)",
     allowlist: T(process.env.LIVE_SYMBOL_ALLOWLIST) || "(전체 허용)",
-    dailyLossLimit: T(process.env.LIVE_DAILY_LOSS_LIMIT) || `${LIVE_DEFAULTS.LIVE_DAILY_LOSS_LIMIT}(기본)`,
+    dailyLossLimit: T(process.env.LIVE_DAILY_LOSS_LIMIT) || "통화별 기본(USDT 50 / KRW 75,000)",
   };
 }
 
