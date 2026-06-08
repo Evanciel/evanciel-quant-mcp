@@ -161,7 +161,16 @@ export async function tickBot(botId: string): Promise<{ action: "buy" | "sell" |
   }
 
   const interval = secsToInterval(bot.interval_seconds); // 폴링 주기 → kline 타임프레임(인트라데이 자동). 시간대 조건 해금.
-  const fetched = await fetchKlines(bot.symbol, interval, 300);
+  // 데이터 소스 broker-aware: 크립토=Binance public klines, KR(키움/한투)=브로커 어댑터 getCandles(일봉).
+  //   KR 종목코드는 Binance에 없으므로 어댑터에서 OHLCV를 가져와야 지표 평가 가능(없으면 빈 배열→데이터부족 hold).
+  const dataBroker = (["binance", "kis", "kiwoom"].includes(bot.broker) ? bot.broker : "binance") as Broker;
+  let fetched: Bar[];
+  if (dataBroker === "binance") {
+    fetched = await fetchKlines(bot.symbol, interval, 300);
+  } else {
+    const da = getAdapter(dataBroker, "spot")?.adapter as { getCandles?: (s: string, i: string, c: number) => Promise<Bar[]> } | undefined;
+    fetched = da?.getCandles ? await da.getCandles(bot.symbol, interval, 300) : [];
+  }
   // 마지막 봉은 '형성 중'(미완결) → 백테스트는 닫힌 봉만 보므로 제거(backtest≡live). 닫힌 봉마다 최대 1회 정착 행동
   //  → 같은 형성봉의 재틱마다 넷이 다단계로 변해 멱등키가 충돌·드롭되던 문제(2차 동일방향 델타 누락) 제거.
   const data = fetched.length > 1 ? fetched.slice(0, -1) : fetched;

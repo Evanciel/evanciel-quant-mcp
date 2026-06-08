@@ -358,6 +358,37 @@ export class KiwoomBrokerAdapter extends BaseBrokerAdapter {
   }
 
   /**
+   * 일봉 OHLCV(ka10081, /api/dostk/chart) — 러너/백테스트 지표 평가용. ⚠️ 모의서버 검증(2026-06):
+   * 응답 stk_dt_pole_chart_qry 배열(open_pric/high_pric/low_pric/cur_prc/trde_qty/dt), 최신순 → 오래된순 정렬.
+   * 가격 부호 접두는 abs로 정리. count개 최근봉. (분봉은 ka10080=후속. KR 라이브 봇=일봉 우선.)
+   * 러너가 broker별로 이 메서드를 우선 사용(크립토=Binance public klines). interval은 현재 일봉 고정.
+   */
+  /** KR 주식은 정수주(소수주 미지원) → 수량 내림. Binance(stepSize 소수)와 달리 1주 단위. 미구현 시 소수주 거부됨. */
+  async normalizeQuantity(_symbol: string, quantity: number): Promise<number> {
+    return Math.max(0, Math.floor(quantity));
+  }
+
+  async getCandles(symbol: string, _interval = "1d", count = 300): Promise<{ date: string; open: number; high: number; low: number; close: number; volume: number }[]> {
+    const stk = this.normalizeSymbol(symbol);
+    const today = new Date().toISOString().slice(0, 10).replace(/-/g, "");
+    const { data } = await this.post("/api/dostk/chart", "ka10081", { stk_cd: stk, base_dt: today, upd_stkpc_tp: "1" });
+    this.assertOk(data, "getCandles");
+    const rows = Array.isArray(data.stk_dt_pole_chart_qry) ? (data.stk_dt_pole_chart_qry as Record<string, unknown>[]) : [];
+    const bars = rows
+      .map((r) => ({
+        date: String(r.dt ?? "").replace(/^(\d{4})(\d{2})(\d{2}).*/, "$1-$2-$3"),
+        open: Math.abs(toNum(r.open_pric)),
+        high: Math.abs(toNum(r.high_pric)),
+        low: Math.abs(toNum(r.low_pric)),
+        close: Math.abs(toNum(r.cur_prc)),
+        volume: toNum(r.trde_qty),
+      }))
+      .filter((b) => b.close > 0 && b.date.length === 10)
+      .sort((a, b) => a.date.localeCompare(b.date)); // 오래된→최신
+    return bars.slice(-count);
+  }
+
+  /**
    * 주문(/api/dostk/ordr, 단일 경로). 오퍼레이션=api-id 헤더(kt10000 매수/kt10001 매도).
    * 바디 snake_case: dmst_stex_tp('KRX')/stk_cd/ord_qty(string)/ord_uv(string,'0'=시장가)/trde_tp('0'지정/'3'시장).
    * 성공/주문번호는 바디 return_code===0 / ord_no.
