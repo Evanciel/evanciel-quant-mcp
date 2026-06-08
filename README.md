@@ -287,7 +287,9 @@ src/mcp-server/   stdio MCP server + 22 tools
 - ✅ Position management: SL/TP, TP ladder, scale-in, pyramid, trailing, short/futures
 - ✅ Paper bot runner + real-time dashboard
 - ✅ P0 execution core (resting stops / reconcile / balance sizing) — key-free, tested
-- ⏳ Live execution wiring + money-path E2E (testnet-gated)
+- ✅ Live money-path verified on Binance **testnet** (entry → resting SL/TP → cancel → close)
+- ✅ Mainnet pilot prep: GO/NO-GO pre-flight (`verify-mainnet-readiness.ts`) + [runbook](docs/mainnet-pilot-runbook.md) — withdrawal-OFF / IP / hard-limit checks, **zero orders**
+- ⏳ Mainnet pilot (real funds — your decision; small-size, master switch) · limit orders · futures protective stops
 - ⏳ Non-crypto data (equities/FX), order-book/microstructure, options
 
 ---
@@ -300,6 +302,7 @@ src/mcp-server/   stdio MCP server + 22 tools
 - **2-step order confirmation** — `place_order` is fail-closed: preview returns a token; execution requires the same args + token.
 - **Dashboard** — binds to `127.0.0.1` only, random per-launch token, read-only positions/plans.
 - **Keys never via chat** — store keys with the CLI wizard (`npx quant-mcp setup`), the dashboard's ⚙️ settings form, or env vars. They live in `~/.quant-mcp/credentials.env` (chmod 600, gitignored), are shown masked only, and can't be read back. Never paste keys into the agent conversation.
+- **Mainnet pre-flight** — before real-money trading, `npx tsx scripts/verify-mainnet-readiness.ts` runs a read-only GO/NO-GO check (env=live, master switch, key validity, **withdrawal permission OFF**, IP restriction, hard-limit self-test) — **places zero orders**. See the [mainnet pilot runbook](docs/mainnet-pilot-runbook.md).
 
 ### Adding exchange keys (3 ways — pick one)
 ```bash

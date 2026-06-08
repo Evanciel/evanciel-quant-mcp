@@ -287,7 +287,9 @@ src/mcp-server/   stdio MCP 서버 + 22개 툴
 - ✅ 포지션 관리: SL/TP, TP 라더, 스케일인, 피라미딩, 트레일링, 숏/선물
 - ✅ 페이퍼 봇 러너 + 실시간 대시보드
 - ✅ P0 실행 코어(상주 스톱 / reconcile / 실잔고 사이징) — 키 불필요, 테스트 완료
-- ⏳ 라이브 실행 배선 + 머니패스 E2E(testnet 게이트)
+- ✅ 머니패스 Binance **testnet** 검증(진입 → 상주 SL/TP → 취소 → 청산)
+- ✅ 메인넷 파일럿 준비: GO/NO-GO 사전점검(`verify-mainnet-readiness.ts`) + [런북](docs/mainnet-pilot-runbook.md) — 출금권한 OFF / IP / 하드리밋 검사, **주문 0건**
+- ⏳ 메인넷 파일럿(실돈 — 사장님 결정; 소액·마스터 스위치) · 지정가 · 선물 보호주문
 - ⏳ 비크립토 데이터(주식/FX), 호가/마이크로구조, 옵션
 
 ---
@@ -300,6 +302,7 @@ src/mcp-server/   stdio MCP 서버 + 22개 툴
 - **2단계 주문 확인** — `place_order`는 fail-closed: 프리뷰가 토큰 반환, 동일 인자 + 토큰이어야 실행.
 - **대시보드** — `127.0.0.1` 전용 바인딩, 런치별 랜덤 토큰, 읽기전용 포지션/플랜.
 - **키는 채팅으로 절대 X** — CLI 마법사(`npx quant-mcp setup`), 대시보드 ⚙️ 설정 폼, 또는 환경변수로 저장. 키는 `~/.quant-mcp/credentials.env`(chmod 600, gitignore)에만 저장되고 마스킹으로만 보이며 다시 읽을 수 없습니다.
+- **메인넷 사전점검** — 실돈 거래 전 `npx tsx scripts/verify-mainnet-readiness.ts`로 읽기전용 GO/NO-GO 점검(env=live·마스터스위치·키유효·**출금권한 OFF**·IP제한·하드리밋 자가검증) — **주문 0건**. [메인넷 파일럿 런북](docs/mainnet-pilot-runbook.md) 참고.
 
 ### 거래소 키 넣기 (3가지 — 아무거나)
 ```bash

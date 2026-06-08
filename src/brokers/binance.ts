@@ -283,6 +283,24 @@ export class BinanceBrokerAdapter extends BaseBrokerAdapter {
     };
   }
 
+  /**
+   * API 키 권한 점검(읽기전용, 메인넷 파일럿 사전점검용). 현물 baseUrl의 /sapi/v1/account/apiRestrictions.
+   * enableWithdrawals=출금권한(반드시 false여야 안전), ipRestrict=IP 화이트리스트 여부(true 권장).
+   * 선물 마켓/엔드포인트 미지원 환경에서는 null(점검 불가) 반환 — 호출측이 WARN으로 처리.
+   */
+  async apiRestrictions(): Promise<{ enableWithdrawals: boolean; ipRestrict: boolean; enableSpotTrading: boolean; enableFutures: boolean } | null> {
+    if (this.market !== "spot") return null; // /sapi는 현물 베이스에만 존재
+    try {
+      const d = await this.request<Record<string, unknown>>("/sapi/v1/account/apiRestrictions", { signed: true });
+      return {
+        enableWithdrawals: d.enableWithdrawals === true,
+        ipRestrict: d.ipRestrict === true,
+        enableSpotTrading: d.enableSpotAndMarginTrading === true,
+        enableFutures: d.enableFutures === true,
+      };
+    } catch { return null; } // testnet 등 미지원 → 점검 불가
+  }
+
   // ─────────────────────── 포지션 ───────────────────────
   async getPositions(): Promise<Position[]> {
     if (this.market === "futures") {

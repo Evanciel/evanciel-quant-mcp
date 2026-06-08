@@ -62,10 +62,13 @@ npx quant-mcp setup
 4. **자율 봇(`create_bot mode=live`)**은 사전승인 모델: 마스터 스위치 + 하드리밋 + 멱등으로 통제(봇은 2단계 토큰 없이 돌되, 게이트/리밋이 막음).
 
 ### 메인넷 파일럿 체크리스트 (실돈 첫 가동 전)
+
+> 📖 **상세 절차는 [`docs/mainnet-pilot-runbook.md`](docs/mainnet-pilot-runbook.md)** (단계별 런북 + 긴급정지).
+
 - [ ] testnet 봇 E2E 통과 확인(`npx tsx scripts/verify-testnet-bot-e2e.ts` → 매수·상주스톱·정리 PASS).
 - [ ] 메인넷 키 = **출금권한 OFF + IP 화이트리스트** (거래 권한만).
 - [ ] `BINANCE_ENV=live` + `LIVE_TRADING_ENABLED=true` + **`LIVE_MAX_NOTIONAL` 소액**(예: 20~50) + `LIVE_SYMBOL_ALLOWLIST` + `LIVE_DAILY_LOSS_LIMIT`.
-- [ ] 메인넷 연결 확인: `BINANCE_ENV=live`로 `verify-testnet-connection.ts` 실행(읽기전용, 잔고 확인).
+- [ ] **사전점검(GO/NO-GO, 주문 0건)**: `npx tsx scripts/verify-mainnet-readiness.ts` → 🟢 GO 확인. env=live·마스터·키유효·**출금권한 OFF**·하드리밋을 한 번에 검사하고, 하드리밋이 실제로 막는지 자가검증.
 - [ ] 봇 1개·소액·`stop_loss_percent` 설정으로 시작 → `open_dashboard`로 모니터 + 거래소 앱에서 상주 스톱 확인.
 - [ ] 며칠 관찰 후 점진 확대. `audit.jsonl` + `testnet-cleanup-orders.ts`(심볼만 바꿔 메인넷 점검)로 고아주문 0 확인.
 - [ ] ⚠️ **현물만 라이브 지원**(선물 보호주문은 미지원). **지정가 라이브는 v2**(현재 시장가 체결).
