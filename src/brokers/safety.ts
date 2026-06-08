@@ -53,10 +53,18 @@ export function liveGate(broker: Broker, market: "spot" | "futures" = "spot"): {
   return { allowed: true, env: c.env, reason: `${c.env} 거래 활성(키 present, 가짜돈).` };
 }
 
+/**
+ * 라이브 안전 기본 캡(USDT). 마스터 ON인데 LIVE_MAX_NOTIONAL을 안 정했어도 무제한이 아니라 이 값으로 캡.
+ * "키만 넣으면 바로 매매"의 친화성 + 안전을 동시에: 사용자가 안 정해도 소액으로 보호. 올리려면 LIVE_MAX_NOTIONAL 설정.
+ */
+export const DEFAULT_LIVE_MAX_NOTIONAL = 100;
+
 /** 서버측 하드리밋(LLM 우회 불가 pre-trade). 노셔널캡 + 심볼 allowlist + 일일손실 서킷. */
 export function checkLimits(order: { symbol: string; notional: number }): { ok: boolean; reason: string } {
-  const cap = Number(trim(process.env.LIVE_MAX_NOTIONAL) || "0");
-  if (cap > 0 && order.notional > cap) return { ok: false, reason: `노셔널 ${order.notional} > 캡 ${cap}(LIVE_MAX_NOTIONAL)` };
+  const liveActive = trim(process.env.LIVE_TRADING_ENABLED) === "true";
+  // 명시 캡 우선. 라이브 마스터 ON인데 미설정이면 안전 기본 캡(무제한 금지). 페이퍼/testnet 마스터 OFF면 0(캡 없음).
+  const cap = Number(trim(process.env.LIVE_MAX_NOTIONAL) || "0") || (liveActive ? DEFAULT_LIVE_MAX_NOTIONAL : 0);
+  if (cap > 0 && order.notional > cap) return { ok: false, reason: `노셔널 ${order.notional} > 캡 ${cap}(LIVE_MAX_NOTIONAL${Number(trim(process.env.LIVE_MAX_NOTIONAL) || "0") ? "" : " 기본값"})` };
   const allow = trim(process.env.LIVE_SYMBOL_ALLOWLIST);
   if (allow && !allow.split(",").map((s) => s.trim().toUpperCase()).includes(order.symbol.toUpperCase()))
     return { ok: false, reason: `${order.symbol} 미허용(LIVE_SYMBOL_ALLOWLIST)` };

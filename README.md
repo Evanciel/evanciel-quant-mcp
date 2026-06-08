@@ -304,12 +304,13 @@ src/mcp-server/   stdio MCP server + 22 tools
 - **Keys never via chat** — store keys with the CLI wizard (`npx quant-mcp setup`), the dashboard's ⚙️ settings form, or env vars. They live in `~/.quant-mcp/credentials.env` (chmod 600, gitignored), are shown masked only, and can't be read back. Never paste keys into the agent conversation.
 - **Mainnet pre-flight** — before real-money trading, `npx tsx scripts/verify-mainnet-readiness.ts` runs a read-only GO/NO-GO check (env=live, master switch, key validity, **withdrawal permission OFF**, IP restriction, hard-limit self-test) — **places zero orders**. See the [mainnet pilot runbook](docs/mainnet-pilot-runbook.md).
 
-### Adding exchange keys (3 ways — pick one)
+### Adding exchange keys — *just add keys and trade*
+Pick **live** in the wizard/dashboard and it flips the master switch + sets safe defaults (per-order cap, daily-loss circuit) for you — no fiddling with 5 env vars.
 ```bash
-npx quant-mcp setup     # A) interactive wizard (masked input) — easiest
+npx quant-mcp setup     # A) wizard: practice(testnet) / live → keys → "withdrawal off?" → done
 ```
-**B)** Open the dashboard → **⚙️ API 키 설정** → enter per broker (password fields, masked, no readback).
-**C)** Env vars / secret managers (advanced; MCP-config `env` overrides the file). See [`SETUP-LIVE.md`](SETUP-LIVE.md).
+**B)** Dashboard → **⚙️ API 키 설정** → enter keys, then **💸 실거래 모드** toggle (cap + withdrawal-off check). One-click emergency off → paper.
+**C)** Env vars / secret managers (advanced; MCP-config `env` overrides the file). Even then, master-on with no cap falls back to a safe default. See [`SETUP-LIVE.md`](SETUP-LIVE.md).
 
 See [`SETUP-LIVE.md`](SETUP-LIVE.md) before enabling live trading.
 

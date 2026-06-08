@@ -30,9 +30,11 @@
 
 ## 2. 설정 입력 (3가지 중 택1 — 키는 채팅 미경유)
 
-**A. CLI 마법사** — `npx quant-mcp setup` → binance 선택, `BINANCE_ENV`에 `live` 입력, 키 입력(화면 마스킹).
-**B. 대시보드** — `open_dashboard` → ⚙️ API 키 설정.
-**C. `.env.local` 직접** — 아래 변수를 파일에 작성(gitignore, `chmod 600`):
+> 💸 **A·B는 "키만 넣으면 바로 매매"** — 실거래(live)를 고르면 **마스터 스위치 + 안전 기본값(주문당 50 USDT·일일손실 서킷 50)을 자동**으로 켜줍니다. 환경변수 5개를 손으로 만질 필요 없음.
+
+**A. CLI 마법사 (추천)** — `npx quant-mcp setup` → binance → **실거래(live) 선택** → 키 입력 → "출금 권한 껐죠?" 확인 → 한도 입력(Enter=기본 50) → 끝. 자동으로 실거래 ON.
+**B. 대시보드** — `open_dashboard` → ⚙️ API 키 설정 → 키 입력 → **💸 실거래 모드**에서 한도+출금OFF 체크 → **실거래 켜기**.
+**C. `.env.local` 직접 (고급)** — 수동으로 변수 작성(gitignore, `chmod 600`):
 
 ```bash
 BINANCE_ENV=live
@@ -40,11 +42,11 @@ BINANCE_API_KEY=<메인넷 key>
 BINANCE_API_SECRET=<메인넷 secret>
 LIVE_TRADING_ENABLED=true          # 마스터 스위치
 LIVE_MAX_NOTIONAL=20               # 첫 파일럿은 소액(20~50 권장)
-LIVE_SYMBOL_ALLOWLIST=BTCUSDT      # 한 종목으로 시작 권장
+LIVE_SYMBOL_ALLOWLIST=BTCUSDT      # 한 종목으로 시작 권장(비우면 전체 허용)
 LIVE_DAILY_LOSS_LIMIT=50           # 일일 손실 서킷
 ```
 
-> CLI/대시보드로 넣은 키는 `~/.quant-mcp/credentials.env`(chmod 600)에 저장됩니다. `BINANCE_ENV`·하드리밋 같은 운영 설정은 `.env.local`이나 MCP 설정 env에 두는 걸 권장(파일보다 우선 적용).
+> 마스터 ON인데 `LIVE_MAX_NOTIONAL`을 안 정했어도 **기본 안전 캡(50 USDT)** 이 자동 적용됩니다(무제한 금지). A/B로 넣은 키·설정은 `~/.quant-mcp/credentials.env`(chmod 600)에 저장되고 서버 기동 시 자동 로드. MCP 설정 env가 이 파일보다 우선(운영 오버라이드).
 
 ## 3. 사전점검 (GO/NO-GO — 주문 0건)
 

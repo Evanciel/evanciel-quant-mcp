@@ -59,6 +59,19 @@ async function main() {
   ok(existsSync(path), `credentials.env 파일 생성: ${path}`);
   ok(readFileSync(path, "utf8").includes(`BINANCE_API_KEY=${secret}`), "파일에 키 저장됨(소유자 전용 파일)");
 
+  // 6) 라이브 모드 토글: 켜기(마스터 ON + 안전 기본값) → 끄기(긴급 페이퍼)
+  const en = await (await fetch(`${base}/api/live?token=${token}`, {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ maxNotional: "30", allowlist: "BTCUSDT" }),
+  })).json();
+  ok(en.ok && en.live.masterOn === true, "POST /api/live 켜기 → masterOn=true");
+  ok(en.live.maxNotional === "30" && en.live.allowlist === "BTCUSDT", `라이브 한도 적용(캡=${en.live.maxNotional}, 허용=${en.live.allowlist})`);
+  const dis = await (await fetch(`${base}/api/live?token=${token}`, {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ enable: false }),
+  })).json();
+  ok(dis.ok && dis.live.masterOn === false, "POST /api/live 끄기 → masterOn=false(긴급 페이퍼)");
+  const liveNoAuth = await fetch(`${base}/api/live`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+  ok(liveNoAuth.status === 401, `토큰 없는 /api/live → 401 (got ${liveNoAuth.status})`);
+
   console.log(`\n${process.exitCode ? "🔴 일부 실패" : "🟢 대시보드 자격증명 E2E ALL PASS"}`);
   rmSync(dir, { recursive: true, force: true });
   process.exit(process.exitCode || 0);

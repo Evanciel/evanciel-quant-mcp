@@ -304,12 +304,13 @@ src/mcp-server/   stdio MCP 서버 + 22개 툴
 - **키는 채팅으로 절대 X** — CLI 마법사(`npx quant-mcp setup`), 대시보드 ⚙️ 설정 폼, 또는 환경변수로 저장. 키는 `~/.quant-mcp/credentials.env`(chmod 600, gitignore)에만 저장되고 마스킹으로만 보이며 다시 읽을 수 없습니다.
 - **메인넷 사전점검** — 실돈 거래 전 `npx tsx scripts/verify-mainnet-readiness.ts`로 읽기전용 GO/NO-GO 점검(env=live·마스터스위치·키유효·**출금권한 OFF**·IP제한·하드리밋 자가검증) — **주문 0건**. [메인넷 파일럿 런북](docs/mainnet-pilot-runbook.md) 참고.
 
-### 거래소 키 넣기 (3가지 — 아무거나)
+### 거래소 키 넣기 — *키만 넣으면 바로 매매*
+마법사/대시보드에서 **실거래(live)** 를 고르면 마스터 스위치 + 안전 기본값(주문당 한도·일일손실 서킷)을 **자동**으로 켜줍니다. 환경변수 5개 따로 안 만져도 됩니다.
 ```bash
-npx quant-mcp setup     # A) 대화형 마법사(입력 마스킹) — 제일 쉬움
+npx quant-mcp setup     # A) 마법사: 연습(testnet)/실거래(live) → 키 입력 → "출금 껐죠?" → 끝
 ```
-**B)** 대시보드 → **⚙️ API 키 설정** → 브로커별 입력(password 필드, 마스킹, 재조회 불가).
-**C)** 환경변수/시크릿 매니저(고급; MCP 설정 `env`가 파일보다 우선). [`SETUP-LIVE.md`](SETUP-LIVE.md) 참고.
+**B)** 대시보드 → **⚙️ API 키 설정** → 키 입력 후 **💸 실거래 모드** 토글(한도+출금OFF 체크). 긴급 끄기(페이퍼 전환)도 버튼 하나.
+**C)** 환경변수/시크릿 매니저(고급; MCP 설정 `env`가 파일보다 우선). 이 경우에도 마스터 ON·캡 미설정이면 안전 기본 캡 적용. [`SETUP-LIVE.md`](SETUP-LIVE.md) 참고.
 
 라이브 거래를 켜기 전 [`SETUP-LIVE.md`](SETUP-LIVE.md)를 먼저 읽으세요.
 

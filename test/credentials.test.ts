@@ -8,7 +8,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const KEYS = ["BINANCE_ENV", "BINANCE_API_KEY", "BINANCE_API_SECRET", "BINANCE_FUTURES_API_KEY", "BINANCE_FUTURES_API_SECRET",
-  "KIS_ENV", "KIS_APPKEY", "KIS_APPSECRET", "KIS_ACCOUNT", "KIWOOM_ENV", "KIWOOM_APPKEY", "KIWOOM_SECRETKEY", "QUANT_MCP_DATA_DIR"];
+  "KIS_ENV", "KIS_APPKEY", "KIS_APPSECRET", "KIS_ACCOUNT", "KIWOOM_ENV", "KIWOOM_APPKEY", "KIWOOM_SECRETKEY", "QUANT_MCP_DATA_DIR",
+  "LIVE_TRADING_ENABLED", "LIVE_MAX_NOTIONAL", "LIVE_SYMBOL_ALLOWLIST", "LIVE_DAILY_LOSS_LIMIT"];
 
 let dir: string;
 function clearEnv() { for (const k of KEYS) delete process.env[k]; }
@@ -74,6 +75,55 @@ describe("loadCredentialsFile (no-override)", () => {
     expect(n).toBeGreaterThanOrEqual(1);
     expect(process.env.BINANCE_API_KEY).toBe("from-file"); // 비어있던 키는 주입
     expect(process.env.BINANCE_ENV).toBe("live"); // 이미 있던 키는 유지
+  });
+});
+
+describe("enableLive / disableLive (라이브 친화 원스톱)", () => {
+  it("enableLive: 마스터 ON + 안전 기본값(캡50/서킷50) 자동 채움, process.env 즉시 반영", async () => {
+    const C = await load();
+    const { written } = C.enableLive();
+    expect(written).toContain("LIVE_TRADING_ENABLED");
+    expect(process.env.LIVE_TRADING_ENABLED).toBe("true");
+    expect(process.env.LIVE_MAX_NOTIONAL).toBe(C.LIVE_DEFAULTS.LIVE_MAX_NOTIONAL);
+    expect(process.env.LIVE_DAILY_LOSS_LIMIT).toBe(C.LIVE_DEFAULTS.LIVE_DAILY_LOSS_LIMIT);
+  });
+  it("enableLive(opts): 지정 캡/allowlist 적용", async () => {
+    const C = await load();
+    C.enableLive({ maxNotional: "30", allowlist: "BTCUSDT" });
+    expect(process.env.LIVE_MAX_NOTIONAL).toBe("30");
+    expect(process.env.LIVE_SYMBOL_ALLOWLIST).toBe("BTCUSDT");
+  });
+  it("기존 캡이 있으면 enableLive가 덮어쓰지 않음(유지)", async () => {
+    const C = await load();
+    C.upsertCredentials({ LIVE_MAX_NOTIONAL: "20" });
+    C.enableLive();
+    expect(process.env.LIVE_MAX_NOTIONAL).toBe("20");
+  });
+  it("disableLive: 마스터 OFF(긴급 정지), 캡 등은 유지", async () => {
+    const C = await load();
+    C.enableLive({ maxNotional: "30" });
+    C.disableLive();
+    expect(process.env.LIVE_TRADING_ENABLED).toBe("false");
+    expect(process.env.LIVE_MAX_NOTIONAL).toBe("30");
+  });
+});
+
+describe("checkLimits 안전 기본 캡(친화+안전)", () => {
+  it("마스터 ON + 캡 미설정 → DEFAULT_LIVE_MAX_NOTIONAL로 자동 캡(무제한 금지)", async () => {
+    const S = await import("../src/brokers/safety.js");
+    process.env.LIVE_TRADING_ENABLED = "true";
+    delete process.env.LIVE_MAX_NOTIONAL;
+    const over = S.checkLimits({ symbol: "BTCUSDT", notional: S.DEFAULT_LIVE_MAX_NOTIONAL + 1 });
+    expect(over.ok).toBe(false);
+    expect(over.reason).toContain("기본값");
+    const under = S.checkLimits({ symbol: "BTCUSDT", notional: S.DEFAULT_LIVE_MAX_NOTIONAL - 1 });
+    expect(under.ok).toBe(true);
+  });
+  it("마스터 OFF(페이퍼/testnet) + 캡 미설정 → 캡 없음(가짜돈이라 제한 불필요)", async () => {
+    const S = await import("../src/brokers/safety.js");
+    delete process.env.LIVE_TRADING_ENABLED;
+    delete process.env.LIVE_MAX_NOTIONAL;
+    expect(S.checkLimits({ symbol: "BTCUSDT", notional: 1e9 }).ok).toBe(true);
   });
 });
 

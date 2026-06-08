@@ -35,7 +35,43 @@ export const BROKER_FIELDS: Record<BrokerKey, { key: string; label: string; secr
   ],
 };
 
-const ALL_KEYS = new Set(Object.values(BROKER_FIELDS).flat().map((f) => f.key));
+/** 라이브 운영 설정(브로커 무관 글로벌). 마법사/대시보드가 키와 함께 저장 → "키만 넣으면 바로 매매" 친화. */
+export const LIVE_SETTING_KEYS = ["LIVE_TRADING_ENABLED", "LIVE_MAX_NOTIONAL", "LIVE_SYMBOL_ALLOWLIST", "LIVE_DAILY_LOSS_LIMIT"] as const;
+
+const ALL_KEYS = new Set([...Object.values(BROKER_FIELDS).flat().map((f) => f.key), ...LIVE_SETTING_KEYS]);
+
+/** 안전 기본 라이브 설정(사용자가 따로 안 정해도 소액·보호되게). 캡 미지정 시 50, 일일손실 서킷 50. */
+export const LIVE_DEFAULTS = { LIVE_MAX_NOTIONAL: "50", LIVE_DAILY_LOSS_LIMIT: "50" } as const;
+
+/**
+ * 실거래 원스톱 활성화: 마스터 스위치 ON + 안전 기본값 채움(이미 있으면 유지). 키는 별도 upsert로 이미 저장됨.
+ * maxNotional 지정 시 그 값으로 캡. 반환=실제 기록된 키.
+ */
+export function enableLive(opts?: { maxNotional?: string; allowlist?: string; dailyLossLimit?: string }): { written: string[]; path: string } {
+  const cur = parseEnvFile(credentialsPath());
+  const up: Record<string, string> = { LIVE_TRADING_ENABLED: "true" };
+  up.LIVE_MAX_NOTIONAL = opts?.maxNotional || cur.LIVE_MAX_NOTIONAL || LIVE_DEFAULTS.LIVE_MAX_NOTIONAL;
+  up.LIVE_DAILY_LOSS_LIMIT = opts?.dailyLossLimit || cur.LIVE_DAILY_LOSS_LIMIT || LIVE_DEFAULTS.LIVE_DAILY_LOSS_LIMIT;
+  if (opts?.allowlist || cur.LIVE_SYMBOL_ALLOWLIST) up.LIVE_SYMBOL_ALLOWLIST = opts?.allowlist || cur.LIVE_SYMBOL_ALLOWLIST;
+  return upsertCredentials(up);
+}
+
+/** 실거래 마스터 OFF(긴급 정지 = 페이퍼 폴백). 키는 유지. */
+export function disableLive(): { written: string[]; path: string } {
+  return upsertCredentials({ LIVE_TRADING_ENABLED: "false" });
+}
+
+/** 라이브 운영 상태 요약(키 노출 0). 대시보드/마법사 표시용. */
+export function liveSettingsStatus(): { masterOn: boolean; env: string; maxNotional: string; allowlist: string; dailyLossLimit: string } {
+  const T = (s?: string) => (s ?? "").trim();
+  return {
+    masterOn: T(process.env.LIVE_TRADING_ENABLED) === "true",
+    env: T(process.env.BINANCE_ENV) || "testnet",
+    maxNotional: T(process.env.LIVE_MAX_NOTIONAL) || `${LIVE_DEFAULTS.LIVE_MAX_NOTIONAL}(기본)`,
+    allowlist: T(process.env.LIVE_SYMBOL_ALLOWLIST) || "(전체 허용)",
+    dailyLossLimit: T(process.env.LIVE_DAILY_LOSS_LIMIT) || `${LIVE_DEFAULTS.LIVE_DAILY_LOSS_LIMIT}(기본)`,
+  };
+}
 
 export function dataDir(): string {
   return process.env.QUANT_MCP_DATA_DIR || join(homedir(), ".quant-mcp");

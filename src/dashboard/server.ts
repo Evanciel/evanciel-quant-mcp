@@ -7,7 +7,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { randomBytes } from "node:crypto";
 import * as store from "../store/db.js";
-import { BROKER_FIELDS, upsertCredentials, credentialStatus, credentialsPath, type BrokerKey } from "../setup/credentials.js";
+import { BROKER_FIELDS, upsertCredentials, credentialStatus, credentialsPath, enableLive, disableLive, liveSettingsStatus, type BrokerKey } from "../setup/credentials.js";
 
 /** POST 본문을 안전하게 읽어 JSON 파싱(상한 64KB, 자격증명 폼은 작음). */
 function readJsonBody(req: IncomingMessage): Promise<Record<string, unknown>> {
@@ -207,7 +207,7 @@ export function startDashboard(port = 7788): Promise<{ url: string; port: number
     if (u.pathname === "/api/credentials") {
       if (req.method === "GET") {
         res.writeHead(200, { "content-type": "application/json" });
-        res.end(JSON.stringify({ ok: true, fields: BROKER_FIELDS, status: credentialStatus(), path: credentialsPath() }));
+        res.end(JSON.stringify({ ok: true, fields: BROKER_FIELDS, status: credentialStatus(), live: liveSettingsStatus(), path: credentialsPath() }));
         return;
       }
       if (req.method === "POST") {
@@ -216,11 +216,22 @@ export function startDashboard(port = 7788): Promise<{ url: string; port: number
           for (const [k, v] of Object.entries(body)) if (typeof v === "string") updates[k] = v; // upsert가 화이트리스트로 재차 필터
           const { written } = upsertCredentials(updates); // 키값 로깅/에코 안 함
           res.writeHead(200, { "content-type": "application/json" });
-          res.end(JSON.stringify({ ok: true, written: written.length, status: credentialStatus() })); // 마스킹 상태만 반환
+          res.end(JSON.stringify({ ok: true, written: written.length, status: credentialStatus(), live: liveSettingsStatus() })); // 마스킹 상태만 반환
         }).catch((e) => { res.writeHead(400, { "content-type": "application/json" }); res.end(JSON.stringify({ ok: false, error: e instanceof Error ? e.message : "bad request" })); });
         return;
       }
       res.writeHead(405).end("method not allowed"); return;
+    }
+    // 라이브 모드: POST {enable:true, maxNotional?, allowlist?} → 마스터 ON+안전기본값 / {enable:false} → 긴급 OFF(페이퍼 폴백).
+    if (u.pathname === "/api/live") {
+      if (req.method !== "POST") { res.writeHead(405).end("method not allowed"); return; }
+      readJsonBody(req).then((body) => {
+        if (body.enable === false) { disableLive(); }
+        else { enableLive({ maxNotional: typeof body.maxNotional === "string" ? body.maxNotional : undefined, allowlist: typeof body.allowlist === "string" ? body.allowlist : undefined }); }
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true, live: liveSettingsStatus() }));
+      }).catch((e) => { res.writeHead(400, { "content-type": "application/json" }); res.end(JSON.stringify({ ok: false, error: e instanceof Error ? e.message : "bad request" })); });
+      return;
     }
     res.writeHead(404).end("not found");
   });
@@ -279,6 +290,14 @@ h1{font-size:18px;margin:0 0 2px}.sub{color:#8a94a6;font-size:12px;margin-bottom
 .fld input:focus{outline:none;border-color:#7aa2f7}
 .savebtn{background:#7aa2f7;color:#0b0e14;border:0;border-radius:8px;padding:8px 16px;font-weight:700;font-size:13px;cursor:pointer;margin-top:8px}.savebtn:hover{background:#a8c0ff}
 .setmsg{font-size:12px;margin-top:10px;min-height:16px}.setmsg.ok{color:#10b981}.setmsg.err{color:#f43f5e}
+.livebox{border-top:1px solid #222838;margin-top:14px;padding-top:12px}
+.livebox .lh{display:flex;justify-content:space-between;align-items:center;font-weight:600}
+.livebox .ld{font-size:12px;color:#8a94a6;margin:6px 0 10px;line-height:1.5}
+.livebox .on{color:#f59e0b}.livebox .off{color:#8a94a6}
+.livebtn{border:0;border-radius:8px;padding:8px 16px;font-weight:700;font-size:13px;cursor:pointer}
+.livebtn.go{background:#f59e0b;color:#0b0e14}.livebtn.go:hover{background:#fbbf24}
+.livebtn.stop{background:#f43f5e;color:#fff}.livebtn.stop:hover{background:#fb7185}
+.lstat{font-size:12px;color:#c9d2e3;margin-top:8px;line-height:1.6}.lstat b{color:#e6e6e6}
 @media(max-width:560px){.fld{grid-template-columns:1fr}}
 @media(max-width:560px){.wrap{padding:14px}.hdr{grid-template-columns:1fr 1fr}.pos{grid-template-columns:1fr}.v{font-size:20px}.sym{font-size:14px}}
 </style></head><body><div class="wrap">
@@ -290,6 +309,7 @@ h1{font-size:18px;margin:0 0 2px}.sub{color:#8a94a6;font-size:12px;margin-bottom
     <span class="gear" onclick="toggleSettings()">닫기 ✕</span></div>
   <div class="setnote">🔒 키는 이 컴퓨터의 <code id="credpath">~/.quant-mcp/credentials.env</code> 파일에만 저장돼요(소유자 전용). 화면·채팅·인터넷으로 절대 새어나가지 않고, 한 번 저장하면 다시 보이지 않아요(보안). 발급처는 거래소(예: Binance) 설정에서 받으세요.</div>
   <div id="setbody"></div>
+  <div id="setlive" class="livebox"></div>
   <div id="setmsg" class="setmsg"></div>
 </div>
 <div class="hdr">
@@ -367,7 +387,34 @@ function loadSettings(){fetch('/api/credentials?token='+TOKEN).then(r=>r.json())
   h+='<button class="savebtn" data-broker="'+esc(b)+'">저장</button>';
   sec.innerHTML=h;body.appendChild(sec);
   sec.querySelector('.savebtn').addEventListener('click',()=>saveBroker(b,sec));}
+ renderLive(d.live);
 });}
+function renderLive(live){const box=document.getElementById('setlive');if(!box)return;
+ const on=live&&live.masterOn;
+ let h='<div class="lh"><span>💸 실거래 모드</span><span class="'+(on?'on':'off')+'">'+(on?'🟢 켜짐(실돈)':'⚪ 꺼짐(연습/페이퍼)')+'</span></div>';
+ if(on){
+  h+='<div class="lstat">환경 <b>'+esc(live.env)+'</b> · 주문당 최대 <b>'+esc(live.maxNotional)+' USDT</b> · 허용종목 <b>'+esc(live.allowlist)+'</b> · 일일손실 서킷 <b>'+esc(live.dailyLossLimit)+' USDT</b></div>';
+  h+='<div class="ld">자비스에게 "실거래 봇 돌려줘"라고 하면 바로 실매매가 나갑니다. 위 한도가 안전장치예요.</div>';
+  h+='<button class="livebtn stop" id="livestop">🛑 실거래 끄기(긴급 — 페이퍼로 전환)</button>';
+ }else{
+  h+='<div class="ld">키를 넣었다면, 아래에서 실거래를 켜면 바로 매매가 시작됩니다. 안전을 위해 한도를 정하세요(비우면 기본 50 USDT).</div>';
+  h+='<div class="fld"><label>주문당 최대(USDT)</label><input id="livecap" type="text" inputmode="numeric" autocomplete="off" placeholder="50"></div>';
+  h+='<div class="fld"><label>허용 종목</label><input id="liveallow" type="text" autocomplete="off" placeholder="비우면 전체 / 예: BTCUSDT,ETHUSDT"></div>';
+  h+='<label class="ld" style="display:flex;gap:7px;align-items:center;cursor:pointer"><input type="checkbox" id="livewd"> 거래소에서 이 키의 <b style="color:#c9d2e3">출금 권한을 껐습니다</b>(거래 권한만). 키 유출 시 자금 보호.</label>';
+  h+='<button class="livebtn go" id="livego">💸 실거래 켜기</button>';
+ }
+ box.innerHTML=h;
+ if(on){box.querySelector('#livestop').addEventListener('click',()=>saveLive(false));}
+ else{box.querySelector('#livego').addEventListener('click',()=>{
+   if(!document.getElementById('livewd').checked){const m=document.getElementById('setmsg');m.className='setmsg err';m.textContent='먼저 거래소에서 출금 권한을 끄고 체크해주세요(실돈 안전).';return;}
+   saveLive(true,document.getElementById('livecap').value.trim(),document.getElementById('liveallow').value.trim());});}
+}
+function saveLive(enable,cap,allow){const msg=document.getElementById('setmsg');msg.className='setmsg';msg.textContent=enable?'실거래 켜는 중…':'페이퍼로 전환 중…';
+ const body=enable?{enable:true,maxNotional:cap||'',allowlist:allow||''}:{enable:false};
+ fetch('/api/live?token='+TOKEN,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)})
+  .then(r=>r.json()).then(d=>{if(d.ok){msg.className='setmsg ok';msg.textContent=enable?'🟢 실거래 ON — 이제 봇이 실매매합니다(한도 보호 적용).':'⚪ 페이퍼로 전환됨(실주문 중단).';renderLive(d.live);}
+   else{msg.className='setmsg err';msg.textContent='실패: '+(d.error||'알 수 없음');}})
+  .catch(e=>{msg.className='setmsg err';msg.textContent='실패: '+e.message;});}
 function saveBroker(b,sec){const updates={};sec.querySelectorAll('input[data-key]').forEach(i=>{const v=i.value.trim();if(v)updates[i.getAttribute('data-key')]=v;});
  const msg=document.getElementById('setmsg');
  if(!Object.keys(updates).length){msg.className='setmsg err';msg.textContent='입력한 값이 없어요.';return;}
