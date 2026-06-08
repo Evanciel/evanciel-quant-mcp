@@ -3,4 +3,6 @@ dist/
 *.log
 .env
 .env.local
+credentials.env
+.quant-mcp/
 .git-commit-msg.txt

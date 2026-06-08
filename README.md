@@ -298,7 +298,15 @@ src/mcp-server/   stdio MCP server + 22 tools
 - **Paper-first** — bots are paper unless you set exchange keys *and* the master switch (`LIVE_TRADING_ENABLED`).
 - **Server-side hard limits** — notional cap, symbol allowlist, daily-loss circuit breaker (LLM cannot bypass).
 - **2-step order confirmation** — `place_order` is fail-closed: preview returns a token; execution requires the same args + token.
-- **Dashboard** — binds to `127.0.0.1` only, random per-launch token, read-only, no secrets transmitted.
+- **Dashboard** — binds to `127.0.0.1` only, random per-launch token, read-only positions/plans.
+- **Keys never via chat** — store keys with the CLI wizard (`npx quant-mcp setup`), the dashboard's ⚙️ settings form, or env vars. They live in `~/.quant-mcp/credentials.env` (chmod 600, gitignored), are shown masked only, and can't be read back. Never paste keys into the agent conversation.
+
+### Adding exchange keys (3 ways — pick one)
+```bash
+npx quant-mcp setup     # A) interactive wizard (masked input) — easiest
+```
+**B)** Open the dashboard → **⚙️ API 키 설정** → enter per broker (password fields, masked, no readback).
+**C)** Env vars / secret managers (advanced; MCP-config `env` overrides the file). See [`SETUP-LIVE.md`](SETUP-LIVE.md).
 
 See [`SETUP-LIVE.md`](SETUP-LIVE.md) before enabling live trading.
 

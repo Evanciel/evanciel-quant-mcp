@@ -152,6 +152,9 @@ export function buildServer(): McpServer {
 }
 
 async function main() {
+  const { loadCredentialsFile } = await import("../setup/credentials.js");
+  const n = loadCredentialsFile(); // ~/.quant-mcp/credentials.env → process.env (MCP 설정 env 우선)
+  if (n > 0) process.stderr.write(`loaded ${n} credential(s) from credentials.env\n`);
   const server = buildServer();
   const transport = new StdioServerTransport();
   await server.connect(transport);
@@ -166,5 +169,13 @@ async function main() {
 // 직접 실행 시에만 기동(테스트 import 시엔 buildServer만 사용).
 const isMain = import.meta.url === `file://${process.argv[1]}` || process.argv[1]?.endsWith("index.ts") || process.argv[1]?.endsWith("index.js");
 if (isMain) {
-  main().catch((e) => { process.stderr.write(`fatal: ${e instanceof Error ? e.message : String(e)}\n`); process.exit(1); });
+  // `npx quant-mcp setup` → 대화형 자격증명 마법사(서버 미기동, 키는 화면 마스킹).
+  if (process.argv[2] === "setup") {
+    import("../setup/cli.js")
+      .then(({ runSetup }) => runSetup())
+      .then(() => process.exit(0))
+      .catch((e) => { process.stderr.write(`setup failed: ${e instanceof Error ? e.message : String(e)}\n`); process.exit(1); });
+  } else {
+    main().catch((e) => { process.stderr.write(`fatal: ${e instanceof Error ? e.message : String(e)}\n`); process.exit(1); });
+  }
 }

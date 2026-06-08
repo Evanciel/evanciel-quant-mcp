@@ -7,6 +7,17 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { randomBytes } from "node:crypto";
 import * as store from "../store/db.js";
+import { BROKER_FIELDS, upsertCredentials, credentialStatus, credentialsPath, type BrokerKey } from "../setup/credentials.js";
+
+/** POST 본문을 안전하게 읽어 JSON 파싱(상한 64KB, 자격증명 폼은 작음). */
+function readJsonBody(req: IncomingMessage): Promise<Record<string, unknown>> {
+  return new Promise((resolve, reject) => {
+    let n = 0; const chunks: Buffer[] = [];
+    req.on("data", (c: Buffer) => { n += c.length; if (n > 65536) { reject(new Error("body too large")); req.destroy(); return; } chunks.push(c); });
+    req.on("end", () => { try { resolve(chunks.length ? JSON.parse(Buffer.concat(chunks).toString("utf8")) : {}); } catch (e) { reject(e); } });
+    req.on("error", reject);
+  });
+}
 
 let _state: { url: string; port: number; token: string } | null = null;
 
@@ -192,6 +203,25 @@ export function startDashboard(port = 7788): Promise<{ url: string; port: number
       req.on("close", () => clearInterval(iv));
       return;
     }
+    // 자격증명: GET=마스킹 상태(키값 미반환) / POST=upsert(화이트리스트, chmod 600, 응답도 마스킹만).
+    if (u.pathname === "/api/credentials") {
+      if (req.method === "GET") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true, fields: BROKER_FIELDS, status: credentialStatus(), path: credentialsPath() }));
+        return;
+      }
+      if (req.method === "POST") {
+        readJsonBody(req).then((body) => {
+          const updates: Record<string, string> = {};
+          for (const [k, v] of Object.entries(body)) if (typeof v === "string") updates[k] = v; // upsert가 화이트리스트로 재차 필터
+          const { written } = upsertCredentials(updates); // 키값 로깅/에코 안 함
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({ ok: true, written: written.length, status: credentialStatus() })); // 마스킹 상태만 반환
+        }).catch((e) => { res.writeHead(400, { "content-type": "application/json" }); res.end(JSON.stringify({ ok: false, error: e instanceof Error ? e.message : "bad request" })); });
+        return;
+      }
+      res.writeHead(405).end("method not allowed"); return;
+    }
     res.writeHead(404).end("not found");
   });
 
@@ -237,10 +267,31 @@ h1{font-size:18px;margin:0 0 2px}.sub{color:#8a94a6;font-size:12px;margin-bottom
 .plain{margin-top:10px;font-size:14px;line-height:1.55;color:#dfe6f1}
 .earn{margin-top:9px;font-size:13px;font-weight:600}
 .more{margin-top:10px;font-size:11px;color:#6b7588;cursor:pointer;user-select:none}.more:hover{color:#8a94a6}
+.gear{cursor:pointer;color:#7aa2f7;font-size:12px;margin-left:8px;user-select:none}.gear:hover{color:#a8c0ff}
+.setpanel{margin-bottom:16px}
+.setnote{font-size:12px;color:#8a94a6;margin:8px 0 12px;line-height:1.5}.setnote code{background:#0e1320;padding:1px 5px;border-radius:4px;color:#c9d2e3}
+.brk{border-top:1px solid #222838;padding-top:10px;margin-top:10px}.brk:first-child{border-top:0;padding-top:0;margin-top:0}
+.brkh{display:flex;justify-content:space-between;align-items:center;font-weight:600;margin-bottom:8px}
+.brkh .ok{font-size:11px;color:#10b981}.brkh .no{font-size:11px;color:#8a94a6}
+.fld{display:grid;grid-template-columns:140px 1fr;gap:8px;align-items:center;margin-bottom:7px}
+.fld label{font-size:12px;color:#c9d2e3}.fld .cur{font-size:11px;color:#6b7588}
+.fld input{background:#0e1320;border:1px solid #222838;border-radius:6px;color:#e6e6e6;padding:7px 9px;font:13px system-ui,sans-serif;width:100%;box-sizing:border-box}
+.fld input:focus{outline:none;border-color:#7aa2f7}
+.savebtn{background:#7aa2f7;color:#0b0e14;border:0;border-radius:8px;padding:8px 16px;font-weight:700;font-size:13px;cursor:pointer;margin-top:8px}.savebtn:hover{background:#a8c0ff}
+.setmsg{font-size:12px;margin-top:10px;min-height:16px}.setmsg.ok{color:#10b981}.setmsg.err{color:#f43f5e}
+@media(max-width:560px){.fld{grid-template-columns:1fr}}
 @media(max-width:560px){.wrap{padding:14px}.hdr{grid-template-columns:1fr 1fr}.pos{grid-template-columns:1fr}.v{font-size:20px}.sym{font-size:14px}}
 </style></head><body><div class="wrap">
 <h1>내 자동매매 현황 <span class="dot"></span></h1>
-<div class="sub">봇이 알아서 사고팔아요 · 실시간 시세 반영 <span id="upd" style="color:#8a94a6">—</span></div>
+<div class="sub">봇이 알아서 사고팔아요 · 실시간 시세 반영 <span id="upd" style="color:#8a94a6">—</span>
+  <span class="gear" onclick="toggleSettings()">⚙️ API 키 설정</span></div>
+<div class="card setpanel" id="setpanel" style="display:none">
+  <div class="row"><div><b>거래소 API 키 입력</b> <span class="hint">실거래/모의거래를 하려면 키가 필요해요</span></div>
+    <span class="gear" onclick="toggleSettings()">닫기 ✕</span></div>
+  <div class="setnote">🔒 키는 이 컴퓨터의 <code id="credpath">~/.quant-mcp/credentials.env</code> 파일에만 저장돼요(소유자 전용). 화면·채팅·인터넷으로 절대 새어나가지 않고, 한 번 저장하면 다시 보이지 않아요(보안). 발급처는 거래소(예: Binance) 설정에서 받으세요.</div>
+  <div id="setbody"></div>
+  <div id="setmsg" class="setmsg"></div>
+</div>
 <div class="hdr">
   <div class="card"><div class="k">작동 중인 봇 / 보유 중</div><div class="v"><span id="bcnt">0</span><span style="font-size:14px;color:#8a94a6"> / </span><span id="cnt">0</span></div></div>
   <div class="card"><div class="k">지금 손익 <span class="hint">(안 팔았을 때)</span></div><div class="v" id="tot">+0.00</div></div>
@@ -298,6 +349,34 @@ function render(){const pos=document.getElementById('pos');let tot=0,n=0,rtot=0;
  const t=document.getElementById('tot');t.textContent=(tot>=0?'+':'')+fmt(tot);t.className='v '+(tot>=0?'up':'dn');
  const rt=document.getElementById('rtot');rt.textContent=(rtot>=0?'+':'')+fmt(rtot);rt.className='v '+(rtot>=0?'up':'dn');
  document.getElementById('empty').style.display=bots.length?'none':'block'}
+// ── API 키 설정 패널 (시크릿은 type=password·autocomplete=off, 저장 후 마스킹만 표시·재조회 불가) ──
+let setLoaded=false;
+function toggleSettings(){const p=document.getElementById('setpanel');const show=p.style.display!=='block';p.style.display=show?'block':'none';if(show&&!setLoaded){loadSettings();}}
+function brokerLabel(b){return {binance:'Binance (암호화폐)',kis:'한국투자증권',kiwoom:'키움증권'}[b]||b;}
+function loadSettings(){fetch('/api/credentials?token='+TOKEN).then(r=>r.json()).then(d=>{if(!d.ok)return;setLoaded=true;
+ document.getElementById('credpath').textContent=d.path;
+ const body=document.getElementById('setbody');body.innerHTML='';
+ for(const b of Object.keys(d.fields)){const st=d.status[b];
+  const sec=document.createElement('div');sec.className='brk';
+  const okTxt=st.configured?'<span class="ok">✓ 설정됨</span>':'<span class="no">미설정</span>';
+  let h='<div class="brkh"><span>'+esc(brokerLabel(b))+'</span>'+okTxt+'</div>';
+  for(const f of d.fields[b]){const cur=st.fields[f.key];const isSet=cur&&cur!=='(none)';
+   const ph=f.secret?(isSet?'저장됨: '+esc(cur)+' (바꾸려면 입력)':'입력 안 함'):(isSet?esc(cur):(f.optional?'선택':'입력'));
+   h+='<div class="fld"><label>'+esc(f.label)+'</label>'+
+      '<input data-key="'+esc(f.key)+'" type="'+(f.secret?'password':'text')+'" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="'+ph+'"></div>';}
+  h+='<button class="savebtn" data-broker="'+esc(b)+'">저장</button>';
+  sec.innerHTML=h;body.appendChild(sec);
+  sec.querySelector('.savebtn').addEventListener('click',()=>saveBroker(b,sec));}
+});}
+function saveBroker(b,sec){const updates={};sec.querySelectorAll('input[data-key]').forEach(i=>{const v=i.value.trim();if(v)updates[i.getAttribute('data-key')]=v;});
+ const msg=document.getElementById('setmsg');
+ if(!Object.keys(updates).length){msg.className='setmsg err';msg.textContent='입력한 값이 없어요.';return;}
+ msg.className='setmsg';msg.textContent='저장 중…';
+ fetch('/api/credentials?token='+TOKEN,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(updates)})
+  .then(r=>r.json()).then(d=>{if(d.ok){msg.className='setmsg ok';msg.textContent='✅ '+d.written+'개 저장 완료. 키는 안전하게 보관돼요(다시 표시 안 됨).';
+   sec.querySelectorAll('input[data-key]').forEach(i=>i.value='');setLoaded=false;loadSettings();}
+   else{msg.className='setmsg err';msg.textContent='저장 실패: '+(d.error||'알 수 없음');}})
+  .catch(e=>{msg.className='setmsg err';msg.textContent='저장 실패: '+e.message;});}
 const es=new EventSource('/events?token='+TOKEN);
 es.onmessage=e=>{const s=JSON.parse(e.data);bots=s.bots;document.getElementById('upd').textContent=new Date(s.updatedAt).toLocaleTimeString();subscribe();render()};
 render();
