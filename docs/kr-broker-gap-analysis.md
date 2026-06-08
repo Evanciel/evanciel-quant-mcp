@@ -51,3 +51,16 @@
 ## 결론
 
 공식문서 대조로 **실제 거부를 유발할 치명 갭 3건(KIS tr_id·EXCG_ID, 키움 취소 stk_cd) + KRW 캡 버그**를 색출·수정. 이제 한투/키움은 **"현행 스펙 일치" 단계**. 다음 관문 = **모의서버 E2E**(키 주시면 Binance testnet과 동일 절차로 머니패스 확정).
+
+## 키움 모의서버 E2E 검증 (2026-06-08) — 🟢 PASS, 추가 실버그 3건 색출·수정
+
+키움 모의(mockapi.kiwoom.com) 키로 머니패스 E2E 실행 → **"스펙 일치"만으론 안 잡히는 런타임 버그 3건** 발견·수정 (Binance testnet과 동일 교훈: 실서버 안 돌리면 못 잡음).
+
+- 🔴[키움-E2E-1] **getPrice가 0 반환**: `ka10004`는 현재가가 아니라 **주식호가(orderbook)** API라 `cur_prc` 필드 없음 → 최우선 매수/매도호가(`buy_fpr_bid`/`sel_fpr_bid`) mid를 현재가로 사용하도록 수정.
+- 🔴[키움-E2E-2] **getPositions return_code=2**: `ka10072`는 `strt_dt`(시작일) 필수인 '일자별 실현손익'이라 보유종목 용도 부적합 → 보유종목은 **`kt00018`(계좌평가잔고)의 `acnt_evlt_remn_indv_tot` 배열**에 있음(잔고와 동일 응답). 그쪽 파싱으로 수정.
+- 🔴[키움-E2E-3] **지정가 매수 return_code=20(RC4003 호가단위 오류)**: 지정가가 KRX 틱(200k~500k=500원)에 안 맞아 거부 → 어댑터에 `krxTick()`/`roundToKrxTick()` 추가, placeOrder가 지정가를 틱에 자동 정렬.
+
+E2E 결과: 연결(토큰/잔고5억/현재가/보유) PASS + 주문(지정가 매수 접수 0100138 → kt10003+stk_cd 취소 → 미체결 확인) **4/4 PASS**. tsc0, vitest117.
+검증 스크립트: `scripts/verify-kiwoom-mock-connection.ts`(읽기전용), `scripts/verify-kiwoom-mock-order-e2e.ts`(매수→취소).
+
+**남은 한계**: 시장가 체결→보유종목 populate→매도 회수의 "체결 사이클"은 모의 시장시간/체결 시뮬 의존이라 미확정(지정가 접수+취소는 확정). 한투(KIS) 모의 E2E는 KIS 모의키 받으면 동일 절차. KR 상주손절(거래소 SL/TP)은 여전히 공백(소프트스톱 후속).

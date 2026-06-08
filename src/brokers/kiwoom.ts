@@ -56,6 +56,25 @@ function toNum(v: unknown): number {
   return Number.isFinite(n) ? n : 0;
 }
 
+/**
+ * KRX 호가단위(2023 개편). 가격대별 틱. ⚠️ 모의서버 검증(2026-06): 지정가가 틱에 안 맞으면
+ * return_code=20(RC4003 호가단위 오류)로 거부 → placeOrder가 지정가를 이 틱으로 정렬해야 함.
+ */
+function krxTick(price: number): number {
+  if (price < 2000) return 1;
+  if (price < 5000) return 5;
+  if (price < 20000) return 10;
+  if (price < 50000) return 50;
+  if (price < 200000) return 100;
+  if (price < 500000) return 500;
+  return 1000;
+}
+function roundToKrxTick(price: number): number {
+  if (!(price > 0)) return price;
+  const t = krxTick(price);
+  return Math.round(price / t) * t;
+}
+
 interface KiwoomResponse {
   return_code?: number;
   return_msg?: string;
@@ -269,45 +288,36 @@ export class KiwoomBrokerAdapter extends BaseBrokerAdapter {
   }
 
   /**
-   * 보유종목/평가손익(ka10072, /api/dostk/acnt). cont-yn/next-key 헤더 페이징 전체 수집.
-   * 응답 배열 후보(acnt_evlt_remn_indv_tot / stk_acnt_evlt_remn 등)에서 종목 리스트 추출.
+   * 보유종목/평가손익. ⚠️ 모의서버 검증(2026-06): ka10072는 strt_dt(시작일) 필수인 '일자별 실현손익'이라
+   * 현재 보유종목 용도엔 부적합 → **계좌평가잔고 kt00018의 acnt_evlt_remn_indv_tot 배열**에 보유종목이 들어있음.
+   * (kt00018은 getBalance와 동일 엔드포인트, 응답에 합산 + 개별 보유 배열 동시 포함.)
    */
   async getPositions(): Promise<Position[]> {
     try {
+      const { data } = await this.post(
+        "/api/dostk/acnt",
+        API_ID.balance,
+        { qry_tp: "1", dmst_stex_tp: "KRX" },
+      );
+      this.assertOk(data, "getPositions");
+
+      const rows = Array.isArray(data.acnt_evlt_remn_indv_tot)
+        ? (data.acnt_evlt_remn_indv_tot as Record<string, unknown>[])
+        : [];
       const positions: Position[] = [];
-      let contYn = "N";
-      let nextKey = "";
-      let guard = 0;
-
-      do {
-        const page = await this.post(
-          "/api/dostk/acnt",
-          API_ID.holdings,
-          { qry_tp: "1", dmst_stex_tp: "KRX" },
-          guard === 0 ? undefined : { contYn: "Y", nextKey },
-        );
-        this.assertOk(page.data, "getPositions");
-
-        const rows = this.extractRows(page.data);
-        for (const item of rows) {
-          const qty = toNum(item.rmnd_qty ?? item.hldg_qty ?? item.cur_qty);
-          if (qty === 0) continue;
-          positions.push({
-            symbol: this.normalizeSymbol(String(item.stk_cd ?? item.pdno ?? "")),
-            name: String(item.stk_nm ?? item.prdt_name ?? "").trim(),
-            quantity: qty,
-            avgPrice: toNum(item.pur_pric ?? item.pchs_avg_pric ?? item.buy_uv),
-            currentPrice: toNum(item.cur_prc ?? item.prpr ?? item.now_pric),
-            pnl: toNum(item.evltv_prft ?? item.evlu_pfls_amt ?? item.pl_amt),
-            pnlPercent: toNum(item.prft_rt ?? item.evlu_pfls_rt ?? item.pl_rt),
-          });
-        }
-
-        contYn = page.contYn;
-        nextKey = page.nextKey;
-        guard += 1;
-      } while (contYn === "Y" && nextKey && guard < 50);
-
+      for (const item of rows) {
+        const qty = toNum(item.rmnd_qty ?? item.hldg_qty ?? item.cur_qty ?? item.trde_able_qty);
+        if (qty === 0) continue;
+        positions.push({
+          symbol: this.normalizeSymbol(String(item.stk_cd ?? item.pdno ?? "")),
+          name: String(item.stk_nm ?? item.prdt_name ?? "").trim(),
+          quantity: qty,
+          avgPrice: toNum(item.pur_pric ?? item.pchs_avg_pric ?? item.buy_uv),
+          currentPrice: toNum(item.cur_prc ?? item.prpr ?? item.now_pric),
+          pnl: toNum(item.evltv_prft ?? item.evlu_pfls_amt ?? item.pl_amt),
+          pnlPercent: toNum(item.prft_rt ?? item.evlu_pfls_rt ?? item.pl_rt),
+        });
+      }
       return positions;
     } catch (error) {
       throw new Error(
@@ -317,8 +327,9 @@ export class KiwoomBrokerAdapter extends BaseBrokerAdapter {
   }
 
   /**
-   * 현재가 시세(ka10004, /api/dostk/mrkcond). normalized MarketPrice로 매핑.
-   * 키움 현재가 필드는 부호 접두('+'/'-')가 붙는 경우가 있어 toNum이 정리.
+   * 현재가 시세. ⚠️ 모의서버 검증(2026-06): ka10004는 '주식호가'(orderbook)라 cur_prc 필드가 없음 →
+   * 최우선 매수/매도호가(buy_fpr_bid/sel_fpr_bid)의 mid를 현재가로 사용. 부호 접두는 toNum+abs로 정리.
+   * (last-traded-price/등락은 별도 api-id 필요 → 주문 참조가엔 mid로 충분, change=0.)
    */
   async getPrice(symbol: string): Promise<MarketPrice> {
     try {
@@ -328,12 +339,15 @@ export class KiwoomBrokerAdapter extends BaseBrokerAdapter {
       });
       this.assertOk(data, "getPrice");
 
+      const bestBid = Math.abs(toNum(data.buy_fpr_bid));
+      const bestAsk = Math.abs(toNum(data.sel_fpr_bid));
+      const price = bestBid > 0 && bestAsk > 0 ? (bestBid + bestAsk) / 2 : (bestBid || bestAsk);
       return {
         symbol: stk,
-        price: Math.abs(toNum(data.cur_prc ?? data.prpr ?? data.now_pric)),
-        change: toNum(data.pred_pre ?? data.prdy_vrss ?? data.base_pre),
-        changePercent: toNum(data.flu_rt ?? data.prdy_ctrt ?? data.fluc_rt),
-        volume: toNum(data.trde_qty ?? data.acml_vol ?? data.now_trde_qty),
+        price,
+        change: 0,
+        changePercent: 0,
+        volume: toNum(data.tot_buy_req) + toNum(data.tot_sel_req),
         timestamp: new Date(),
       };
     } catch (error) {
@@ -358,8 +372,8 @@ export class KiwoomBrokerAdapter extends BaseBrokerAdapter {
         dmst_stex_tp: "KRX",
         stk_cd: stk,
         ord_qty: String(order.quantity),
-        // 지정가는 가격, 시장가는 '0'.
-        ord_uv: isMarket ? "0" : String(order.price ?? 0),
+        // 지정가는 가격(KRX 틱 정렬 필수 — 미정렬 시 RC4003 거부), 시장가는 '0'.
+        ord_uv: isMarket ? "0" : String(roundToKrxTick(order.price ?? 0)),
         // '0'=보통(지정가), '3'=시장가.
         trde_tp: isMarket ? "3" : "0",
       };
