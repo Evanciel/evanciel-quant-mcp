@@ -242,6 +242,10 @@ Deploy with `save_strategy({ tree, stopLossPercent: 5, tpLadder: [{pct:5,sellPct
 
 **Manual trading & protective orders (BYOK, testnet-gated):** place market/limit **buy/sell** straight from a bot card, and set **take-profit / stop-loss by dragging lines on the chart** → a real Binance-spot **OCO** order (one-cancels-the-other: if TP fills, the SL auto-cancels, and vice-versa). Every order goes through the *same* safety pipeline as the bots — `liveGate` (testnet/mock only unless the master switch is on) → held-quantity & direction re-check on the server (client values are never trusted) → notional caps → **two-step confirm token** (preview → confirm, hash-bound, single-use, 5-min TTL) → audit log. The dashboard is the *only* place these run, and they're **off by default** on mainnet.
 
+**Exchange account sync (read-only):** each broker shows a **real-account panel** — actual exchange balance, real holdings, and any **resting OCO** orders (with a one-click cancel through the same safe path) — next to a **paper-vs-exchange drift badge** that quantifies how far your paper bots' ledger has diverged from real holdings. Keys are never returned to the browser; the panel polls `getAccount` every 60s and never places orders.
+
+**Event alerts (Slack / Discord webhook):** an in-dashboard alert feed surfaces bot events in real time — entries, exits (with realized PnL), and **error/stopped** transitions — and can fan them out to a **Slack or Discord webhook**. The webhook URL is treated as a secret (stored masked, never echoed) and passes a strict **SSRF gate**: HTTPS-only, an exact Slack/Discord host allowlist, no IP literals / userinfo / non-443 ports, webhook-path shape checks, and `redirect: 'error'` — so it can never be coerced into hitting an internal address. Delivery is debounced per bot+event to avoid spam.
+
 <div align="center">
   <img src="docs/img/dashboard.png" alt="quant-mcp dashboard" width="80%"/>
   <br/>
@@ -295,6 +299,8 @@ src/mcp-server/   stdio MCP server + 22 tools
 - ✅ Live money-path verified on Binance **testnet** (entry → resting SL/TP → cancel → close)
 - ✅ Pro dashboard: TradingView-grade charts (18 indicators w/ editable params, multi-pane oscillators, drawing tools, live ticking, KST axis)
 - ✅ Manual trading + drag-to-set TP/SL **OCO** protective orders — same two-step-token safety pipeline, testnet-verified
+- ✅ Exchange account sync (read-only): real balance / holdings / resting OCO + paper-vs-exchange drift badge — keys never leave the host
+- ✅ Event alerts: in-dashboard feed + Slack/Discord webhook with strict **SSRF gate** (HTTPS-only, host allowlist, no-redirect) + per-event debounce
 - ✅ Mainnet pilot prep: GO/NO-GO pre-flight (`verify-mainnet-readiness.ts`) + [runbook](docs/mainnet-pilot-runbook.md) — withdrawal-OFF / IP / hard-limit checks, **zero orders**
 - ⏳ Mainnet pilot (real funds — your decision; small-size, master switch) · limit orders · futures protective stops
 - ⏳ Non-crypto data (equities/FX), order-book/microstructure, options
