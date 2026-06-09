@@ -541,7 +541,9 @@ export class BinanceBrokerAdapter extends BaseBrokerAdapter {
     const tp = await this.normalizePrice(p.symbol, p.takeProfitPrice);
     const stopTrigger = await this.normalizePrice(p.symbol, p.stopPrice);
     // 손절 지정가: 미지정 시 트리거보다 0.1% 아래(급락 시 STOP_LOSS_LIMIT 미체결 방지 — 손절은 확실히 나가야 함).
-    const stopLimit = await this.normalizePrice(p.symbol, p.stopLimitPrice ?? p.stopPrice * 0.999);
+    let stopLimit = await this.normalizePrice(p.symbol, p.stopLimitPrice ?? p.stopPrice * 0.999);
+    // 라운딩 충돌 방지(저가 토큰): 지정가가 트리거 이상이 되면 1틱 아래로 강제(STOP_LOSS_LIMIT는 지정가<트리거여야 체결).
+    if (stopLimit >= stopTrigger) { const { tickSize } = await this.symbolFilters(p.symbol); stopLimit = await this.normalizePrice(p.symbol, stopTrigger - (tickSize || stopTrigger * 0.001)); }
     const qty = await this.normalizeQuantity(p.symbol, p.quantity, stopTrigger);
     if (!(tp > stopTrigger)) throw new Error(`OCO 가격 관계 오류: 익절가(${tp}) > 손절가(${stopTrigger}) 여야 합니다(SELL OCO).`);
     const params: Record<string, string> = {
@@ -574,5 +576,22 @@ export class BinanceBrokerAdapter extends BaseBrokerAdapter {
       if (msg.includes("-2011") || msg.toLowerCase().includes("unknown order")) return false;
       throw e;
     }
+  }
+
+  /** 심볼의 상주 OCO(보호주문) 조회. openOrders에서 orderListId 묶음 → {orderListId, tpPrice(LIMIT_MAKER), slPrice(STOP 트리거)}. 없으면 null. */
+  async getOpenOco(symbol: string): Promise<{ orderListId: string; tpPrice: number; slPrice: number } | null> {
+    if (this.market !== "spot") return null;
+    const data = await this.request<Array<Record<string, unknown>>>("/api/v3/openOrders", { method: "GET", signed: true, params: { symbol } });
+    const oco = (Array.isArray(data) ? data : []).filter((o) => String(o.orderListId ?? "-1") !== "-1");
+    if (!oco.length) return null;
+    const listId = String(oco[0].orderListId);
+    const legs = oco.filter((o) => String(o.orderListId) === listId);
+    let tpPrice = 0, slPrice = 0;
+    for (const o of legs) {
+      const type = String(o.type ?? "").toUpperCase();
+      if (type.includes("STOP")) slPrice = parseFloat(String(o.stopPrice ?? o.price ?? "0"));
+      else tpPrice = parseFloat(String(o.price ?? "0")); // LIMIT_MAKER 익절
+    }
+    return { orderListId: listId, tpPrice, slPrice };
   }
 }

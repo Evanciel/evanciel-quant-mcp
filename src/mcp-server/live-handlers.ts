@@ -108,6 +108,10 @@ export async function placeProtective(a: {
   if (!(a.quantity > 0)) return { ok: false, error: "수량은 0보다 커야 합니다." };
   if (!(held > 0)) return { ok: false, error: "보유 수량 없음(거래소 조회 실패 또는 미보유) → 보호주문 거절(fail-closed)." };
   if (a.quantity > held + 1e-9) return { ok: false, error: `수량 ${a.quantity} > 실보유 ${held}. 보유분만 보호 가능.` };
+  // 중복 등록 방지: 같은 심볼에 이미 상주 OCO가 있으면 거절(거래소 -2010 전에 fail-closed). 취소 후 재등록.
+  if (typeof got.adapter.getOpenOco === "function") {
+    try { const ex = await got.adapter.getOpenOco(a.symbol); if (ex) return { ok: false, error: `이미 ${a.symbol} 상주 OCO가 있습니다(취소 후 재등록).` }; } catch { /* 조회 실패 → 진행(거래소가 최종 방어) */ }
+  }
 
   // 2) 방향 검증 — 현재가 서버 재계산. 익절>현재가>손절(SELL OCO 구조).
   let mark = 0;
@@ -145,6 +149,20 @@ export async function placeProtective(a: {
     audit({ event: "oco_error", broker, env: gate.env, error: e instanceof Error ? e.message : String(e) });
     return { ok: false, error: e instanceof Error ? e.message : String(e) };
   }
+}
+
+/** 심볼의 상주 OCO 상태 + 실보유 조회(세션 간 복원·페이퍼봇 분기용). 키/시크릿 미노출. */
+export async function getProtective(a: { broker?: Broker; symbol: string }) {
+  const broker = a.broker || "binance", market = "spot" as const;
+  const got = getAdapter(broker, market);
+  if (!got) return { ok: false, active: false, held: 0, error: `${broker} 키 미설정(env).` };
+  const gate = liveGate(broker, market);
+  if (!gate.allowed) return { ok: false, active: false, held: 0, error: gate.reason };
+  let held = 0;
+  try { const base = a.symbol.replace(/USDT$|USDC$|BUSD$/i, ""); const ps = await got.adapter.getPositions(); held = ps.find((p) => p.symbol.toUpperCase() === base.toUpperCase())?.quantity ?? 0; } catch { held = 0; }
+  let oco: { orderListId: string; tpPrice: number; slPrice: number } | null = null;
+  if (typeof got.adapter.getOpenOco === "function") { try { oco = await got.adapter.getOpenOco(a.symbol); } catch { oco = null; } }
+  return { ok: true, env: gate.env, held: +held, active: !!oco, orderListId: oco?.orderListId, tpPrice: oco?.tpPrice, slPrice: oco?.slPrice };
 }
 
 /** OCO 보호주문 취소(orderListId). liveGate 경유(주문 아님이라 캡 불필요) + adapter.cancelOco + audit. */

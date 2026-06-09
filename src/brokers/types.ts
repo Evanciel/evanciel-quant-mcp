@@ -87,4 +87,6 @@ export interface BrokerAdapter {
   // 미지원 어댑터(선물/KIS/키움)는 undefined → 호출측이 typeof로 가드.
   placeOco?(p: { symbol: string; quantity: number; takeProfitPrice: number; stopPrice: number; stopLimitPrice?: number; listClientOrderId?: string }): Promise<{ orderListId: string; orders: OrderResult[] }>;
   cancelOco?(symbol: string, orderListId: string): Promise<boolean>;
+  // 심볼의 상주 OCO 조회(세션 간 상태 복원·중복 등록 방지). 없으면 null.
+  getOpenOco?(symbol: string): Promise<{ orderListId: string; tpPrice: number; slPrice: number } | null>;
 }

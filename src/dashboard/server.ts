@@ -11,7 +11,7 @@ import * as store from "../store/db.js";
 import { BROKER_FIELDS, upsertCredentials, credentialStatus, credentialsPath, enableLive, disableLive, liveSettingsStatus, type BrokerKey } from "../setup/credentials.js";
 import { fetchKlines } from "../data/binance-public.js";
 import { getAdapter } from "../brokers/index.js";
-import { placeOrder, placeProtective, cancelProtective } from "../mcp-server/live-handlers.js"; // 수동주문·OCO보호주문 — 안전경로(2단계토큰/게이트/캡) 재사용
+import { placeOrder, placeProtective, cancelProtective, getProtective } from "../mcp-server/live-handlers.js"; // 수동주문·OCO보호주문 — 안전경로(2단계토큰/게이트/캡) 재사용
 import type { Broker } from "../brokers/safety.js";
 import { sma, ema, rsi, macd, bollingerBands, stochastic, adx, atr, williamsR, stochasticRsi, cci, supertrend, vwap, mfi, parabolicSar, ichimoku, roc, obv, donchian } from "../core/strategy/indicators.js";
 
@@ -551,8 +551,15 @@ export function startDashboard(port = 7788): Promise<{ url: string; port: number
     }
     if (u.pathname === "/api/protect") {
       // OCO 보호주문(익절+손절 묶음). 안전로직은 placeProtective 내부에서만 강제(우회·재구현 금지).
-      // GET=상주 OCO 조회(v1: no-op {active:false}, getOpenOcoOrders 동기화는 후속). POST=미리보기→확정.
-      if (req.method === "GET") { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify({ ok: true, active: false })); return; }
+      // GET=심볼별 상주 OCO + 실보유 조회(세션 간 상태 복원·페이퍼봇 분기). POST=미리보기→확정.
+      if (req.method === "GET") {
+        const sym = (u.searchParams.get("symbol") || "").trim();
+        const bk = (u.searchParams.get("broker") || "binance") as Broker;
+        if (!sym) { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify({ ok: true, active: false })); return; }
+        getProtective({ broker: bk, symbol: sym }).then((r) => { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify(r)); })
+          .catch((e) => { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify({ ok: false, active: false, error: e instanceof Error ? e.message : "err" })); });
+        return;
+      }
       if (req.method !== "POST") { res.writeHead(405).end("method not allowed"); return; }
       readJsonBody(req).then(async (body) => {
         const symbol = typeof body.symbol === "string" ? body.symbol.trim() : "";
@@ -1018,7 +1025,7 @@ function renderProtectBar(){var bar=document.getElementById('chartProtect');if(!
   (_protect.active?'':'<span class="ib on" onclick="submitProtect()">보호주문 걸기</span>')+actTxt;
 }
 function setProtectInput(inp,which){var v=Number(inp.value);if(!(v>0)){inp.value=(which==='tp'?_protect.tpPrice:_protect.slPrice).toFixed(2);return;}
- if(which==='tp')_protect.tpPrice=v;else _protect.slPrice=v;drawProtectLines();renderProtectBar();}
+ if(which==='tp')_protect.tpPrice=v;else _protect.slPrice=v;invalidateProtPreview();drawProtectLines();renderProtectBar();}
 function lineY(price){try{return _priceSeries.priceToCoordinate(price)}catch(e){return null;}}
 function onProtMouseDown(ev){if(!_protect||_drawMode!=='none'||_protect.active)return; // 드로잉 모드/상주중엔 드래그 안 함
  var rect=document.getElementById('chartBody').getBoundingClientRect();var y=ev.clientY-rect.top;
@@ -1026,15 +1033,19 @@ function onProtMouseDown(ev){if(!_protect||_drawMode!=='none'||_protect.active)r
  if(ytp!=null&&Math.abs(y-ytp)<bd){bd=Math.abs(y-ytp);hit='tp';}
  if(ysl!=null&&Math.abs(y-ysl)<bd){hit='sl';}
  if(!hit)return;_protDrag=hit;try{_chart.applyOptions({handleScroll:false,handleScale:false})}catch(e){}ev.preventDefault();}
-function onProtMouseMove(ev){if(!_protDrag||!_protect)return;
+function onProtMouseMove(ev){if(_protDrag&&ev.buttons===0){onProtMouseUp();return;} // 창 밖에서 뗀 경우 복귀 첫 이동에 복원
+ if(!_protDrag||!_protect)return;
  var rect=document.getElementById('chartBody').getBoundingClientRect();var y=ev.clientY-rect.top;
  var price;try{price=_priceSeries.coordinateToPrice(y)}catch(e){return;}if(price==null||!isFinite(price)||price<=0)return;
- if(_protDrag==='tp')_protect.tpPrice=price;else _protect.slPrice=price;drawProtectLines();renderProtectBar();}
-function onProtMouseUp(){if(!_protDrag)return;_protDrag=null;try{_chart.applyOptions({handleScroll:true,handleScale:true})}catch(e){}}
+ if(_protDrag==='tp')_protect.tpPrice=price;else _protect.slPrice=price;invalidateProtPreview();drawProtectLines();renderProtectBar();}
+function onProtMouseUp(){if(!_protDrag)return;_protDrag=null;try{_chart.applyOptions({handleScroll:true,handleScale:true})}catch(e){}} // pan/zoom 복원
 function bindProtectDrag(){var body=document.getElementById('chartBody');if(!body)return;unbindProtectDrag();
- body.addEventListener('mousedown',onProtMouseDown);window.addEventListener('mousemove',onProtMouseMove);window.addEventListener('mouseup',onProtMouseUp);}
-function unbindProtectDrag(){var body=document.getElementById('chartBody');if(body)body.removeEventListener('mousedown',onProtMouseDown);window.removeEventListener('mousemove',onProtMouseMove);window.removeEventListener('mouseup',onProtMouseUp);}
-function loadActiveProtect(id){fetch('/api/protect?token='+TOKEN+'&bot='+encodeURIComponent(id)).then(function(r){return r.json()}).then(function(d){if(!_protect||String(_chartId)!==String(id))return;if(d&&d.ok&&d.active){_protect.active=true;_protect.orderListId=d.orderListId;if(typeof d.tpPrice==='number')_protect.tpPrice=d.tpPrice;if(typeof d.slPrice==='number')_protect.slPrice=d.slPrice;drawProtectLines();renderProtectBar();}}).catch(function(){});}
+ body.addEventListener('mousedown',onProtMouseDown);window.addEventListener('mousemove',onProtMouseMove);window.addEventListener('mouseup',onProtMouseUp);window.addEventListener('blur',onProtMouseUp);}
+function unbindProtectDrag(){var body=document.getElementById('chartBody');if(body)body.removeEventListener('mousedown',onProtMouseDown);window.removeEventListener('mousemove',onProtMouseMove);window.removeEventListener('mouseup',onProtMouseUp);window.removeEventListener('blur',onProtMouseUp);}
+function loadActiveProtect(id){if(!_protect)return;fetch('/api/protect?token='+TOKEN+'&symbol='+encodeURIComponent(_protect.sym)+'&broker='+encodeURIComponent(_protect.broker)).then(function(r){return r.json()}).then(function(d){if(!_protect||String(_chartId)!==String(id))return;
+ if(d&&d.ok&&typeof d.held==='number'&&!(d.held>0)){var bar=document.getElementById('chartProtect');if(bar)bar.style.display='none';var pm=document.getElementById('protectMsg');if(pm){pm.style.color='#8a94a6';pm.textContent='실거래 계정 보유가 없어 OCO 보호주문 불가(페이퍼 포지션).';}return;} // 페이퍼봇 죽은버튼 방지
+ if(d&&d.ok&&d.active){_protect.active=true;_protect.orderListId=d.orderListId;if(typeof d.tpPrice==='number'&&d.tpPrice>0)_protect.tpPrice=d.tpPrice;if(typeof d.slPrice==='number'&&d.slPrice>0)_protect.slPrice=d.slPrice;drawProtectLines();renderProtectBar();}}).catch(function(){});}
+function invalidateProtPreview(){if(_protect&&_protect.confirmToken){_protect.confirmToken=null;var pm=document.getElementById('protectMsg');if(pm){pm.style.color='';pm.textContent='값이 바뀌었어요 — 다시 미리보기하세요.';}}}
 function submitProtect(){if(!_protect)return;var msg=document.getElementById('protectMsg');
  if(!(_protect.tpPrice>_protect.entry)){msg.style.color='#f43f5e';msg.textContent='익절가는 진입가보다 높아야 해요.';return;}
  if(!(_protect.slPrice<_protect.entry)){msg.style.color='#f43f5e';msg.textContent='손절가는 진입가보다 낮아야 해요.';return;}
