@@ -644,8 +644,28 @@ function posRow(p,c){const px=prices.get(p.symbol)??p.entryAvg;const sign=p.side
  return {html,abs};}
 function statusPill(sum,hasPos){if(!hasPos)return '<span class="pill wait">⚪ 대기 중</span>';
  return sum>=0?'<span class="pill win">🟢 수익 중</span>':'<span class="pill lose">🔴 손실 중</span>';}
-let _chart=null,_chartId=null,_chartTf=null;
+let _chart=null,_chartId=null,_chartTf=null,_klineWs=null,_priceSeries=null,_ovSeries=[],_oscFlat=[],_markersPrim=null,_refreshing=false;
 function tfLabel(t){return {'1m':'1분','5m':'5분','30m':'30분','1h':'1시간','1d':'일','1w':'주','1mo':'월'}[t]||t;}
+// 실시간 차트(코인): 바이낸스 kline WS로 현재 봉 매 틱 갱신 + 봉 종료 시 지표 재계산(setData, 차트 재생성 없음=무깜빡).
+function klineIv(t){return t==='1mo'?'1M':t;} // 우리 토큰→바이낸스 kline 인터벌(월만 1M)
+function closeKline(){if(_klineWs){try{_klineWs.close()}catch(e){}_klineWs=null;}}
+function setupKline(sym,tf){closeKline();
+ if(!sym||!/usdt$/i.test(sym)||!window.WebSocket)return; // 바이낸스 USDT 심볼만(KR=폴링)
+ try{var ws=new WebSocket('wss://stream.binance.com:9443/ws/'+sym.toLowerCase()+'@kline_'+klineIv(tf));_klineWs=ws;
+  ws.onmessage=function(e){if(!_priceSeries||ws!==_klineWs)return;var k;try{k=JSON.parse(e.data).k}catch(err){return;}if(!k)return;
+   try{_priceSeries.update({time:Math.floor(k.t/1000),open:+k.o,high:+k.h,low:+k.l,close:+k.c})}catch(err){}
+   if(k.x)refreshSeries();}; // 봉 마감 → 지표/마커 재계산
+ }catch(e){}}
+// 봉 마감 시 1회: 지표 다시 받아 기존 시리즈에 setData(차트/패널 유지 → 깜빡임·줌리셋 없음).
+function refreshSeries(){if(_refreshing||!_priceSeries||!_chartId)return;_refreshing=true;
+ var indQ=chartInds.size?'&ind='+encodeURIComponent(Array.from(chartInds).join(',')):'';
+ fetch('/api/candles?token='+TOKEN+'&bot='+encodeURIComponent(_chartId)+(_chartTf?'&tf='+_chartTf:'')+indQ).then(function(r){return r.json()}).then(function(d){_refreshing=false;if(!d.ok||!_priceSeries)return;
+  try{_priceSeries.setData(d.bars||[]);}catch(e){}
+  (d.overlays||[]).forEach(function(o,i){if(_ovSeries[i])try{_ovSeries[i].setData(o.data||[])}catch(e){}});
+  var flat=(d.oscGroups||[]).reduce(function(a,g){return a.concat(g.series||[])},[]);
+  flat.forEach(function(se,i){if(_oscFlat[i])try{_oscFlat[i].setData(se.data||[])}catch(e){}});
+  if(_markersPrim)try{_markersPrim.setMarkers(d.markers||[])}catch(e){}
+ }).catch(function(){_refreshing=false;});}
 function renderTfButtons(cur){var tfs=['1m','5m','30m','1h','1d','1w','1mo'];
  document.getElementById('chartTf').innerHTML=tfs.map(function(t){return '<span class="tfb'+(t===cur?' on':'')+'" data-tf="'+t+'" onclick="openChart(_chartId,this.dataset.tf)">'+tfLabel(t)+'</span>';}).join('');}
 // 트뷰처럼 켜고끄는 지표 메뉴. 가격 위 오버레이 + 하단 보조지표. 선택은 localStorage 보존(틱 재렌더에도 유지).
@@ -671,21 +691,23 @@ function openChart(id,tf){_chartId=id;var modal=document.getElementById('chartMo
   var nOsc=oscGroups.length;
   var H=Math.min(820,360+nOsc*120); body.style.height=H+'px'; // 보조지표 패널 수만큼 세로 확장
   var chart=LightweightCharts.createChart(body,{width:body.clientWidth,height:H,layout:{background:{color:'#0e1320'},textColor:'#c9d2e3',panes:{separatorColor:'#222838',separatorHoverColor:'#3a4254',enableResize:true}},grid:{vertLines:{color:'#1a2030'},horzLines:{color:'#1a2030'}},timeScale:{timeVisible:!!d.intraday,borderColor:'#222838'},rightPriceScale:{borderColor:'#222838'}});
-  // pane 0 = 가격(캔들 + 오버레이)
+  // pane 0 = 가격(캔들 + 오버레이). 시리즈 참조 보관(실시간 갱신용).
+  _ovSeries=[];_oscFlat=[];
   var s=chart.addSeries(LightweightCharts.CandlestickSeries,{upColor:'#10b981',downColor:'#f43f5e',borderVisible:false,wickUpColor:'#10b981',wickDownColor:'#f43f5e'},0);
   s.setData(d.bars||[]);
-  (d.overlays||[]).forEach(function(o){var ls=chart.addSeries(LightweightCharts.LineSeries,{color:o.color,lineWidth:2,priceLineVisible:false,lastValueVisible:false,crosshairMarkerVisible:false},0);ls.setData(o.data||[]);});
+  (d.overlays||[]).forEach(function(o){var ls=chart.addSeries(LightweightCharts.LineSeries,{color:o.color,lineWidth:2,priceLineVisible:false,lastValueVisible:false,crosshairMarkerVisible:false},0);ls.setData(o.data||[]);_ovSeries.push(ls);});
   // 보조지표: 그룹(지표)당 별도 패널(pane 1,2,…). 같은 그룹의 선들은 한 패널.
   oscGroups.forEach(function(g,gi){var pane=gi+1;
-   (g.series||[]).forEach(function(se,si){var ls=chart.addSeries(LightweightCharts.LineSeries,{color:se.color,lineWidth:1.5,priceLineVisible:false,lastValueVisible:false,crosshairMarkerVisible:false},pane);ls.setData(se.data||[]);
+   (g.series||[]).forEach(function(se,si){var ls=chart.addSeries(LightweightCharts.LineSeries,{color:se.color,lineWidth:1.5,priceLineVisible:false,lastValueVisible:false,crosshairMarkerVisible:false},pane);ls.setData(se.data||[]);_oscFlat.push(ls);
     if(si===0&&g.guides)g.guides.forEach(function(gv){ls.createPriceLine({price:gv,color:'#3a4254',lineWidth:1,lineStyle:1,axisLabelVisible:false});});});});
   // 패널 높이 비율: 가격 패널을 크게(3), 보조 패널은 각 1.
   try{var panes=chart.panes();if(panes&&panes.length){panes[0].setStretchFactor(3);for(var pi=1;pi<panes.length;pi++)panes[pi].setStretchFactor(1);}}catch(e){}
   (d.priceLines||[]).forEach(function(pl){s.createPriceLine({price:pl.price,color:pl.color,lineWidth:1,lineStyle:2,axisLabelVisible:true,title:pl.title});});
-  if(d.markers&&d.markers.length){try{LightweightCharts.createSeriesMarkers(s,d.markers)}catch(e){}}
-  chart.timeScale().fitContent();_chart=chart;
+  _markersPrim=null;try{_markersPrim=LightweightCharts.createSeriesMarkers(s,d.markers||[])}catch(e){}
+  chart.timeScale().fitContent();_chart=chart;_priceSeries=s;
+  if(isC)setupKline(d.symbol,d.interval); else closeKline(); // 코인=실시간 WS, KR=SSE/폴링(45s)이 카드 갱신
  }).catch(function(){document.getElementById('chartTitle').textContent='차트 오류(네트워크)';});}
-function closeChart(){document.getElementById('chartModal').style.display='none';if(_chart){try{_chart.remove()}catch(e){}_chart=null;}document.getElementById('chartBody').innerHTML='';}
+function closeChart(){document.getElementById('chartModal').style.display='none';closeKline();_priceSeries=null;_ovSeries=[];_oscFlat=[];_markersPrim=null;if(_chart){try{_chart.remove()}catch(e){}_chart=null;}document.getElementById('chartBody').innerHTML='';}
 function card(r){var b=r.b,live=b.mode==='live',open=expanded.has(b.id),rp=r.rp;
  var wr=b.winRate!=null?', '+b.closes+'번 중 '+Math.round(b.winRate*b.closes/100)+'번 수익':'';
  var earn=b.closes>0?'<div class="earn '+(rp>=0?'up':'dn')+'">💰 지금까지 '+signed(rp,r.ccy)+' '+(rp>=0?'벌었어요':'잃었어요')+' <span class="hint">('+b.closes+'번 거래'+wr+')</span></div>':'';
