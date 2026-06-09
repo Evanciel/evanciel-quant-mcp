@@ -665,6 +665,29 @@ let _chart=null,_chartId=null,_chartTf=null,_klineWs=null,_priceSeries=null,_ovS
 // _drawings: {kind:'trend',p1:{time,price},p2:{time,price},series} | {kind:'hline',price,line(=PriceLine)}
 var _drawings=[],_drawMode='none',_pendingTrend=null,_clickHandler=null;
 function drawColor(){return '#22d3ee';}
+// ── 드로잉 영속(localStorage, 봇별) ──
+// 키=botId만(tf 무관: 드로잉은 가격/시각 절대좌표라 tf 바뀌어도 같은 선이 유효). 모델만 직렬화(series/line 객체참조 제외).
+var DRAW_NS='qmDraw:',DRAW_MAX=100; // 봇당 상한(용량/DoS 방어)
+var _drawLoadedFor=null; // 현재 _drawings가 어느 봇의 것인지(봇 전환 시에만 저장소 재로드)
+function drawKey(id){return DRAW_NS+String(id==null?'':id);}
+// _drawings → 직렬화 가능한 순수 모델 배열({kind,price} | {kind,p1,p2}). 객체참조(line/series) 제외.
+function serializeDrawings(){var out=[];for(var i=0;i<_drawings.length;i++){var d=_drawings[i];
+  if(d.kind==='hline'&&isFinite(d.price))out.push({kind:'hline',price:d.price});
+  else if(d.kind==='trend'&&d.p1&&d.p2)out.push({kind:'trend',p1:{time:d.p1.time,price:d.p1.price},p2:{time:d.p2.time,price:d.p2.price}});}
+  return out;}
+// 현재 _chartId 봇의 드로잉을 localStorage에 저장(그리기/지우개/전체삭제 후 호출).
+function persistDrawings(){if(_chartId==null)return;try{var arr=serializeDrawings();
+  if(arr.length)localStorage.setItem(drawKey(_chartId),JSON.stringify(arr.slice(0,DRAW_MAX)));
+  else localStorage.removeItem(drawKey(_chartId));}catch(e){}}
+// 손상 JSON/형식 방어하며 봇 드로잉 모델 로드. 좌표가 현재 윈도우 밖이어도 모델은 유지(off-screen).
+function loadDrawings(id){var raw;try{raw=localStorage.getItem(drawKey(id))}catch(e){return [];}if(!raw)return [];
+  var arr;try{arr=JSON.parse(raw)}catch(e){return [];}if(!Array.isArray(arr))return [];
+  var out=[];for(var i=0;i<arr.length&&out.length<DRAW_MAX;i++){var d=arr[i];if(!d||typeof d!=='object')continue;
+    if(d.kind==='hline'){if(typeof d.price==='number'&&isFinite(d.price))out.push({kind:'hline',price:d.price});}
+    else if(d.kind==='trend'){var p1=d.p1,p2=d.p2;
+      if(p1&&p2&&p1.time!=null&&p2.time!=null&&typeof p1.price==='number'&&typeof p2.price==='number'&&isFinite(p1.price)&&isFinite(p2.price))
+        out.push({kind:'trend',p1:{time:p1.time,price:p1.price},p2:{time:p2.time,price:p2.price}});}}
+  return out;}
 function clearChartPoll(){if(_chartPoll){clearInterval(_chartPoll);_chartPoll=null;}}
 function tfLabel(t){return {'1m':'1분','5m':'5분','30m':'30분','1h':'1시간','1d':'일','1w':'주','1mo':'월'}[t]||t;}
 // 시각 표기 KST 통일: 데이터는 안 건드리고 표시만. KR 봉시각=KST벽시계가 UTC로 인코딩됨(shift 0),
@@ -710,7 +733,8 @@ function onChartClick(param){
   if(_drawMode==='hline'){
     var pt=clickToPoint(param);if(!pt)return;
     var line=_priceSeries.createPriceLine({price:pt.price,color:drawColor(),lineWidth:1,lineStyle:0,axisLabelVisible:true,title:''});
-    _drawings.push({kind:'hline',price:pt.price,line:line});
+    if(_drawings.length>=DRAW_MAX){removeDrawing({kind:'hline',price:pt.price,line:line});return;} // 상한 초과=무시
+    _drawings.push({kind:'hline',price:pt.price,line:line});persistDrawings();
     return;
   }
   if(_drawMode==='trend'){
@@ -721,7 +745,8 @@ function onChartClick(param){
     var a=p1.time<p2.time?p1:p2,b=p1.time<p2.time?p2:p1; // time 오름차순 정렬(setData 요구)
     var ls=_chart.addSeries(LightweightCharts.LineSeries,{color:drawColor(),lineWidth:2,priceLineVisible:false,lastValueVisible:false,crosshairMarkerVisible:false},0);
     ls.setData([{time:a.time,value:a.price},{time:b.time,value:b.price}]);
-    _drawings.push({kind:'trend',p1:a,p2:b,series:ls});
+    if(_drawings.length>=DRAW_MAX){try{_chart.removeSeries(ls)}catch(e){}return;} // 상한 초과=무시
+    _drawings.push({kind:'trend',p1:a,p2:b,series:ls});persistDrawings();
     return;
   }
   if(_drawMode==='erase'){ // 클릭 근처(화면 픽셀 임계 내) 드로잉 1개만 삭제. 빈 영역 클릭=미삭제.
@@ -735,7 +760,7 @@ function onChartClick(param){
       var yc;try{yc=_priceSeries.priceToCoordinate(yp)}catch(e){yc=null;}
       if(yc==null)continue;var dpx=Math.abs(yc-cy);
       if(dpx<bd){bd=dpx;best=i;}}
-    if(best>=0&&bd<=THRESH){removeDrawing(_drawings[best]);_drawings.splice(best,1);} // 임계 내일 때만 삭제
+    if(best>=0&&bd<=THRESH){removeDrawing(_drawings[best]);_drawings.splice(best,1);persistDrawings();} // 임계 내일 때만 삭제
     return;
   }
 }
@@ -750,7 +775,7 @@ var DRAW_TOOLS=[{k:'trend',n:'추세선'},{k:'hline',n:'수평선'},{k:'erase',n
 function renderDrawButtons(){var el=document.getElementById('chartDraw');if(!el)return;
  el.innerHTML='<span class="indlbl">그리기</span>'+DRAW_TOOLS.map(function(t){return '<span class="ib'+(_drawMode===t.k?' on':'')+'" data-dk="'+t.k+'" onclick="setDrawMode(this.dataset.dk)">'+t.n+'</span>';}).join('')+'<span class="ib" onclick="clearAllDrawings()">전체삭제</span>';}
 function setDrawMode(k){_drawMode=(_drawMode===k)?'none':k;_pendingTrend=null;renderDrawButtons();}
-function clearAllDrawings(){clearDrawings();renderDrawButtons();}
+function clearAllDrawings(){clearDrawings();persistDrawings();renderDrawButtons();} // 모델 비움 → 저장소도 제거
 function renderTfButtons(cur){var tfs=['1m','5m','30m','1h','1d','1w','1mo'];
  document.getElementById('chartTf').innerHTML=tfs.map(function(t){return '<span class="tfb'+(t===cur?' on':'')+'" data-tf="'+t+'" onclick="openChart(_chartId,this.dataset.tf)">'+tfLabel(t)+'</span>';}).join('');}
 // 트뷰처럼 켜고끄는 지표 메뉴. 가격 위 오버레이 + 하단 보조지표. 선택은 localStorage 보존(틱 재렌더에도 유지).
@@ -769,7 +794,10 @@ function renderIndButtons(){document.getElementById('chartInds').innerHTML='<spa
 function toggleInd(k){if(chartInds.has(k))chartInds.delete(k);else chartInds.add(k);saveInds();openChart(_chartId,_chartTf);}
 // 거래량 히스토그램 데이터: 봉 상승/하락에 따라 색(가격패널 캔들색과 동일·반투명). bars[].volume는 서버가 이미 실어 보냄.
 function volData(bars){return (bars||[]).map(function(b){return {time:b.time,value:Number(b.volume)||0,color:(b.close>=b.open?'rgba(16,185,129,.45)':'rgba(244,63,94,.45)')};});}
-function openChart(id,tf){_chartId=id;var modal=document.getElementById('chartModal'),body=document.getElementById('chartBody');
+function openChart(id,tf){
+ // 새 봇(또는 닫힌 뒤 재오픈) 진입 시 저장된 드로잉 로드. tf변경/지표토글로 같은 봇 재오픈은 메모리 _drawings 유지(이미 저장과 동기).
+ if(String(id)!==String(_drawLoadedFor)){_drawings=[];_pendingTrend=null;_drawLoadedFor=String(id);try{_drawings=loadDrawings(id)}catch(e){_drawings=[];}}
+ _chartId=id;var modal=document.getElementById('chartModal'),body=document.getElementById('chartBody');
  document.getElementById('chartTitle').textContent='차트 불러오는 중…';modal.style.display='flex';
  var _oq=Array.from(chartInds).filter(function(k){return k!=='volume'});var indQ=_oq.length?'&ind='+encodeURIComponent(_oq.join(',')):''; // volume=클라전용(refreshSeries와 일관)
  fetch('/api/candles?token='+TOKEN+'&bot='+encodeURIComponent(id)+(tf?'&tf='+tf:'')+indQ).then(function(r){return r.json()}).then(function(d){
@@ -818,7 +846,7 @@ function openChart(id,tf){_chartId=id;var modal=document.getElementById('chartMo
   if(isC)setupKline(d.symbol,d.interval);
   else _chartPoll=setInterval(refreshSeries,20000); // KR 실시간 근사(20초마다 키움 차트 재요청). 429 회피용 간격.
  }).catch(function(){document.getElementById('chartTitle').textContent='차트 오류(네트워크)';});}
-function closeChart(){document.getElementById('chartModal').style.display='none';closeKline();clearChartPoll();if(_chart&&_clickHandler){try{_chart.unsubscribeClick(_clickHandler)}catch(e){}}_clickHandler=null;_drawings=[];_pendingTrend=null;_drawMode='none';_priceSeries=null;_ovSeries=[];_oscFlat=[];_markersPrim=null;_volSeries=null;if(_chart){try{_chart.remove()}catch(e){}_chart=null;}document.getElementById('chartBody').innerHTML='';}
+function closeChart(){document.getElementById('chartModal').style.display='none';closeKline();clearChartPoll();if(_chart&&_clickHandler){try{_chart.unsubscribeClick(_clickHandler)}catch(e){}}_clickHandler=null;_drawings=[];_pendingTrend=null;_drawLoadedFor=null;_drawMode='none';_priceSeries=null;_ovSeries=[];_oscFlat=[];_markersPrim=null;_volSeries=null;if(_chart){try{_chart.remove()}catch(e){}_chart=null;}document.getElementById('chartBody').innerHTML='';}
 function card(r){var b=r.b,live=b.mode==='live',open=expanded.has(b.id),rp=r.rp;
  var wr=b.winRate!=null?', '+b.closes+'번 중 '+Math.round(b.winRate*b.closes/100)+'번 수익':'';
  var earn=b.closes>0?'<div class="earn '+(rp>=0?'up':'dn')+'">💰 지금까지 '+signed(rp,r.ccy)+' '+(rp>=0?'벌었어요':'잃었어요')+' <span class="hint">('+b.closes+'번 거래'+wr+')</span></div>':'';
