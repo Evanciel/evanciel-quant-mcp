@@ -81,3 +81,88 @@ export async function placeOrder(a: {
     return { ok: false, error: e instanceof Error ? e.message : String(e) };
   }
 }
+
+/**
+ * 현물 OCO 보호주문(롱 포지션: 익절 LIMIT_MAKER + 손절 STOP_LOSS_LIMIT 묶음, 한쪽 체결 시 다른쪽 자동취소).
+ * placeOrder와 동일 안전 골격 재사용(신규 안전로직 0): liveGate → 실보유수량 검증 → 방향 검증 → checkLimits(TP·SL 각각)
+ * → 2단계 confirmToken(tp/sl/qty 해시 바인딩) → adapter.placeOco → audit. 서버가 클라 가격/수량/env 전부 불신·재계산.
+ */
+export async function placeProtective(a: {
+  broker?: Broker; symbol: string; quantity: number;
+  takeProfitPrice: number; stopPrice: number; stopLimitPrice?: number; confirmToken?: string;
+}) {
+  const broker = a.broker || "binance", market = "spot" as const; // OCO는 현물만
+  const got = getAdapter(broker, market);
+  if (!got) return { ok: false, error: `${broker} 키 미설정(env). 보호주문 불가. SETUP-LIVE.md 참고.` };
+  const gate = liveGate(broker, market);
+  if (!gate.allowed) return { ok: false, error: gate.reason, gate };
+  if (typeof got.adapter.placeOco !== "function") return { ok: false, error: `${broker} 어댑터는 OCO 미지원(현물 크립토만).` };
+
+  // 1) 실보유수량 검증 — 클라 quantity 불신, 거래소 실보유로 상한(현물 SELL only, 공매도 차단).
+  let held = 0;
+  try {
+    const base = a.symbol.replace(/USDT$|USDC$|BUSD$/i, ""); // 현물 base 자산(USDT/USDC/BUSD 페어만 정확)
+    const positions = await got.adapter.getPositions();
+    held = positions.find((p) => p.symbol.toUpperCase() === base.toUpperCase())?.quantity ?? 0;
+  } catch { held = 0; } // 조회 실패 → 0 → 아래에서 fail-closed 거절
+  if (!(a.quantity > 0)) return { ok: false, error: "수량은 0보다 커야 합니다." };
+  if (!(held > 0)) return { ok: false, error: "보유 수량 없음(거래소 조회 실패 또는 미보유) → 보호주문 거절(fail-closed)." };
+  if (a.quantity > held + 1e-9) return { ok: false, error: `수량 ${a.quantity} > 실보유 ${held}. 보유분만 보호 가능.` };
+
+  // 2) 방향 검증 — 현재가 서버 재계산. 익절>현재가>손절(SELL OCO 구조).
+  let mark = 0;
+  try { mark = (await got.adapter.getPrice(a.symbol)).price; } catch { mark = 0; }
+  if (!(mark > 0)) return { ok: false, error: "현재가 산출 실패 → 방향 검증 불가. 보호주문 거절(fail-closed)." };
+  if (!(a.takeProfitPrice > mark)) return { ok: false, error: `익절가 ${a.takeProfitPrice}는 현재가 ${mark}보다 높아야 합니다.` };
+  if (!(a.stopPrice < mark)) return { ok: false, error: `손절가 ${a.stopPrice}는 현재가 ${mark}보다 낮아야 합니다.` };
+  if (a.stopLimitPrice != null && a.stopLimitPrice > a.stopPrice) return { ok: false, error: "손절 지정가는 트리거가 이하여야 합니다." };
+
+  // 3) 하드리밋 — TP·SL 노셔널 각각 캡(한쪽만 우회 불가).
+  const quoteCurrency = broker === "binance" ? "USDT" : "KRW";
+  const tpLim = checkLimits({ symbol: a.symbol, notional: a.takeProfitPrice * a.quantity, quoteCurrency });
+  if (!tpLim.ok) return { ok: false, error: `하드리밋 차단(익절): ${tpLim.reason}` };
+  const slLim = checkLimits({ symbol: a.symbol, notional: a.stopPrice * a.quantity, quoteCurrency });
+  if (!slLim.ok) return { ok: false, error: `하드리밋 차단(손절): ${slLim.reason}` };
+
+  // 4) 2단계 confirmToken(fail-CLOSED) — kind:oco + tp/sl/qty 해시 바인딩(변조·교차사용 차단).
+  const hash = orderHash({ broker, market, kind: "oco", symbol: a.symbol, quantity: a.quantity, tp: a.takeProfitPrice, sl: a.stopPrice, sll: a.stopLimitPrice ?? null, env: gate.env });
+  if (!a.confirmToken) {
+    const token = mintToken(hash);
+    return {
+      ok: true, phase: "preview", needConfirm: true, confirmToken: token,
+      preview: { broker, market, env: gate.env, symbol: a.symbol, side: "sell", quantity: a.quantity, takeProfitPrice: a.takeProfitPrice, stopPrice: a.stopPrice, currentPrice: +mark.toFixed(8), held },
+      note: `⚠️ ${String(gate.env).toUpperCase()} OCO 보호주문 프리뷰(익절+손절 묶음, 한쪽 체결 시 다른쪽 자동취소). 동일 인자+confirmToken으로 재호출해야 실제 주문(5분 TTL, 단일사용).`,
+    };
+  }
+  if (!consumeToken(a.confirmToken, hash)) return { ok: false, error: "확인토큰 무효/만료/불일치 → 거절(fail-closed). 프리뷰부터 다시." };
+
+  audit({ event: "oco_attempt", broker, market, env: gate.env, symbol: a.symbol, quantity: a.quantity, tp: a.takeProfitPrice, sl: a.stopPrice });
+  try {
+    const result = await got.adapter.placeOco({ symbol: a.symbol, quantity: a.quantity, takeProfitPrice: a.takeProfitPrice, stopPrice: a.stopPrice, stopLimitPrice: a.stopLimitPrice });
+    audit({ event: "oco_result", broker, env: gate.env, orderListId: result.orderListId, symbol: a.symbol });
+    return { ok: true, phase: "executed", broker, env: gate.env, result };
+  } catch (e) {
+    audit({ event: "oco_error", broker, env: gate.env, error: e instanceof Error ? e.message : String(e) });
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+/** OCO 보호주문 취소(orderListId). liveGate 경유(주문 아님이라 캡 불필요) + adapter.cancelOco + audit. */
+export async function cancelProtective(a: { broker?: Broker; symbol: string; orderListId: string }) {
+  const broker = a.broker || "binance", market = "spot" as const;
+  const got = getAdapter(broker, market);
+  if (!got) return { ok: false, error: `${broker} 키 미설정(env).` };
+  const gate = liveGate(broker, market);
+  if (!gate.allowed) return { ok: false, error: gate.reason, gate };
+  if (!a.symbol || !a.orderListId) return { ok: false, error: "symbol·orderListId 필요." };
+  if (typeof got.adapter.cancelOco !== "function") return { ok: false, error: `${broker} 어댑터는 OCO 미지원.` };
+  audit({ event: "oco_cancel_attempt", broker, env: gate.env, symbol: a.symbol, orderListId: a.orderListId });
+  try {
+    const canceled = await got.adapter.cancelOco(a.symbol, a.orderListId);
+    audit({ event: "oco_cancel_result", broker, env: gate.env, symbol: a.symbol, orderListId: a.orderListId, canceled });
+    return { ok: true, canceled };
+  } catch (e) {
+    audit({ event: "oco_cancel_error", broker, env: gate.env, error: e instanceof Error ? e.message : String(e) });
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+  }
+}

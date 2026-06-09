@@ -83,4 +83,8 @@ export interface BrokerAdapter {
   getOrderByClientId?(symbol: string, clientOrderId: string): Promise<OrderResult | null>;
   // 거래소 수량 단위(LOT_SIZE 등)에 맞춰 주문 수량 정규화. 미구현 시 원본 수량 사용.
   normalizeQuantity?(symbol: string, quantity: number, refPrice: number): Promise<number>;
+  // 현물 OCO 보호주문(익절 LIMIT_MAKER + 손절 STOP_LOSS_LIMIT 묶음, 한쪽 체결 시 다른쪽 자동취소). 현물 SELL 전용.
+  // 미지원 어댑터(선물/KIS/키움)는 undefined → 호출측이 typeof로 가드.
+  placeOco?(p: { symbol: string; quantity: number; takeProfitPrice: number; stopPrice: number; stopLimitPrice?: number; listClientOrderId?: string }): Promise<{ orderListId: string; orders: OrderResult[] }>;
+  cancelOco?(symbol: string, orderListId: string): Promise<boolean>;
 }

@@ -11,7 +11,7 @@ import * as store from "../store/db.js";
 import { BROKER_FIELDS, upsertCredentials, credentialStatus, credentialsPath, enableLive, disableLive, liveSettingsStatus, type BrokerKey } from "../setup/credentials.js";
 import { fetchKlines } from "../data/binance-public.js";
 import { getAdapter } from "../brokers/index.js";
-import { placeOrder } from "../mcp-server/live-handlers.js"; // 수동주문 — 안전경로(2단계토큰/게이트/캡) 재사용
+import { placeOrder, placeProtective, cancelProtective } from "../mcp-server/live-handlers.js"; // 수동주문·OCO보호주문 — 안전경로(2단계토큰/게이트/캡) 재사용
 import type { Broker } from "../brokers/safety.js";
 import { sma, ema, rsi, macd, bollingerBands, stochastic, adx, atr, williamsR, stochasticRsi, cci, supertrend, vwap, mfi, parabolicSar, ichimoku, roc, obv, donchian } from "../core/strategy/indicators.js";
 
@@ -549,6 +549,40 @@ export function startDashboard(port = 7788): Promise<{ url: string; port: number
       }).catch((e) => { res.writeHead(400, { "content-type": "application/json" }); res.end(JSON.stringify({ ok: false, error: e instanceof Error ? e.message : "bad request" })); });
       return;
     }
+    if (u.pathname === "/api/protect") {
+      // OCO 보호주문(익절+손절 묶음). 안전로직은 placeProtective 내부에서만 강제(우회·재구현 금지).
+      // GET=상주 OCO 조회(v1: no-op {active:false}, getOpenOcoOrders 동기화는 후속). POST=미리보기→확정.
+      if (req.method === "GET") { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify({ ok: true, active: false })); return; }
+      if (req.method !== "POST") { res.writeHead(405).end("method not allowed"); return; }
+      readJsonBody(req).then(async (body) => {
+        const symbol = typeof body.symbol === "string" ? body.symbol.trim() : "";
+        const quantity = Number(body.quantity);
+        const takeProfitPrice = Number(body.takeProfitPrice);
+        const stopPrice = Number(body.stopPrice);
+        const stopLimitPrice = body.stopLimitPrice != null && Number(body.stopLimitPrice) > 0 ? Number(body.stopLimitPrice) : undefined;
+        const broker = (typeof body.broker === "string" ? body.broker : "binance") as Broker;
+        const confirmToken = typeof body.confirmToken === "string" ? body.confirmToken : undefined;
+        if (!symbol || !(quantity > 0) || !(takeProfitPrice > 0) || !(stopPrice > 0)) {
+          res.writeHead(400, { "content-type": "application/json" }); res.end(JSON.stringify({ ok: false, error: "입력 오류: symbol·quantity>0·takeProfitPrice>0·stopPrice>0 필요" })); return;
+        }
+        // 서버는 클라 가격/수량/env 불신 — placeProtective가 getPositions(실보유)+getPrice(방향)+checkLimits 강제.
+        const r = await placeProtective({ broker, symbol, quantity, takeProfitPrice, stopPrice, stopLimitPrice, confirmToken });
+        res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify(r));
+      }).catch((e) => { res.writeHead(400, { "content-type": "application/json" }); res.end(JSON.stringify({ ok: false, error: e instanceof Error ? e.message : "bad request" })); });
+      return;
+    }
+    if (u.pathname === "/api/protect/cancel") {
+      if (req.method !== "POST") { res.writeHead(405).end("method not allowed"); return; }
+      readJsonBody(req).then(async (body) => {
+        const symbol = typeof body.symbol === "string" ? body.symbol.trim() : "";
+        const orderListId = typeof body.orderListId === "string" ? body.orderListId : String(body.orderListId ?? "");
+        const broker = (typeof body.broker === "string" ? body.broker : "binance") as Broker;
+        if (!symbol || !orderListId) { res.writeHead(400, { "content-type": "application/json" }); res.end(JSON.stringify({ ok: false, error: "symbol·orderListId 필요" })); return; }
+        const r = await cancelProtective({ broker, symbol, orderListId });
+        res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify(r));
+      }).catch((e) => { res.writeHead(400, { "content-type": "application/json" }); res.end(JSON.stringify({ ok: false, error: e instanceof Error ? e.message : "bad request" })); });
+      return;
+    }
     res.writeHead(404).end("not found");
   });
 
@@ -675,8 +709,10 @@ h1{font-size:18px;margin:0 0 2px}.sub{color:#8a94a6;font-size:12px;margin-bottom
   <div class="indbar" id="chartInds"></div>
   <div class="indparams" id="chartIndParams"></div>
   <div class="indbar" id="chartDraw"></div>
+  <div class="indbar" id="chartProtect" style="display:none"></div>
   <div id="chartBody"></div>
   <div class="cmnote" id="chartNote"></div>
+  <div class="cmnote" id="protectMsg"></div>
 </div></div>
 <div class="cmodal" id="orderModal"><div class="cmbox" style="width:min(440px,94vw)">
   <div class="cmhead"><b id="orderTitle">주문</b><span class="cmx" onclick="closeOrder()">닫기 ✕</span></div>
@@ -729,6 +765,11 @@ let _chart=null,_chartId=null,_chartTf=null,_klineWs=null,_priceSeries=null,_ovS
 // _drawings: {kind:'trend',p1:{time,price},p2:{time,price},series} | {kind:'hline',price,line(=PriceLine)}
 var _drawings=[],_drawMode='none',_pendingTrend=null,_clickHandler=null;
 function drawColor(){return '#22d3ee';}
+// ── 보호주문(OCO) 상태: 차트당. _protect=null이면 비활성(포지션 없음/현물 아님). 클라는 입력·표시만, 안전판정은 서버.
+var _protect=null; // {sym,broker,market,ccy,qty,entry,side,tpPrice,slPrice,tpLine,slLine,confirmToken,active,orderListId}
+var _protDrag=null; // 'tp'|'sl' 드래그 중이면 해당, 아니면 null
+var PROT_TP_PCT=5,PROT_SL_PCT=3; // 기본 익절/손절 %(드래그/입력 전 초기값)
+var PROT_HIT_PX=7; // 선 근처 판정 픽셀 임계
 // ── 드로잉 영속(localStorage, 봇별) ──
 // 키=botId만(tf 무관: 드로잉은 가격/시각 절대좌표라 tf 바뀌어도 같은 선이 유효). 모델만 직렬화(series/line 객체참조 제외).
 var DRAW_NS='qmDraw:',DRAW_MAX=100; // 봇당 상한(용량/DoS 방어)
@@ -941,12 +982,82 @@ function openChart(id,tf){
   chart.timeScale().fitContent();_chart=chart;_priceSeries=s;
   _clickHandler=onChartClick;chart.subscribeClick(_clickHandler); // 클릭→드로잉(모드 none이면 무시)
   _pendingTrend=null;redrawDrawings(); // 재생성된 차트에 기존 드로잉 복원
+  initProtect(id); // 봇 포지션(현물 롱 qty>0) 기반 익절/손절선 표시 + 드래그 배선(포지션 없으면 내부에서 숨김)
   // 실시간: 코인=바이낸스 kline WS, KR(키움/한투)=getCandles 폴링(WS 없음). 둘 다 refreshSeries로 갱신(무깜빡).
   closeKline();clearChartPoll();
   if(isC)setupKline(d.symbol,d.interval);
   else _chartPoll=setInterval(refreshSeries,20000); // KR 실시간 근사(20초마다 키움 차트 재요청). 429 회피용 간격.
  }).catch(function(){document.getElementById('chartTitle').textContent='차트 오류(네트워크)';});}
-function closeChart(){document.getElementById('chartModal').style.display='none';closeKline();clearChartPoll();if(_chart&&_clickHandler){try{_chart.unsubscribeClick(_clickHandler)}catch(e){}}_clickHandler=null;_drawings=[];_pendingTrend=null;_drawLoadedFor=null;_drawMode='none';_priceSeries=null;_ovSeries=[];_oscFlat=[];_markersPrim=null;_volSeries=null;if(_chart){try{_chart.remove()}catch(e){}_chart=null;}document.getElementById('chartBody').innerHTML='';}
+function closeChart(){document.getElementById('chartModal').style.display='none';closeKline();clearChartPoll();if(_chart&&_clickHandler){try{_chart.unsubscribeClick(_clickHandler)}catch(e){}}_clickHandler=null;_drawings=[];_pendingTrend=null;_drawLoadedFor=null;_drawMode='none';
+ unbindProtectDrag();_protect=null;_protDrag=null;var _cp=document.getElementById('chartProtect');if(_cp){_cp.style.display='none';_cp.innerHTML='';}var _pm=document.getElementById('protectMsg');if(_pm)_pm.textContent=''; // 보호주문 정리(리스너 누수 방지)
+ _priceSeries=null;_ovSeries=[];_oscFlat=[];_markersPrim=null;_volSeries=null;if(_chart){try{_chart.remove()}catch(e){}_chart=null;}document.getElementById('chartBody').innerHTML='';}
+// ── 보호주문(OCO) — 차트에서 익절/손절선 드래그 + 진짜 OCO. 모든 안전판정은 서버(placeProtective)가 강제. ──
+function findBot(id){for(var i=0;i<bots.length;i++)if(String(bots[i].id)===String(id))return bots[i];return null;}
+function initProtect(id){var bar=document.getElementById('chartProtect');var b=findBot(id);
+ var pos=b&&!b.isScanner&&(b.positions||[]).filter(function(p){return p.side==='long'&&p.qty>0;})[0]; // 현물 롱만(OCO SELL)
+ if(!pos||!_priceSeries||(b.broker!=='binance')){_protect=null;if(bar)bar.style.display='none';var pm0=document.getElementById('protectMsg');if(pm0)pm0.textContent='';return;}
+ var entry=pos.entryAvg;
+ _protect={sym:pos.symbol,broker:b.broker,market:b.market||'spot',ccy:ccyOf(b.broker),qty:pos.qty,entry:entry,side:'long',
+   tpPrice:entry*(1+PROT_TP_PCT/100),slPrice:entry*(1-PROT_SL_PCT/100),tpLine:null,slLine:null,confirmToken:null,active:false,orderListId:null};
+ drawProtectLines();renderProtectBar();bindProtectDrag();loadActiveProtect(id);
+}
+function drawProtectLines(){if(!_protect||!_priceSeries)return;
+ if(_protect.tpLine){try{_priceSeries.removePriceLine(_protect.tpLine)}catch(e){}}
+ if(_protect.slLine){try{_priceSeries.removePriceLine(_protect.slLine)}catch(e){}}
+ var f=function(x){return money(x,_protect.ccy)};
+ _protect.tpLine=_priceSeries.createPriceLine({price:_protect.tpPrice,color:'#10b981',lineWidth:2,lineStyle:0,axisLabelVisible:true,title:'익절 '+f(_protect.tpPrice)});
+ _protect.slLine=_priceSeries.createPriceLine({price:_protect.slPrice,color:'#f43f5e',lineWidth:2,lineStyle:0,axisLabelVisible:true,title:'손절 '+f(_protect.slPrice)});
+}
+function pctFromEntry(price){return ((price-_protect.entry)/_protect.entry*100);}
+function renderProtectBar(){var bar=document.getElementById('chartProtect');if(!bar||!_protect)return;bar.style.display='flex';
+ var actTxt=_protect.active?'<span class="ib on">상주 OCO 작동중</span><span class="ib" onclick="cancelProtect()">취소</span>':'';
+ bar.innerHTML='<span class="indlbl">보호주문</span>'+
+  '익절 <input type="number" id="ptp" step="any" value="'+(+_protect.tpPrice.toFixed(2))+'" onchange="setProtectInput(this,&quot;tp&quot;)" style="width:96px"> <span class="hint">'+(pctFromEntry(_protect.tpPrice)>=0?'+':'')+pctFromEntry(_protect.tpPrice).toFixed(1)+'%</span> '+
+  '손절 <input type="number" id="psl" step="any" value="'+(+_protect.slPrice.toFixed(2))+'" onchange="setProtectInput(this,&quot;sl&quot;)" style="width:96px"> <span class="hint">'+pctFromEntry(_protect.slPrice).toFixed(1)+'%</span> '+
+  '<span class="hint">수량 '+_protect.qty+'</span>'+
+  (_protect.active?'':'<span class="ib on" onclick="submitProtect()">보호주문 걸기</span>')+actTxt;
+}
+function setProtectInput(inp,which){var v=Number(inp.value);if(!(v>0)){inp.value=(which==='tp'?_protect.tpPrice:_protect.slPrice).toFixed(2);return;}
+ if(which==='tp')_protect.tpPrice=v;else _protect.slPrice=v;drawProtectLines();renderProtectBar();}
+function lineY(price){try{return _priceSeries.priceToCoordinate(price)}catch(e){return null;}}
+function onProtMouseDown(ev){if(!_protect||_drawMode!=='none'||_protect.active)return; // 드로잉 모드/상주중엔 드래그 안 함
+ var rect=document.getElementById('chartBody').getBoundingClientRect();var y=ev.clientY-rect.top;
+ var ytp=lineY(_protect.tpPrice),ysl=lineY(_protect.slPrice);var hit=null,bd=PROT_HIT_PX+1;
+ if(ytp!=null&&Math.abs(y-ytp)<bd){bd=Math.abs(y-ytp);hit='tp';}
+ if(ysl!=null&&Math.abs(y-ysl)<bd){hit='sl';}
+ if(!hit)return;_protDrag=hit;try{_chart.applyOptions({handleScroll:false,handleScale:false})}catch(e){}ev.preventDefault();}
+function onProtMouseMove(ev){if(!_protDrag||!_protect)return;
+ var rect=document.getElementById('chartBody').getBoundingClientRect();var y=ev.clientY-rect.top;
+ var price;try{price=_priceSeries.coordinateToPrice(y)}catch(e){return;}if(price==null||!isFinite(price)||price<=0)return;
+ if(_protDrag==='tp')_protect.tpPrice=price;else _protect.slPrice=price;drawProtectLines();renderProtectBar();}
+function onProtMouseUp(){if(!_protDrag)return;_protDrag=null;try{_chart.applyOptions({handleScroll:true,handleScale:true})}catch(e){}}
+function bindProtectDrag(){var body=document.getElementById('chartBody');if(!body)return;unbindProtectDrag();
+ body.addEventListener('mousedown',onProtMouseDown);window.addEventListener('mousemove',onProtMouseMove);window.addEventListener('mouseup',onProtMouseUp);}
+function unbindProtectDrag(){var body=document.getElementById('chartBody');if(body)body.removeEventListener('mousedown',onProtMouseDown);window.removeEventListener('mousemove',onProtMouseMove);window.removeEventListener('mouseup',onProtMouseUp);}
+function loadActiveProtect(id){fetch('/api/protect?token='+TOKEN+'&bot='+encodeURIComponent(id)).then(function(r){return r.json()}).then(function(d){if(!_protect||String(_chartId)!==String(id))return;if(d&&d.ok&&d.active){_protect.active=true;_protect.orderListId=d.orderListId;if(typeof d.tpPrice==='number')_protect.tpPrice=d.tpPrice;if(typeof d.slPrice==='number')_protect.slPrice=d.slPrice;drawProtectLines();renderProtectBar();}}).catch(function(){});}
+function submitProtect(){if(!_protect)return;var msg=document.getElementById('protectMsg');
+ if(!(_protect.tpPrice>_protect.entry)){msg.style.color='#f43f5e';msg.textContent='익절가는 진입가보다 높아야 해요.';return;}
+ if(!(_protect.slPrice<_protect.entry)){msg.style.color='#f43f5e';msg.textContent='손절가는 진입가보다 낮아야 해요.';return;}
+ msg.style.color='';msg.textContent='보호주문 미리보기 불러오는 중…';
+ fetch('/api/protect?token='+TOKEN,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({bot:_chartId,broker:_protect.broker,market:_protect.market,symbol:_protect.sym,side:'sell',quantity:_protect.qty,takeProfitPrice:_protect.tpPrice,stopPrice:_protect.slPrice})})
+  .then(function(r){return r.json()}).then(function(d){
+   if(!d.ok){msg.style.color='#f43f5e';msg.textContent='차단/오류: '+(d.error||'알 수 없음');return;}
+   if(d.phase==='preview'){_protect.confirmToken=d.confirmToken;var p=d.preview||{};
+    msg.style.color='';msg.innerHTML='OCO 미리보기 — 익절 '+money(p.takeProfitPrice,_protect.ccy)+' / 손절 '+money(p.stopPrice,_protect.ccy)+' · 수량 '+esc(p.quantity)+' · '+esc(String(p.env).toUpperCase())+' <span class="ib on" onclick="confirmProtect()">확정</span> <span class="ib" onclick="document.getElementById(&quot;protectMsg&quot;).textContent=&quot;&quot;">닫기</span>';return;}
+   msg.style.color='#f43f5e';msg.textContent='예상치 못한 응답';
+  }).catch(function(e){msg.style.color='#f43f5e';msg.textContent='실패: '+e.message;});}
+function confirmProtect(){if(!_protect||!_protect.confirmToken)return;var msg=document.getElementById('protectMsg');msg.style.color='';msg.textContent='OCO 전송 중…';
+ fetch('/api/protect?token='+TOKEN,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({bot:_chartId,broker:_protect.broker,market:_protect.market,symbol:_protect.sym,side:'sell',quantity:_protect.qty,takeProfitPrice:_protect.tpPrice,stopPrice:_protect.slPrice,confirmToken:_protect.confirmToken})})
+  .then(function(r){return r.json()}).then(function(d){_protect.confirmToken=null;
+   if(d.ok&&d.phase==='executed'){_protect.active=true;_protect.orderListId=(d.result&&d.result.orderListId)||d.orderListId;msg.style.color='#10b981';msg.textContent='✅ OCO 보호주문 등록됨 ('+esc(d.env||'')+')';renderProtectBar();}
+   else{msg.style.color='#f43f5e';msg.textContent='실패: '+(d.error||'알 수 없음')+' — 다시 시도하세요.';}
+  }).catch(function(e){msg.style.color='#f43f5e';msg.textContent='실패: '+e.message;});}
+function cancelProtect(){if(!_protect)return;var msg=document.getElementById('protectMsg');msg.style.color='';msg.textContent='보호주문 취소 중…';
+ fetch('/api/protect/cancel?token='+TOKEN,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({bot:_chartId,broker:_protect.broker,market:_protect.market,symbol:_protect.sym,orderListId:_protect.orderListId})})
+  .then(function(r){return r.json()}).then(function(d){
+   if(d.ok){_protect.active=false;_protect.orderListId=null;msg.style.color='#10b981';msg.textContent='보호주문이 취소됐어요.';renderProtectBar();}
+   else{msg.style.color='#f43f5e';msg.textContent='취소 실패: '+(d.error||'알 수 없음');}
+  }).catch(function(e){msg.style.color='#f43f5e';msg.textContent='실패: '+e.message;});}
 // ── 수동 주문(2단계: 미리보기→확정). 모든 안전판정은 서버 placeOrder가 수행, 클라는 입력·표시만. ──
 var _order=null; // {broker,market,symbol,ccy,side,quantity,type,price,confirmToken}
 function envBadge(env){var live=env==='live';return '<span class="envb '+(live?'live':'safe')+'">'+(live?'⚠ 실거래(LIVE)':String(env||'testnet').toUpperCase()+' 모의')+'</span>';}

@@ -529,4 +529,50 @@ export class BinanceBrokerAdapter extends BaseBrokerAdapter {
       timestamp: new Date(Number(d.time ?? d.updateTime ?? Date.now())),
     }));
   }
+
+  /**
+   * 현물 OCO(One-Cancels-the-Other) 보호주문. **현물 SELL 전용**(롱 포지션 보호: 익절+손절 묶음).
+   * - price=익절 LIMIT_MAKER(현재가 위), stopPrice=손절 트리거(현재가 아래), stopLimitPrice=손절 지정가.
+   * - 한쪽 체결 시 거래소가 다른쪽을 자동취소(진짜 OCO). 선물은 OCO 미지원 → throw.
+   * - 가격은 normalizePrice(tickSize), 수량은 normalizeQuantity(stepSize)로 라운딩(-1013/-1111 거부 방지).
+   */
+  async placeOco(p: { symbol: string; quantity: number; takeProfitPrice: number; stopPrice: number; stopLimitPrice?: number; listClientOrderId?: string }): Promise<{ orderListId: string; orders: OrderResult[] }> {
+    if (this.market !== "spot") throw new Error("OCO 보호주문은 현물(spot)만 지원합니다.");
+    const tp = await this.normalizePrice(p.symbol, p.takeProfitPrice);
+    const stopTrigger = await this.normalizePrice(p.symbol, p.stopPrice);
+    // 손절 지정가: 미지정 시 트리거보다 0.1% 아래(급락 시 STOP_LOSS_LIMIT 미체결 방지 — 손절은 확실히 나가야 함).
+    const stopLimit = await this.normalizePrice(p.symbol, p.stopLimitPrice ?? p.stopPrice * 0.999);
+    const qty = await this.normalizeQuantity(p.symbol, p.quantity, stopTrigger);
+    if (!(tp > stopTrigger)) throw new Error(`OCO 가격 관계 오류: 익절가(${tp}) > 손절가(${stopTrigger}) 여야 합니다(SELL OCO).`);
+    const params: Record<string, string> = {
+      symbol: p.symbol, side: "SELL", quantity: String(qty),
+      price: String(tp),                 // 익절 LIMIT_MAKER
+      stopPrice: String(stopTrigger),    // 손절 트리거
+      stopLimitPrice: String(stopLimit), // 손절 지정가
+      stopLimitTimeInForce: "GTC", newOrderRespType: "FULL",
+    };
+    if (p.listClientOrderId) params.listClientOrderId = p.listClientOrderId; // 멱등키(리스트 단위)
+    const data = await this.request<{ orderListId?: number | string; orderReports?: Array<Record<string, unknown>> }>("/api/v3/order/oco", { method: "POST", signed: true, params });
+    const orders: OrderResult[] = (data.orderReports || []).map((d) => ({
+      orderId: String(d.orderId ?? ""), symbol: p.symbol,
+      side: "sell", quantity: parseFloat(String(d.origQty ?? qty)),
+      price: parseFloat(String(d.price ?? d.stopPrice ?? "0")),
+      status: this.mapStatus(String(d.status ?? "")),
+      timestamp: new Date(Number(d.transactTime ?? Date.now())),
+    }));
+    return { orderListId: String(data.orderListId ?? ""), orders };
+  }
+
+  /** OCO 리스트 전체 취소. DELETE /api/v3/orderList?symbol&orderListId. 이미 없음/체결(-2011)은 false(멱등). */
+  async cancelOco(symbol: string, orderListId: string): Promise<boolean> {
+    if (this.market !== "spot") throw new Error("OCO 취소는 현물(spot)만 지원합니다.");
+    try {
+      const data = await this.request<{ listOrderStatus?: string }>("/api/v3/orderList", { method: "DELETE", signed: true, params: { symbol, orderListId } });
+      return data.listOrderStatus === "ALL_DONE" || data.listOrderStatus === "ALL_FREE";
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      if (msg.includes("-2011") || msg.toLowerCase().includes("unknown order")) return false;
+      throw e;
+    }
+  }
 }
