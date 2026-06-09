@@ -206,3 +206,30 @@ export async function cancelProtective(a: { broker?: Broker; symbol: string; ord
     return { ok: false, error: e instanceof Error ? e.message : String(e) };
   }
 }
+
+/**
+ * read-only 실계정 스냅샷 — 대시보드 '거래소 실계정' 패널용. 키/시크릿 절대 미노출.
+ * liveGate 경유(키 없으면 configured:false → 빈 패널, 메인넷+마스터OFF면 조회조차 차단). 쓰기 경로 없음.
+ * symbols: 이 브로커 봇 심볼들(현물 OCO 요약 대상). getProtective 재사용(liveGate+held+OCO 묶음).
+ */
+export async function getAccount(a: { broker?: Broker; market?: "spot" | "futures"; symbols?: string[] }) {
+  const broker = a.broker || "binance", market = a.market || "spot";
+  const got = getAdapter(broker, market);
+  if (!got) return { ok: false, configured: false, broker, reason: `${broker} 키 미설정(env). 페이퍼 유지.` };
+  const gate = liveGate(broker, market);
+  if (!gate.allowed) return { ok: false, configured: true, broker, env: gate.env, reason: gate.reason };
+  let balance: { totalAsset: number; cashBalance: number; currency: string } | null = null;
+  let balErr: string | undefined;
+  try { balance = await got.adapter.getBalance(); } catch (e) { balErr = e instanceof Error ? e.message : String(e); }
+  let positions: Awaited<ReturnType<typeof got.adapter.getPositions>> = [];
+  let posErr: string | undefined;
+  try { positions = await got.adapter.getPositions(); } catch (e) { posErr = e instanceof Error ? e.message : String(e); }
+  const protective: { symbol: string; active: boolean; held: number; orderListId?: string; tpPrice?: number; slPrice?: number; error?: string }[] = [];
+  if (market === "spot" && Array.isArray(a.symbols)) {
+    for (const sym of [...new Set(a.symbols.filter((s) => typeof s === "string" && s))].slice(0, 20)) {
+      const r = await getProtective({ broker, symbol: sym });
+      protective.push({ symbol: sym, active: !!r.active, held: Number(r.held) || 0, orderListId: r.orderListId, tpPrice: r.tpPrice, slPrice: r.slPrice, error: r.ok ? undefined : r.error });
+    }
+  }
+  return { ok: true, configured: true, broker, env: gate.env, balance, balErr, positions, posErr, protective };
+}

@@ -11,7 +11,8 @@ import * as store from "../store/db.js";
 import { BROKER_FIELDS, upsertCredentials, credentialStatus, credentialsPath, enableLive, disableLive, liveSettingsStatus, type BrokerKey } from "../setup/credentials.js";
 import { fetchKlines } from "../data/binance-public.js";
 import { getAdapter } from "../brokers/index.js";
-import { placeOrder, placeProtective, cancelProtective, getProtective } from "../mcp-server/live-handlers.js"; // 수동주문·OCO보호주문 — 안전경로(2단계토큰/게이트/캡) 재사용
+import { placeOrder, placeProtective, cancelProtective, getProtective, getAccount } from "../mcp-server/live-handlers.js"; // 수동주문·OCO보호주문·실계정조회 — 안전경로 재사용
+import { computePositionDrift } from "../core/execution/reconcile.js"; // 페이퍼 vs 거래소 실보유 드리프트(정보용)
 import type { Broker } from "../brokers/safety.js";
 import { sma, ema, rsi, macd, bollingerBands, stochastic, adx, atr, williamsR, stochasticRsi, cci, supertrend, vwap, mfi, parabolicSar, ichimoku, roc, obv, donchian } from "../core/strategy/indicators.js";
 
@@ -490,6 +491,34 @@ export function startDashboard(port = 7788): Promise<{ url: string; port: number
         .catch((e) => { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify({ prices: {}, error: e instanceof Error ? e.message : "err" })); });
       return;
     }
+    if (u.pathname === "/api/account") {
+      // 거래소 실계정(읽기전용) — getAccount가 liveGate 경유·키/시크릿 미노출. 심볼은 서버가 봇에서만 수집(클라 주입 불가).
+      const bk = (u.searchParams.get("broker") || "binance");
+      const accBots = store.listBots().filter((b) => b.broker === bk);
+      const market = accBots.some((b) => (store.getComposite(b.composite_strategy_id) as { market?: string } | undefined)?.market === "futures") ? "futures" : "spot";
+      const symbols = [...new Set(accBots.map((b) => b.symbol.toUpperCase()))];
+      // 페이퍼 보유: base 자산별 합산 qty(position_state open). 드리프트 매칭용.
+      const paperByBase = new Map<string, number>();
+      for (const b of accBots) {
+        const ps = b.position_state as { status?: string; qty?: number } | Record<string, { status?: string; qty?: number }> | null;
+        if (!ps || typeof ps !== "object") continue;
+        const base = b.symbol.toUpperCase().replace(/USDT$|USDC$|BUSD$/i, "");
+        const add = (q?: number) => { if (q && q > 0) paperByBase.set(base, (paperByBase.get(base) || 0) + q); };
+        if ((ps as { status?: string }).status === "open") add((ps as { qty?: number }).qty);
+        else for (const v of Object.values(ps as Record<string, { status?: string; qty?: number }>)) if (v?.status === "open") add(v.qty);
+      }
+      getAccount({ broker: bk as Broker, market, symbols }).then((acc) => {
+        let drift: { base: string; localQty: number; exchangeQty: number; severity: string; inSync: boolean }[] = [];
+        if (acc.ok && Array.isArray(acc.positions)) {
+          const exByBase = new Map<string, number>();
+          for (const p of acc.positions) { const k = String(p.symbol).toUpperCase(); exByBase.set(k, (exByBase.get(k) || 0) + (Number(p.quantity) || 0)); }
+          const bases = new Set<string>([...paperByBase.keys(), ...exByBase.keys()]);
+          drift = [...bases].map((base) => { const d = computePositionDrift(paperByBase.get(base) || 0, exByBase.get(base) || 0); return { base, localQty: d.localQty, exchangeQty: d.exchangeQty, severity: d.severity, inSync: d.inSync }; }).filter((d) => d.localQty > 0 || d.exchangeQty > 0);
+        }
+        res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify({ ...acc, market, drift }));
+      }).catch((e) => { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify({ ok: false, configured: true, error: e instanceof Error ? e.message : "err" })); });
+      return;
+    }
     if (u.pathname === "/events") {
       res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
       const send = () => res.write(`data: ${JSON.stringify(snapshot())}\n\n`);
@@ -645,6 +674,7 @@ h1{font-size:18px;margin:0 0 2px}.sub{color:#8a94a6;font-size:12px;margin-bottom
 .envb{font-size:10px;font-weight:700;padding:2px 7px;border-radius:4px;margin-left:6px}
 .envb.safe{background:rgba(122,162,247,.18);color:#7aa2f7}.envb.live{background:rgba(244,63,94,.22);color:#f43f5e}
 .obig{background:#7aa2f7;color:#0b0e14;border:0;border-radius:8px;padding:9px 16px;font-weight:700;font-size:13px;cursor:pointer;margin-top:10px}.obig.danger{background:#f43f5e;color:#fff}
+.acctpanel{grid-column:1/-1;margin-top:4px;border-color:#2a3550}.acctpanel .k{font-size:13px}
 .cmodal{display:none;position:fixed;inset:0;background:rgba(0,0,0,.66);z-index:50;align-items:center;justify-content:center;padding:16px}
 .cmbox{background:#121622;border:1px solid #222838;border-radius:14px;padding:14px;width:min(900px,94vw)}
 .cmhead{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}
@@ -728,7 +758,7 @@ h1{font-size:18px;margin:0 0 2px}.sub{color:#8a94a6;font-size:12px;margin-bottom
 </div></div>
 <script>
 const TOKEN=${JSON.stringify(token)};
-let bots=[];const prices=new Map();let ws=null;var accounts={};
+let bots=[];const prices=new Map();let ws=null;var accounts={};var realAccounts={}; // realAccounts[broker]=거래소 실계정 스냅샷(getAccount)
 function fmt(n,d=2){return Number(n).toLocaleString(undefined,{minimumFractionDigits:d,maximumFractionDigits:d})}
 function ccyOf(broker){return broker==='binance'?'USD':'KRW'}
 function csym(c){return c==='KRW'?'₩':'$'}
@@ -1150,6 +1180,7 @@ function render(){var pos=document.getElementById('pos');pos.innerHTML='';
   hd.innerHTML='<span class="sect-t">'+meta.label+' <span class="sect-s">'+meta.sub+'</span></span>'+
    '<span class="sect-m">'+balHtml+' · 평가손익 '+plspan(unr,ccy)+' · 확정 '+plspan(real,ccy)+'</span>';
   pos.appendChild(hd);
+  var ra=realAccounts[bk];if(ra){var ap=document.createElement('div');ap.className='card acctpanel';ap.innerHTML=acctPanelHtml(bk,ccy,ra);pos.appendChild(ap);} // 거래소 실계정 패널(읽기전용)
   for(const r of gr){posCount+=r.n;pos.appendChild(card(r));}}
  var hasU=acc.USD.n>0,hasK=acc.KRW.n>0;
  var heads=function(u,k){var o=[];if(hasU)o.push(plspan(u,'USD'));if(hasK)o.push(plspan(k,'KRW'));return o.join(' <span class="hint">·</span> ')||'—';};
@@ -1214,9 +1245,32 @@ function saveBroker(b,sec){const updates={};sec.querySelectorAll('input[data-key
    else{msg.className='setmsg err';msg.textContent='저장 실패: '+(d.error||'알 수 없음');}})
   .catch(e=>{msg.className='setmsg err';msg.textContent='저장 실패: '+e.message;});}
 function loadBalances(){fetch('/api/balances?token='+TOKEN).then(function(r){return r.json()}).then(function(d){if(d&&d.accounts){d.accounts.forEach(function(a){accounts[a.broker]=a});render();}}).catch(function(){});}
+// 거래소 실계정 패널(읽기전용). 브로커별 getAccount 폴링(60s). 주문/취소는 기존 안전경로만.
+function loadRealAccounts(){var bks=[];bots.forEach(function(b){if(bks.indexOf(b.broker)<0)bks.push(b.broker);});
+ bks.forEach(function(bk){fetch('/api/account?token='+TOKEN+'&broker='+encodeURIComponent(bk)).then(function(r){return r.json()}).then(function(d){realAccounts[bk]=d;render();}).catch(function(){});});}
+function acctPanelHtml(bk,ccy,ra){
+ if(!ra.configured)return '<div class="k">🔑 거래소 실계정</div><div class="hint" style="margin-top:6px">키 미연동 — ⚙️에서 API 키를 넣으면 실잔고·실포지션이 보여요.</div>';
+ if(ra.ok===false)return '<div class="k">🔑 거래소 실계정 <span class="envb safe">'+esc(String(ra.env||'').toUpperCase())+'</span></div><div class="hint" style="margin-top:6px">'+esc(ra.reason||ra.error||'조회 불가')+'</div>';
+ var bal=ra.balance||{};var balLine=bal.currency?('잔고 <b>'+money(bal.cashBalance||0,ccy)+'</b> <span class="hint">총평가 '+money(bal.totalAsset||0,ccy)+'</span>'):'<span class="hint">잔고 조회 실패'+(ra.balErr?': '+esc(ra.balErr):'')+'</span>';
+ var bad=(ra.drift||[]).filter(function(x){return x.severity&&x.severity!=='ok'});
+ var driftBadge=bad.length?'<span class="pill lose" title="봇 장부와 거래소 실보유가 달라요(페이퍼봇은 별개=정상, 정보용)">⚠ 페이퍼 vs 실계정 차이 '+bad.length+'</span>':'<span class="pill win">실계정 동기화 OK</span>';
+ var posH=(ra.positions||[]).filter(function(p){return (Number(p.quantity)||0)>0}).map(function(p){var base=String(p.symbol).toUpperCase();var unit=ccy==='KRW'?'주':'개';
+   var pnl=(Number(p.pnl)||0)!==0?(' · 미실현 '+plspan(p.pnl,ccy)):(' <span class="hint">(현물=시세로 평가)</span>');
+   return '<div class="prow"><div class="row"><div><b>'+esc(coin(base))+'</b> <span class="qty">'+fmt(p.quantity,4)+unit+'</span></div></div><div class="pmeta">'+(p.avgPrice>0?'평단 '+money(p.avgPrice,ccy)+' · 현재 '+money(p.currentPrice,ccy):'거래소 실보유')+pnl+'</div></div>';}).join('');
+ var protH=(ra.protective||[]).filter(function(x){return x.active}).map(function(x){
+   return '<div class="prow"><div class="row"><div><b>'+esc(coin(x.symbol))+'</b> <span class="st run">상주 OCO</span></div><span class="ib" onclick="cancelAcctProtect(&quot;'+esc(bk)+'&quot;,&quot;'+esc(x.symbol)+'&quot;,&quot;'+esc(x.orderListId||'')+'&quot;)">취소</span></div><div class="pmeta">익절 '+money(x.tpPrice||0,ccy)+' · 손절 '+money(x.slPrice||0,ccy)+' · 보유 '+fmt(x.held||0,4)+'</div></div>';}).join('');
+ return '<div class="row"><div class="k">🔑 거래소 실계정 <span class="envb '+(ra.env==='live'?'live':'safe')+'">'+esc(String(ra.env||'').toUpperCase())+'</span></div>'+driftBadge+'</div>'+
+   '<div class="sect-m" style="text-align:left;margin-top:6px">'+balLine+'</div>'+
+   (posH?'<div class="plist">'+posH+'</div>':'<div class="hint" style="margin-top:6px">거래소 실보유 없음</div>')+
+   (protH?'<div class="plist">'+protH+'</div>':'');
+}
+// OCO 취소 — 기존 안전경로(/api/protect/cancel → cancelProtective)만 경유. 신규 쓰기로직 없음.
+function cancelAcctProtect(bk,sym,olid){if(!olid){alert('orderListId 없음');return;}
+ fetch('/api/protect/cancel?token='+TOKEN,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({broker:bk,symbol:sym,orderListId:olid})}).then(function(r){return r.json()}).then(function(){loadRealAccounts();}).catch(function(){});}
 function loadPrices(){fetch('/api/prices?token='+TOKEN).then(function(r){return r.json()}).then(function(d){if(d&&d.prices){for(const k in d.prices)prices.set(k,d.prices[k]);render();}}).catch(function(){});} // KR 현재가 폴링(~45s) → 카드 평가손익 실값
 const es=new EventSource('/events?token='+TOKEN);
 es.onmessage=e=>{const s=JSON.parse(e.data);bots=s.bots;document.getElementById('upd').textContent=new Date(s.updatedAt).toLocaleTimeString();subscribe();render()};
 render();loadBalances();setTimeout(loadPrices,2500);setInterval(loadBalances,60000);setInterval(loadPrices,45000);
+setTimeout(loadRealAccounts,1500);setInterval(loadRealAccounts,60000); // 거래소 실계정 패널 폴링
 </script></div></body></html>`;
 }
