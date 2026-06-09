@@ -8,6 +8,9 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { randomBytes } from "node:crypto";
 import * as store from "../store/db.js";
 import { BROKER_FIELDS, upsertCredentials, credentialStatus, credentialsPath, enableLive, disableLive, liveSettingsStatus, type BrokerKey } from "../setup/credentials.js";
+import { fetchKlines } from "../data/binance-public.js";
+import { getAdapter } from "../brokers/index.js";
+import { sma, ema, rsi, macd, bollingerBands, stochastic, adx } from "../core/strategy/indicators.js";
 
 /** POST 본문을 안전하게 읽어 JSON 파싱(상한 64KB, 자격증명 폼은 작음). */
 function readJsonBody(req: IncomingMessage): Promise<Record<string, unknown>> {
@@ -154,6 +157,203 @@ function plainStrategy(node: unknown, depth = 0): string {
   return "전략 운용";
 }
 
+// ── 상세 부연설명: 트리에서 사용 지표 수집 + 한글 라벨 + 운용/리스크 요약 ──
+const IND_KO: Record<string, string> = {
+  rsi: "RSI", sma: "이동평균(SMA)", ema: "지수이동평균(EMA)", macd: "MACD",
+  bollinger: "볼린저밴드", bollinger_bands: "볼린저밴드", stochastic: "스토캐스틱",
+  stochastic_rsi: "스토캐스틱 RSI", mfi: "MFI", williams_r: "윌리엄스 %R", cci: "CCI",
+  atr: "ATR", adx: "ADX", supertrend: "슈퍼트렌드", ichimoku: "일목균형표",
+  volume: "거래량", obv: "OBV", vwap: "VWAP", roc: "ROC", momentum: "모멘텀",
+};
+function indLabel(ind: string, period?: number, tf?: string): string {
+  return `${tf ? tf + " " : ""}${IND_KO[ind.toLowerCase()] ?? ind.toUpperCase()}${period ? `(${period})` : ""}`;
+}
+/** 전략 트리 순회 → 사용 지표 라벨 수집(중복 제거). condition.indicator + leaf rules 모두. */
+function collectIndicators(node: unknown, acc: string[] = []): string[] {
+  const n = node as Record<string, unknown>;
+  if (!n || typeof n !== "object") return acc;
+  const c = n.condition as { type?: string; indicator?: string; params?: { period?: number }; timeframe?: string } | undefined;
+  if (c?.type === "indicator" && c.indicator) {
+    const l = indLabel(c.indicator, c.params?.period, c.timeframe);
+    if (!acc.includes(l)) acc.push(l);
+  }
+  const s = (n.strategy ?? (n.type === "leaf" ? n : null)) as { rules?: { conditions?: { indicator?: string; params?: { period?: number }; timeframe?: string }[] }[] } | null;
+  for (const r of s?.rules ?? []) for (const cond of r.conditions ?? []) {
+    if (cond.indicator) { const l = indLabel(cond.indicator, cond.params?.period, cond.timeframe); if (!acc.includes(l)) acc.push(l); }
+  }
+  for (const k of ["thenNode", "elseNode", "then", "else"]) if (n[k]) collectIndicators(n[k], acc);
+  for (const ch of (Array.isArray(n.children) ? n.children : [])) collectIndicators(ch, acc);
+  return acc;
+}
+const intervalKo = (sec?: number): string =>
+  !sec ? "—" : sec >= 86400 ? `${Math.round(sec / 86400)}일봉` : sec >= 3600 ? `${Math.round(sec / 3600)}시간봉` : sec >= 60 ? `${Math.round(sec / 60)}분봉` : `${sec}초`;
+const BROKER_DATA: Record<string, string> = {
+  binance: "Binance 실시간 시세(WS)", kiwoom: "키움증권 일봉(ka10081) · 시세 지연 가능", kis: "한국투자증권 시세",
+};
+/** composite + bot → 상세 부연설명 객체(클라이언트가 패널에 렌더). */
+function buildDetail(
+  comp: { market?: string; leverage?: number; stop_loss_percent?: number | null; take_profit_percent?: number | null; trailing_stop_percent?: number | null; tp_ladder?: unknown; scale_in?: unknown; pyramid?: unknown; root_node?: unknown } | null | undefined,
+  b: { interval_seconds?: number; capital?: number; broker?: string },
+) {
+  const risk: string[] = [];
+  if (comp?.stop_loss_percent) risk.push(`손절 −${comp.stop_loss_percent}%`);
+  if (comp?.take_profit_percent) risk.push(`익절 +${comp.take_profit_percent}%`);
+  if (comp?.trailing_stop_percent) risk.push(`트레일링 스탑 ${comp.trailing_stop_percent}%`);
+  if (comp?.tp_ladder) risk.push("분할익절(라더)");
+  if (comp?.scale_in) risk.push("물타기(스케일인)");
+  if (comp?.pyramid) risk.push("불타기(피라미딩)");
+  return {
+    indicators: collectIndicators(comp?.root_node ?? {}),
+    market: comp?.market === "futures" ? `선물 ${comp?.leverage ?? 1}배 (하락에도 베팅=숏)` : "현물 (상승 베팅=롱)",
+    risk: risk.length ? risk.join(" · ") : "별도 손절/익절 없음 — 전략 반대신호로만 청산",
+    interval: intervalKo(b.interval_seconds),
+    capital: b.capital ?? 0,
+    data: BROKER_DATA[b.broker ?? ""] ?? b.broker ?? "—",
+  };
+}
+
+type ChartPt = { time: number; value: number };
+/** 전략 트리 → 사용 지표 {ind,period} 수집(중복 제거). 차트 오버레이 계산용. */
+function collectIndicatorSpecs(node: unknown, acc: { ind: string; period: number }[] = []): { ind: string; period: number }[] {
+  const n = node as Record<string, unknown>;
+  if (!n || typeof n !== "object") return acc;
+  const push = (ind?: string, period?: number) => {
+    if (!ind) return; const k = ind.toLowerCase(); const p = period ?? 14;
+    if (!acc.some((s) => s.ind === k && s.period === p)) acc.push({ ind: k, period: p });
+  };
+  const c = n.condition as { type?: string; indicator?: string; params?: { period?: number } } | undefined;
+  if (c?.type === "indicator") push(c.indicator, c.params?.period);
+  const s = (n.strategy ?? (n.type === "leaf" ? n : null)) as { rules?: { conditions?: { indicator?: string; params?: { period?: number } }[] }[] } | null;
+  for (const r of s?.rules ?? []) for (const cond of r.conditions ?? []) push(cond.indicator, cond.params?.period);
+  for (const k of ["thenNode", "elseNode", "then", "else"]) if (n[k]) collectIndicatorSpecs(n[k], acc);
+  for (const ch of (Array.isArray(n.children) ? n.children : [])) collectIndicatorSpecs(ch, acc);
+  return acc;
+}
+const seriesAt = (bars: { time: number }[], vals: number[]): ChartPt[] =>
+  vals.map((v, i) => ({ time: bars[i].time, value: v })).filter((p) => Number.isFinite(p.value));
+/** 봉 + 지표 specs → 가격패널 오버레이(SMA/EMA/BB) + 보조지표(RSI/MACD/Stoch/ADX). 전략과 동일 함수로 계산. */
+function buildIndicators(bars: { time: number; open: number; high: number; low: number; close: number }[], specs: { ind: string; period: number }[]) {
+  const closes = bars.map((b) => b.close), highs = bars.map((b) => b.high), lows = bars.map((b) => b.low);
+  const overlays: { label: string; color: string; data: ChartPt[] }[] = [];
+  const oscillators: { label: string; color: string; data: ChartPt[]; guides?: number[] }[] = [];
+  const C = ["#eab308", "#38bdf8", "#a855f7", "#f97316", "#22d3ee"]; let ci = 0;
+  for (const sp of specs) {
+    const color = C[ci++ % C.length], p = sp.period;
+    if (sp.ind === "sma") overlays.push({ label: `SMA(${p})`, color, data: seriesAt(bars, sma(closes, p)) });
+    else if (sp.ind === "ema") overlays.push({ label: `EMA(${p})`, color, data: seriesAt(bars, ema(closes, p)) });
+    else if (sp.ind === "bollinger" || sp.ind === "bollinger_bands") { const bb = bollingerBands(closes, p || 20); overlays.push({ label: `BB(${p || 20})상`, color: "#64748b", data: seriesAt(bars, bb.upper) }, { label: "BB중", color, data: seriesAt(bars, bb.middle) }, { label: "BB하", color: "#64748b", data: seriesAt(bars, bb.lower) }); }
+    else if (sp.ind === "rsi") oscillators.push({ label: `RSI(${p})`, color, data: seriesAt(bars, rsi(closes, p)), guides: [30, 70] });
+    else if (sp.ind === "macd") { const m = macd(closes); oscillators.push({ label: "MACD", color, data: seriesAt(bars, m.macd) }, { label: "Signal", color: "#f97316", data: seriesAt(bars, m.signal) }); }
+    else if (sp.ind === "stochastic") { const st = stochastic(closes, highs, lows, p || 14); oscillators.push({ label: "Stoch %K", color, data: seriesAt(bars, st.k), guides: [20, 80] }); }
+    else if (sp.ind === "adx") oscillators.push({ label: `ADX(${p})`, color, data: seriesAt(bars, adx(closes, highs, lows, p || 14)), guides: [25] });
+    // vwap/supertrend/ichimoku/cci/mfi/williams_r 등은 차트 미지원 → 스킵(설명 패널엔 표기됨)
+  }
+  return { overlays, oscillators };
+}
+/** 봇 포지션 + composite 리스크 → 차트 수평선(진입가/손절/익절). */
+function buildPriceLines(bot: { symbol: string; position_state?: unknown }, comp: { market?: string; stop_loss_percent?: number | null; take_profit_percent?: number | null } | null | undefined, ccy: string) {
+  const lines: { price: number; title: string; color: string }[] = [];
+  const ps = bot.position_state as Record<string, unknown> | null;
+  let entry = 0;
+  if (ps && typeof ps === "object") {
+    if ((ps as { status?: string }).status === "open") entry = Number((ps as { entryAvg?: number }).entryAvg) || 0;
+    else { const sub = (ps as Record<string, { status?: string; entryAvg?: number }>)[bot.symbol]; if (sub?.status === "open") entry = Number(sub.entryAvg) || 0; }
+  }
+  if (entry > 0) {
+    const f = (x: number) => (ccy === "KRW" ? "₩" : "$") + Math.round(x).toLocaleString();
+    const short = comp?.market === "futures";
+    lines.push({ price: entry, title: `진입 ${f(entry)}`, color: "#eab308" });
+    if (comp?.stop_loss_percent) { const sl = entry * (1 + (short ? 1 : -1) * comp.stop_loss_percent / 100); lines.push({ price: sl, title: `손절 ${f(sl)}`, color: "#f43f5e" }); }
+    if (comp?.take_profit_percent) { const tp = entry * (1 + (short ? -1 : 1) * comp.take_profit_percent / 100); lines.push({ price: tp, title: `익절 ${f(tp)}`, color: "#10b981" }); }
+  }
+  return lines;
+}
+const secToInterval = (s?: number): string =>
+  !s ? "1d" : s >= 86400 ? "1d" : s >= 14400 ? "4h" : s >= 3600 ? "1h" : s >= 900 ? "15m" : s >= 300 ? "5m" : "1m";
+/** 차트용 캔들 — 주식=실제 키움 getCandles(일봉 ka10081), crypto=Binance 공개 klines. lightweight-charts {time(unix s),ohlc}. 읽기전용. */
+const TF_BINANCE: Record<string, string> = { "1m": "1m", "5m": "5m", "15m": "15m", "30m": "30m", "1h": "1h", "4h": "4h", "1d": "1d", "1w": "1w", "1mo": "1M" };
+const secToTfToken = (s?: number): string => !s ? "1d" : s >= 2592000 ? "1mo" : s >= 604800 ? "1w" : s >= 86400 ? "1d" : s >= 3600 ? "1h" : s >= 1800 ? "30m" : s >= 300 ? "5m" : "1m";
+const snapTime = (bars: { time: number }[], t: number): number => { if (!bars.length) return t; let best = bars[0].time, bd = Math.abs(bars[0].time - t); for (const b of bars) { const d = Math.abs(b.time - t); if (d < bd) { bd = d; best = b.time; } } return best; };
+/** 진입(position_state.openedAt) + 거래(recentTrades) → 차트 시점 마커. 시각은 가장 가까운 봉에 스냅. */
+function buildMarkers(bot: { id: string; position_state?: unknown }, bars: { time: number }[], ccy: string) {
+  const f = (x: number) => (ccy === "KRW" ? "₩" : "$") + Math.round(x).toLocaleString();
+  const toUnix = (s: unknown) => Math.floor(Date.parse(String(s).length === 10 ? String(s) + "T00:00:00Z" : String(s)) / 1000);
+  const markers: { time: number; position: string; color: string; shape: string; text: string }[] = [];
+  const addEntry = (entryAvg: number, openedAt: unknown) => { const u = toUnix(openedAt); if (entryAvg > 0 && Number.isFinite(u)) markers.push({ time: snapTime(bars, u), position: "belowBar", color: "#eab308", shape: "arrowUp", text: "진입 " + f(entryAvg) }); };
+  const ps = bot.position_state as Record<string, unknown> | null;
+  if (ps && typeof ps === "object") {
+    if ((ps as { status?: string }).status === "open") addEntry(Number((ps as { entryAvg?: number }).entryAvg) || 0, (ps as { openedAt?: unknown }).openedAt);
+    else for (const k of Object.keys(ps)) { const sub = ps[k] as { status?: string; entryAvg?: number; openedAt?: unknown } | undefined; if (sub?.status === "open") addEntry(Number(sub.entryAvg) || 0, sub.openedAt); }
+  }
+  for (const t of store.recentTrades(bot.id, 12)) {
+    const u = toUnix(t.ts); if (!Number.isFinite(u)) continue;
+    const sell = t.side === "sell";
+    markers.push({ time: snapTime(bars, u), position: sell ? "aboveBar" : "belowBar", color: sell ? "#f43f5e" : "#10b981", shape: sell ? "arrowDown" : "arrowUp", text: (sell ? "매도" : "매수") + " " + f(t.price) });
+  }
+  markers.sort((a, b) => a.time - b.time);
+  return markers;
+}
+/** 봇 보유 브로커별 실계좌 잔고(getBalance). 키 없으면 ok:false(페이퍼/미연동). */
+async function accountBalances() {
+  const brokers = [...new Set(store.listBots().map((b) => b.broker))];
+  const out: { broker: string; ok: boolean; ccy?: string; totalAsset?: number; cashBalance?: number; error?: string }[] = [];
+  for (const bk of brokers) {
+    try {
+      const ad = getAdapter(bk as Parameters<typeof getAdapter>[0], "spot")?.adapter;
+      if (!ad) { out.push({ broker: bk, ok: false, error: "키 없음" }); continue; }
+      const bal = await ad.getBalance();
+      out.push({ broker: bk, ok: true, ccy: bal.currency, totalAsset: bal.totalAsset, cashBalance: bal.cashBalance });
+    } catch (e) { out.push({ broker: bk, ok: false, error: e instanceof Error ? e.message : "잔고 조회 실패" }); }
+  }
+  return out;
+}
+/** 보유 KR 종목 현재가(차트와 동일 소스=getCandles 마지막 종가)로 카드 평가손익 갱신. crypto는 WS가 담당. */
+async function livePrices() {
+  const bots = store.listBots().filter((b) => b.broker !== "binance");
+  const out: Record<string, number> = {};
+  let first = true;
+  for (const b of bots) {
+    if (out[b.symbol] !== undefined) continue;
+    if (!first) await new Promise((r) => setTimeout(r, 500)); // 키움 레이트리밋(429) 회피 — 종목 간 간격
+    first = false;
+    try {
+      const ad = getAdapter(b.broker as Parameters<typeof getAdapter>[0], "spot")?.adapter as { getCandles?: (s: string, i: string, n: number) => Promise<{ close: number }[]> } | undefined;
+      if (ad?.getCandles) { const bars = await ad.getCandles(b.symbol, "1d", 2); const last = bars[bars.length - 1]; if (last?.close) out[b.symbol] = last.close; }
+    } catch { /* 키 없음/레이트리밋 → 스킵(카드는 진입가 유지) */ }
+  }
+  return out;
+}
+async function candlesFor(botId: string, tf?: string): Promise<{ ok: boolean; symbol?: string; broker?: string; ccy?: string; interval?: string; intraday?: boolean; bars?: { time: number; open: number; high: number; low: number; close: number }[]; overlays?: unknown[]; oscillators?: unknown[]; priceLines?: unknown[]; markers?: unknown[]; error?: string }> {
+  const bot = store.getBot(botId);
+  if (!bot) return { ok: false, error: "봇 없음" };
+  const toUnix = (s: string) => Math.floor(Date.parse(s.length === 10 ? s + "T00:00:00Z" : s) / 1000);
+  try {
+    const iv = (tf && /^(1m|5m|15m|30m|1h|4h|1d|1w|1mo)$/.test(tf)) ? tf : secToTfToken(bot.interval_seconds);
+    const intraday = /m$/.test(iv) || /h$/.test(iv); // 분/시간봉이면 시각 표시
+    let raw: { date: string; datetime?: string; open: number; high: number; low: number; close: number }[] = [];
+    if (bot.broker === "binance") {
+      raw = await fetchKlines(bot.symbol, TF_BINANCE[iv] ?? "1d", iv === "1mo" ? 120 : 200);
+    } else {
+      const ad = getAdapter(bot.broker as Parameters<typeof getAdapter>[0], "spot")?.adapter as { getCandles?: (s: string, i: string, n: number) => Promise<{ date: string; datetime?: string; open: number; high: number; low: number; close: number }[]> } | undefined;
+      if (!ad?.getCandles) return { ok: false, error: `${bot.broker} 차트 데이터 미지원(키 필요할 수 있음)` };
+      raw = await ad.getCandles(bot.symbol, iv, 200);
+    }
+    const bars = raw
+      .map((b) => ({ time: toUnix(b.datetime ?? b.date), open: b.open, high: b.high, low: b.low, close: b.close }))
+      .filter((b) => Number.isFinite(b.time) && b.close > 0)
+      .sort((a, b) => a.time - b.time)
+      .filter((b, i, arr) => i === 0 || b.time !== arr[i - 1].time);
+    const ccy = bot.broker === "binance" ? "USD" : "KRW";
+    const comp = store.getComposite(bot.composite_strategy_id);
+    const ind = buildIndicators(bars, collectIndicatorSpecs(comp?.root_node ?? {}));
+    const priceLines = buildPriceLines(bot, comp, ccy);
+    const markers = buildMarkers(bot, bars, ccy);
+    return { ok: true, symbol: bot.symbol, broker: bot.broker, ccy, interval: iv, intraday, bars, overlays: ind.overlays, oscillators: ind.oscillators, priceLines, markers };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : "candles 실패" };
+  }
+}
+
 function snapshot() {
   const bots = store.listBots().map((b) => {
     const comp = store.getComposite(b.composite_strategy_id);
@@ -164,7 +364,7 @@ function snapshot() {
       id: b.id, name: b.name, symbol: b.symbol.toUpperCase(), mode: b.mode, status: b.status,
       strategy: comp ? summarizeStrategy(comp.root_node) : "(전략 없음)",
       plain: comp ? plainStrategy(comp.root_node) : "전략 없음",
-      market, isScanner,
+      market, isScanner, broker: b.broker, detail: buildDetail(comp, b),
       positions: extractPositions(b.position_state, b.symbol, market, isScanner),
       realizedPnl: +st.realizedPnl.toFixed(2), closes: st.closes, winRate: st.closes > 0 ? +(st.wins / st.closes * 100).toFixed(0) : null,
       lastEvaluatedAt: b.last_evaluated_at, lastExecutedAt: b.last_executed_at,
@@ -194,6 +394,22 @@ export function startDashboard(port = 7788): Promise<{ url: string; port: number
 
     if (u.pathname === "/api/state") {
       res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify(snapshot())); return;
+    }
+    if (u.pathname === "/api/candles") {
+      candlesFor(u.searchParams.get("bot") || "", u.searchParams.get("tf") || undefined).then((r) => {
+        res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify(r));
+      }).catch((e) => { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify({ ok: false, error: e instanceof Error ? e.message : "err" })); });
+      return;
+    }
+    if (u.pathname === "/api/balances") {
+      accountBalances().then((r) => { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify({ accounts: r })); })
+        .catch((e) => { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify({ accounts: [], error: e instanceof Error ? e.message : "err" })); });
+      return;
+    }
+    if (u.pathname === "/api/prices") {
+      livePrices().then((p) => { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify({ prices: p })); })
+        .catch((e) => { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify({ prices: {}, error: e instanceof Error ? e.message : "err" })); });
+      return;
     }
     if (u.pathname === "/events") {
       res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
@@ -261,8 +477,11 @@ h1{font-size:18px;margin:0 0 2px}.sub{color:#8a94a6;font-size:12px;margin-bottom
 .g3{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:8px;font-size:12px}
 .g3 .k{font-size:11px}.dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:#10b981;animation:p 1.2s infinite}
 @keyframes p{50%{opacity:.3}}.empty{color:#8a94a6;text-align:center;padding:32px}.mode{font-size:10px;color:#8a94a6}
-.strat{font-size:12px;color:#c9d2e3;background:#0e1320;border:1px solid #222838;border-radius:6px;padding:6px 8px;margin-top:8px;font-family:ui-monospace,monospace;word-break:break-all}
-.strat b{color:#8a94a6;font-weight:600}
+.strat{font-size:12px;color:#c9d2e3;background:#0e1320;border:1px solid #222838;border-radius:6px;padding:8px 10px;margin-top:8px;line-height:1.55}
+.strat .drow{padding:4px 0;border-top:1px solid #1a2030}.strat .drow:first-child{border-top:0;padding-top:0}
+.strat b{color:#8a94a6;font-weight:600;display:inline-block;min-width:62px;margin-right:6px;vertical-align:top}
+.strat code{font-family:ui-monospace,monospace;font-size:11px;color:#9fb2d4;word-break:break-all}
+.strat .tag{display:inline-block;background:#1a2030;color:#c9d2e3;border-radius:4px;padding:1px 6px;margin:0 4px 4px 0;font-size:11px}
 .act{margin-top:8px;font-size:11px;color:#8a94a6;max-height:96px;overflow:auto}
 .act div{display:flex;gap:6px;padding:1px 0}.act .a{color:#7aa2f7;min-width:42px}
 .st{font-size:10px;padding:1px 5px;border-radius:4px;margin-left:6px}.run{background:rgba(122,162,247,.15);color:#7aa2f7}.stop{background:#222838;color:#8a94a6}
@@ -278,6 +497,19 @@ h1{font-size:18px;margin:0 0 2px}.sub{color:#8a94a6;font-size:12px;margin-bottom
 .plain{margin-top:10px;font-size:14px;line-height:1.55;color:#dfe6f1}
 .earn{margin-top:9px;font-size:13px;font-weight:600}
 .more{margin-top:10px;font-size:11px;color:#6b7588;cursor:pointer;user-select:none}.more:hover{color:#8a94a6}
+.cbtn{margin-top:8px;font-size:11px;color:#7aa2f7;cursor:pointer;user-select:none;display:inline-block}.cbtn:hover{color:#a8c0ff}
+.cmodal{display:none;position:fixed;inset:0;background:rgba(0,0,0,.66);z-index:50;align-items:center;justify-content:center;padding:16px}
+.cmbox{background:#121622;border:1px solid #222838;border-radius:14px;padding:14px;width:min(900px,94vw)}
+.cmhead{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}
+.cmhead b{font-size:14px}.cmx{cursor:pointer;color:#8a94a6;font-size:13px;user-select:none}.cmx:hover{color:#e6e6e6}
+.cmnote{font-size:11px;color:#6b7588;margin-top:8px}#chartBody{width:100%;height:380px}
+.sect{grid-column:1/-1;display:flex;justify-content:space-between;align-items:baseline;gap:8px;margin:8px 2px 0;padding-bottom:6px;border-bottom:1px solid #222838}
+.sect-t{font-size:14px;font-weight:700}.sect-s{font-size:11px;color:#8a94a6;font-weight:400;margin-left:3px}
+.sect-m{font-size:12px;color:#c9d2e3;text-align:right}
+@media(max-width:560px){.sect{flex-direction:column;gap:2px;align-items:flex-start}.sect-m{text-align:left}}
+.tfbar{display:flex;gap:6px;margin:2px 0 10px;flex-wrap:wrap}
+.tfb{font-size:12px;color:#8a94a6;background:#0e1320;border:1px solid #222838;border-radius:6px;padding:4px 10px;cursor:pointer;user-select:none}
+.tfb:hover{color:#e6e6e6}.tfb.on{background:#7aa2f7;color:#0b0e14;border-color:#7aa2f7;font-weight:700}
 .gear{cursor:pointer;color:#7aa2f7;font-size:12px;margin-left:8px;user-select:none}.gear:hover{color:#a8c0ff}
 .setpanel{margin-bottom:16px}
 .setnote{font-size:12px;color:#8a94a6;margin:8px 0 12px;line-height:1.5}.setnote code{background:#0e1320;padding:1px 5px;border-radius:4px;color:#c9d2e3}
@@ -300,7 +532,7 @@ h1{font-size:18px;margin:0 0 2px}.sub{color:#8a94a6;font-size:12px;margin-bottom
 .lstat{font-size:12px;color:#c9d2e3;margin-top:8px;line-height:1.6}.lstat b{color:#e6e6e6}
 @media(max-width:560px){.fld{grid-template-columns:1fr}}
 @media(max-width:560px){.wrap{padding:14px}.hdr{grid-template-columns:1fr 1fr}.pos{grid-template-columns:1fr}.v{font-size:20px}.sym{font-size:14px}}
-</style></head><body><div class="wrap">
+</style><script src="https://unpkg.com/lightweight-charts@4.2.3/dist/lightweight-charts.standalone.production.js"></script></head><body><div class="wrap">
 <h1>내 자동매매 현황 <span class="dot"></span></h1>
 <div class="sub">봇이 알아서 사고팔아요 · 실시간 시세 반영 <span id="upd" style="color:#8a94a6">—</span>
   <span class="gear" onclick="toggleSettings()">⚙️ API 키 설정</span></div>
@@ -319,55 +551,126 @@ h1{font-size:18px;margin:0 0 2px}.sub{color:#8a94a6;font-size:12px;margin-bottom
 </div>
 <div class="pos" id="pos"></div>
 <div class="empty" id="empty">아직 봇이 없어요. 자비스에게 "전략 만들어서 봇 돌려줘"라고 말해보세요.</div>
+<div class="cmodal" id="chartModal"><div class="cmbox">
+  <div class="cmhead"><b id="chartTitle">차트</b><span class="cmx" onclick="closeChart()">닫기 ✕</span></div>
+  <div class="tfbar" id="chartTf"></div>
+  <div id="chartBody"></div>
+  <div class="cmnote" id="chartNote"></div>
+</div></div>
 <script>
 const TOKEN=${JSON.stringify(token)};
-let bots=[];const prices=new Map();let ws=null;
+let bots=[];const prices=new Map();let ws=null;var accounts={};
 function fmt(n,d=2){return Number(n).toLocaleString(undefined,{minimumFractionDigits:d,maximumFractionDigits:d})}
+function ccyOf(broker){return broker==='binance'?'USD':'KRW'}
+function csym(c){return c==='KRW'?'₩':'$'}
+function money(n,c){return csym(c)+Math.round(Math.abs(Number(n)||0)).toLocaleString()}
+function signed(n,c){var v=Math.round(Number(n)||0);return (v>=0?'+':'-')+csym(c)+Math.abs(v).toLocaleString()}
+function plspan(n,c){var v=Math.round(Number(n)||0);return '<span class="'+(v>=0?'up':'dn')+'">'+signed(v,c)+'</span>'}
 function esc(s){return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))}
 function allSyms(){return [...new Set(bots.flatMap(b=>(b.positions||[]).map(p=>p.symbol)))]}
 let subSig='';
-function subscribe(){const syms=allSyms().sort();const sig=syms.join(',');
+function subscribe(){const syms=allSyms().filter(function(s){return /[a-z]/i.test(s)}).sort();const sig=syms.join(','); // crypto만 Binance WS(KR 종목코드=숫자 제외)
  if(sig===subSig&&ws&&ws.readyState<=1)return; // 심볼 동일 + 연결 살아있으면 재구독 안 함(churn 방지)
  subSig=sig;if(ws){try{ws.close()}catch(e){}}
  if(!syms.length){ws=null;return;}const streams=syms.map(s=>s.toLowerCase()+'@ticker').join('/');
  ws=new WebSocket('wss://stream.binance.com:9443/ws/'+streams);
  ws.onmessage=e=>{const d=JSON.parse(e.data);if(d.e==='24hrTicker'){prices.set(d.s,parseFloat(d.c));render()}}}
-function tgl(el){const s=el.nextElementSibling;s.style.display=s.style.display==='block'?'none':'block';}
+const expanded=new Set(); // 펼친 봇 id 보존 — WS 가격 틱마다 render()가 통째 재생성해도 안 닫히게(나오자마자 사라지던 버그 수정)
+function tgl(el){const id=el.dataset.id;const open=!expanded.has(id);if(open)expanded.add(id);else expanded.delete(id);
+ const s=el.nextElementSibling;s.style.display=open?'block':'none';el.textContent=open?'간단히 ▴':'전략 자세히 ▾';}
+function detailHtml(b){const d=b.detail||{};
+ const inds=(d.indicators&&d.indicators.length)?d.indicators.map(function(x){return '<span class="tag">'+esc(x)+'</span>'}).join(''):'<span class="hint">가격·조건 기반(별도 지표 없음)</span>';
+ return '<div class="drow"><b>한 줄 요약</b>'+esc(b.plain)+'</div>'+
+  '<div class="drow"><b>보는 지표</b>'+inds+'</div>'+
+  '<div class="drow"><b>시장</b>'+esc(d.market||'—')+'</div>'+
+  '<div class="drow"><b>리스크</b>'+esc(d.risk||'—')+'</div>'+
+  '<div class="drow"><b>운용</b>'+esc(brokerLabel(b.broker))+' · '+esc(d.interval||'—')+'마다 평가 · 자본 '+fmt(d.capital||0,0)+' · '+(b.mode==='live'?'실거래/모의주문':'페이퍼(모의)')+'</div>'+
+  '<div class="drow"><b>데이터</b>'+esc(d.data||'—')+'</div>'+
+  '<div class="drow"><b>전문 표기</b><code>'+esc(b.strategy)+'</code></div>';}
 const ACT={buy:'🟢 샀어요',sell:'🔴 팔았어요',hold:'유지',create:'봇 생성',start:'시작',stop:'정지',gate:'안내',error:'⚠ 오류'};
 function coin(s){return String(s).replace('USDT','').replace('USDC','')}
-function posRow(p){const cur=prices.get(p.symbol)??p.entryAvg;const sign=p.side==='short'?-1:1;
- const up=sign*(cur-p.entryAvg)/p.entryAvg*100;const abs=sign*(cur-p.entryAvg)*p.qty;
- const dir=p.side==='short'?' <span class="qty">하락베팅</span>':'';
- const html='<div class="prow"><div class="row"><div><b>'+esc(coin(p.symbol))+'</b>'+dir+' <span class="qty">'+p.qty+'개 보유</span></div>'+
-   '<span class="pl '+(up>=0?'up':'dn')+'">'+(up>=0?'+':'')+fmt(up)+'%</span></div>'+
-   '<div class="pmeta">산 가격 '+fmt(p.entryAvg)+' → 지금 '+fmt(cur)+' · 평가 <span class="'+(abs>=0?'up':'dn')+'">'+(abs>=0?'+':'')+fmt(abs)+'</span></div></div>';
+function posRow(p,c){const px=prices.get(p.symbol)??p.entryAvg;const sign=p.side==='short'?-1:1;
+ const up=sign*(px-p.entryAvg)/p.entryAvg*100;const abs=sign*(px-p.entryAvg)*p.qty;
+ const dir=p.side==='short'?' <span class="qty">하락베팅</span>':'';const unit=c==='KRW'?'주':'개';
+ const html='<div class="prow"><div class="row"><div><b>'+esc(coin(p.symbol))+'</b>'+dir+' <span class="qty">'+p.qty+unit+' 보유</span></div>'+
+   '<span class="pl '+(up>=0?'up':'dn')+'">'+(up>=0?'+':'')+fmt(up,1)+'%</span></div>'+
+   '<div class="pmeta">산 가격 '+money(p.entryAvg,c)+' → 지금 '+money(px,c)+' · 평가 '+plspan(abs,c)+'</div></div>';
  return {html,abs};}
 function statusPill(sum,hasPos){if(!hasPos)return '<span class="pill wait">⚪ 대기 중</span>';
  return sum>=0?'<span class="pill win">🟢 수익 중</span>':'<span class="pill lose">🔴 손실 중</span>';}
-function render(){const pos=document.getElementById('pos');let tot=0,n=0,rtot=0;pos.innerHTML='';
- for(const b of bots){const live=b.mode==='live';const ps=b.positions||[];rtot+=b.realizedPnl||0;
-  let body='',bsum=0;
-  if(ps.length){for(const p of ps){const r=posRow(p);tot+=r.abs;bsum+=r.abs;n++;body+=r.html;}}
+let _chart=null,_chartId=null;
+function tfLabel(t){return {'5m':'5분','30m':'30분','1h':'1시간','1d':'일','1w':'주','1mo':'월'}[t]||t;}
+function renderTfButtons(cur){var tfs=['5m','30m','1h','1d','1w','1mo'];
+ document.getElementById('chartTf').innerHTML=tfs.map(function(t){return '<span class="tfb'+(t===cur?' on':'')+'" data-tf="'+t+'" onclick="openChart(_chartId,this.dataset.tf)">'+tfLabel(t)+'</span>';}).join('');}
+function openChart(id,tf){_chartId=id;var modal=document.getElementById('chartModal'),body=document.getElementById('chartBody');
+ document.getElementById('chartTitle').textContent='차트 불러오는 중…';modal.style.display='flex';
+ fetch('/api/candles?token='+TOKEN+'&bot='+encodeURIComponent(id)+(tf?'&tf='+tf:'')).then(function(r){return r.json()}).then(function(d){
+  if(!d.ok){document.getElementById('chartTitle').textContent='차트 오류: '+(d.error||'불러오기 실패');document.getElementById('chartTf').innerHTML='';return;}
+  var isC=d.broker==='binance';
+  renderTfButtons(d.interval);
+  var names=[].concat((d.overlays||[]).map(function(o){return o.label}),(d.oscillators||[]).map(function(o){return o.label}));
+  document.getElementById('chartTitle').textContent=(isC?coin(d.symbol):d.symbol)+' · '+(isC?'Binance':'키움증권')+' '+tfLabel(d.interval)+(names.length?'  ·  '+names.join(' '):'');
+  document.getElementById('chartNote').textContent=(isC?'데이터: Binance 공개 시세':'데이터: 키움증권 실제 차트(모의)')+((d.priceLines||[]).length?'  ·  노랑=진입 빨강=손절 초록=익절':'')+((d.markers||[]).length?'  ·  ▲진입/매수 ▼청산':'');
+  body.innerHTML='';if(_chart){try{_chart.remove()}catch(e){}_chart=null;}
+  if(!window.LightweightCharts){document.getElementById('chartTitle').textContent='차트 라이브러리 로드 실패(오프라인?)';return;}
+  var hasOsc=(d.oscillators||[]).length>0;
+  var chart=LightweightCharts.createChart(body,{width:body.clientWidth,height:380,layout:{background:{color:'#0e1320'},textColor:'#c9d2e3'},grid:{vertLines:{color:'#1a2030'},horzLines:{color:'#1a2030'}},timeScale:{timeVisible:!!d.intraday,borderColor:'#222838'},rightPriceScale:{borderColor:'#222838',scaleMargins:hasOsc?{top:0.05,bottom:0.32}:{top:0.08,bottom:0.08}}});
+  var s=chart.addCandlestickSeries({upColor:'#10b981',downColor:'#f43f5e',borderVisible:false,wickUpColor:'#10b981',wickDownColor:'#f43f5e'});
+  s.setData(d.bars||[]);
+  (d.overlays||[]).forEach(function(o){var ls=chart.addLineSeries({color:o.color,lineWidth:2,priceLineVisible:false,lastValueVisible:false,crosshairMarkerVisible:false});ls.setData(o.data||[]);});
+  if(hasOsc){
+   (d.oscillators||[]).forEach(function(o,i){var ls=chart.addLineSeries({color:o.color,lineWidth:1.5,priceScaleId:'osc',priceLineVisible:false,lastValueVisible:false,crosshairMarkerVisible:false});ls.setData(o.data||[]);
+    if(i===0&&o.guides)o.guides.forEach(function(g){ls.createPriceLine({price:g,color:'#3a4254',lineWidth:1,lineStyle:1,axisLabelVisible:false});});});
+   chart.priceScale('osc').applyOptions({scaleMargins:{top:0.74,bottom:0.02},borderColor:'#222838'});}
+  (d.priceLines||[]).forEach(function(pl){s.createPriceLine({price:pl.price,color:pl.color,lineWidth:1,lineStyle:2,axisLabelVisible:true,title:pl.title});});
+  if(d.markers&&d.markers.length){try{s.setMarkers(d.markers)}catch(e){}}
+  chart.timeScale().fitContent();_chart=chart;
+ }).catch(function(){document.getElementById('chartTitle').textContent='차트 오류(네트워크)';});}
+function closeChart(){document.getElementById('chartModal').style.display='none';if(_chart){try{_chart.remove()}catch(e){}_chart=null;}document.getElementById('chartBody').innerHTML='';}
+function card(r){var b=r.b,live=b.mode==='live',open=expanded.has(b.id),rp=r.rp;
+ var wr=b.winRate!=null?', '+b.closes+'번 중 '+Math.round(b.winRate*b.closes/100)+'번 수익':'';
+ var earn=b.closes>0?'<div class="earn '+(rp>=0?'up':'dn')+'">💰 지금까지 '+signed(rp,r.ccy)+' '+(rp>=0?'벌었어요':'잃었어요')+' <span class="hint">('+b.closes+'번 거래'+wr+')</span></div>':'';
+ var tags=(live?'<span class="st live">실거래</span>':'<span class="st stop">모의</span>')+
+   '<span class="st '+(b.status==='running'?'run':'stop')+'">'+(b.status==='running'?'작동중':'멈춤')+'</span>'+
+   (b.isScanner?'<span class="st sc">자동선별</span>':'');
+ var acts=b.activity.slice(0,2).map(function(a){return '<div><span class="a">'+(ACT[a.action]||esc(a.action))+'</span><span>'+esc((a.detail||'').replace(/\[페이퍼\]|\[실거래\]/g,''))+'</span></div>'}).join('');
+ var el=document.createElement('div');el.className='card';
+ el.innerHTML='<div class="row"><div><span class="sym">'+esc(b.name)+'</span> '+statusPill(r.bsum,r.ps.length)+'</div></div>'+
+  '<div class="tags">'+tags+'</div>'+
+  '<div class="plain">📋 '+esc(b.plain)+'</div>'+
+  '<div class="plist">'+r.body+'</div>'+earn+
+  (acts?'<div class="act">'+acts+'</div>':'')+
+  '<div class="cbtn" data-id="'+esc(b.id)+'" onclick="openChart(this.dataset.id)">📈 차트 보기</div>'+
+  '<div class="more" data-id="'+esc(b.id)+'" onclick="tgl(this)">'+(open?'간단히 ▴':'전략 자세히 ▾')+'</div>'+
+  '<div class="strat" style="display:'+(open?'block':'none')+'">'+detailHtml(b)+'</div>';
+ return el;}
+function render(){var pos=document.getElementById('pos');pos.innerHTML='';
+ var rows=bots.map(function(b){var ccy=ccyOf(b.broker);var ps=b.positions||[];var body='',bsum=0,n=0;
+  if(ps.length){for(const p of ps){var r=posRow(p,ccy);bsum+=r.abs;n++;body+=r.html;}}
   else body='<div class="prow" style="color:#8a94a6">지금은 대기 중이에요 (가진 것 없음)</div>';
-  const rp=b.realizedPnl||0;const wr=b.winRate!=null?', '+b.closes+'번 중 '+Math.round(b.winRate*b.closes/100)+'번 수익':'';
-  const earn=b.closes>0?'<div class="earn '+(rp>=0?'up':'dn')+'">💰 지금까지 '+(rp>=0?'+':'')+fmt(rp)+' '+(rp>=0?'벌었어요':'잃었어요')+' <span class="hint">('+b.closes+'번 거래'+wr+')</span></div>':'';
-  const tags=(live?'<span class="st live">실거래</span>':'<span class="st stop">모의</span>')+
-    '<span class="st '+(b.status==='running'?'run':'stop')+'">'+(b.status==='running'?'작동중':'멈춤')+'</span>'+
-    (b.isScanner?'<span class="st sc">자동선별</span>':'');
-  const acts=b.activity.slice(0,2).map(a=>'<div><span class="a">'+(ACT[a.action]||esc(a.action))+'</span><span>'+esc((a.detail||'').replace(/\[페이퍼\]|\[실거래\]/g,''))+'</span></div>').join('');
-  const el=document.createElement('div');el.className='card';
-  el.innerHTML='<div class="row"><div><span class="sym">'+esc(b.name)+'</span> '+statusPill(bsum,ps.length)+'</div></div>'+
-   '<div class="tags">'+tags+'</div>'+
-   '<div class="plain">📋 '+esc(b.plain)+'</div>'+
-   '<div class="plist">'+body+'</div>'+earn+
-   (acts?'<div class="act">'+acts+'</div>':'')+
-   '<div class="more" onclick="tgl(this)">전략 자세히 ▾</div>'+
-   '<div class="strat" style="display:none"><b>전문 표기</b> '+esc(b.strategy)+'</div>';
-  pos.appendChild(el)}
- document.getElementById('bcnt').textContent=bots.filter(b=>b.status==='running').length;
- document.getElementById('cnt').textContent=n;
- const t=document.getElementById('tot');t.textContent=(tot>=0?'+':'')+fmt(tot);t.className='v '+(tot>=0?'up':'dn');
- const rt=document.getElementById('rtot');rt.textContent=(rtot>=0?'+':'')+fmt(rtot);rt.className='v '+(rtot>=0?'up':'dn');
+  return {b:b,ccy:ccy,ps:ps,body:body,bsum:bsum,n:n,rp:b.realizedPnl||0,cap:(b.detail&&b.detail.capital)||0};});
+ var acc={USD:{cap:0,unr:0,real:0,n:0},KRW:{cap:0,unr:0,real:0,n:0}};
+ rows.forEach(function(r){var a=acc[r.ccy];a.cap+=r.cap;a.unr+=r.bsum;a.real+=r.rp;a.n++;});
+ var BK={binance:{label:'💰 Binance',sub:'암호화폐·USDT'},kiwoom:{label:'🏦 키움증권',sub:'주식·KRW(모의)'},kis:{label:'🏦 한국투자증권',sub:'주식·KRW'}};
+ var brokers=[];rows.forEach(function(r){if(brokers.indexOf(r.b.broker)<0)brokers.push(r.b.broker);});
+ var posCount=0;
+ for(const bk of brokers){var gr=rows.filter(function(r){return r.b.broker===bk});if(!gr.length)continue;
+  var ccy=gr[0].ccy,meta=BK[bk]||{label:bk,sub:''},ac=accounts[bk];
+  var unr=0,real=0,cap=0;gr.forEach(function(r){unr+=r.bsum;real+=r.rp;cap+=r.cap;});
+  var balHtml;
+  if(ac&&ac.ok){balHtml='잔고 <b>'+money(ac.cashBalance||ac.totalAsset,ccy)+'</b> <span class="hint">예수금'+(ac.totalAsset?'+평가 '+money((ac.cashBalance||0)+(ac.totalAsset||0),ccy):'')+'</span>';}
+  else{balHtml='<span class="hint">잔고 미연동('+((ac&&ac.error)||'키 없음')+') · 투입자본 '+money(cap,ccy)+'</span>';}
+  var hd=document.createElement('div');hd.className='sect';
+  hd.innerHTML='<span class="sect-t">'+meta.label+' <span class="sect-s">'+meta.sub+'</span></span>'+
+   '<span class="sect-m">'+balHtml+' · 평가손익 '+plspan(unr,ccy)+' · 확정 '+plspan(real,ccy)+'</span>';
+  pos.appendChild(hd);
+  for(const r of gr){posCount+=r.n;pos.appendChild(card(r));}}
+ var hasU=acc.USD.n>0,hasK=acc.KRW.n>0;
+ var heads=function(u,k){var o=[];if(hasU)o.push(plspan(u,'USD'));if(hasK)o.push(plspan(k,'KRW'));return o.join(' <span class="hint">·</span> ')||'—';};
+ document.getElementById('bcnt').textContent=bots.filter(function(b){return b.status==='running'}).length;
+ document.getElementById('cnt').textContent=posCount;
+ document.getElementById('tot').innerHTML=heads(acc.USD.unr,acc.KRW.unr);
+ document.getElementById('rtot').innerHTML=heads(acc.USD.real,acc.KRW.real);
  document.getElementById('empty').style.display=bots.length?'none':'block'}
 // ── API 키 설정 패널 (시크릿은 type=password·autocomplete=off, 저장 후 마스킹만 표시·재조회 불가) ──
 let setLoaded=false;
@@ -424,8 +727,10 @@ function saveBroker(b,sec){const updates={};sec.querySelectorAll('input[data-key
    sec.querySelectorAll('input[data-key]').forEach(i=>i.value='');setLoaded=false;loadSettings();}
    else{msg.className='setmsg err';msg.textContent='저장 실패: '+(d.error||'알 수 없음');}})
   .catch(e=>{msg.className='setmsg err';msg.textContent='저장 실패: '+e.message;});}
+function loadBalances(){fetch('/api/balances?token='+TOKEN).then(function(r){return r.json()}).then(function(d){if(d&&d.accounts){d.accounts.forEach(function(a){accounts[a.broker]=a});render();}}).catch(function(){});}
+function loadPrices(){fetch('/api/prices?token='+TOKEN).then(function(r){return r.json()}).then(function(d){if(d&&d.prices){for(const k in d.prices)prices.set(k,d.prices[k]);render();}}).catch(function(){});} // KR 현재가 폴링(~45s) → 카드 평가손익 실값
 const es=new EventSource('/events?token='+TOKEN);
 es.onmessage=e=>{const s=JSON.parse(e.data);bots=s.bots;document.getElementById('upd').textContent=new Date(s.updatedAt).toLocaleTimeString();subscribe();render()};
-render();
+render();loadBalances();setTimeout(loadPrices,2500);setInterval(loadBalances,60000);setInterval(loadPrices,45000);
 </script></div></body></html>`;
 }

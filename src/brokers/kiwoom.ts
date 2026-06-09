@@ -368,23 +368,36 @@ export class KiwoomBrokerAdapter extends BaseBrokerAdapter {
     return Math.max(0, Math.floor(quantity));
   }
 
-  async getCandles(symbol: string, _interval = "1d", count = 300): Promise<{ date: string; open: number; high: number; low: number; close: number; volume: number }[]> {
+  async getCandles(symbol: string, interval = "1d", count = 300): Promise<{ date: string; datetime: string; open: number; high: number; low: number; close: number; volume: number }[]> {
     const stk = this.normalizeSymbol(symbol);
     const today = new Date().toISOString().slice(0, 10).replace(/-/g, "");
-    const { data } = await this.post("/api/dostk/chart", "ka10081", { stk_cd: stk, base_dt: today, upd_stkpc_tp: "1" });
+    const iv = String(interval).toLowerCase();
+    // 모의서버 프로브(2026-06)로 응답키 확정: 분 ka10080(cntr_tm·stk_min_pole_chart_qry, tic_scope=분),
+    //   일 ka10081(dt·stk_dt_pole_chart_qry), 주 ka10082(dt·stk_stk_pole_chart_qry), 월 ka10083(dt·stk_mth_pole_chart_qry).
+    const MIN: Record<string, string> = { "1m": "1", "3m": "3", "5m": "5", "10m": "10", "15m": "15", "30m": "30", "45m": "45", "60m": "60", "1h": "60" };
+    let apiId: string, arrKey: string, body: Record<string, unknown>, isMinute = false;
+    if (MIN[iv]) { isMinute = true; apiId = "ka10080"; arrKey = "stk_min_pole_chart_qry"; body = { stk_cd: stk, tic_scope: MIN[iv], upd_stkpc_tp: "1" }; }
+    else if (iv === "1w" || iv === "1week") { apiId = "ka10082"; arrKey = "stk_stk_pole_chart_qry"; body = { stk_cd: stk, base_dt: today, upd_stkpc_tp: "1" }; }
+    else if (iv === "1mo" || iv === "1month" || iv === "1M".toLowerCase()) { apiId = "ka10083"; arrKey = "stk_mth_pole_chart_qry"; body = { stk_cd: stk, base_dt: today, upd_stkpc_tp: "1" }; }
+    else { apiId = "ka10081"; arrKey = "stk_dt_pole_chart_qry"; body = { stk_cd: stk, base_dt: today, upd_stkpc_tp: "1" }; }
+    const { data } = await this.post("/api/dostk/chart", apiId, body);
     this.assertOk(data, "getCandles");
-    const rows = Array.isArray(data.stk_dt_pole_chart_qry) ? (data.stk_dt_pole_chart_qry as Record<string, unknown>[]) : [];
+    const rows = Array.isArray((data as Record<string, unknown>)[arrKey]) ? ((data as Record<string, unknown>)[arrKey] as Record<string, unknown>[]) : [];
     const bars = rows
-      .map((r) => ({
-        date: String(r.dt ?? "").replace(/^(\d{4})(\d{2})(\d{2}).*/, "$1-$2-$3"),
-        open: Math.abs(toNum(r.open_pric)),
-        high: Math.abs(toNum(r.high_pric)),
-        low: Math.abs(toNum(r.low_pric)),
-        close: Math.abs(toNum(r.cur_prc)),
-        volume: toNum(r.trde_qty),
-      }))
+      .map((r) => {
+        let date: string, datetime: string;
+        if (isMinute) {
+          const t = String(r.cntr_tm ?? ""); // YYYYMMDDHHMMSS
+          date = t.replace(/^(\d{4})(\d{2})(\d{2}).*/, "$1-$2-$3");
+          datetime = t.length >= 14 ? `${t.slice(0, 4)}-${t.slice(4, 6)}-${t.slice(6, 8)}T${t.slice(8, 10)}:${t.slice(10, 12)}:${t.slice(12, 14)}Z` : date + "T00:00:00Z";
+        } else {
+          date = String(r.dt ?? "").replace(/^(\d{4})(\d{2})(\d{2}).*/, "$1-$2-$3");
+          datetime = date + "T00:00:00Z";
+        }
+        return { date, datetime, open: Math.abs(toNum(r.open_pric)), high: Math.abs(toNum(r.high_pric)), low: Math.abs(toNum(r.low_pric)), close: Math.abs(toNum(r.cur_prc)), volume: toNum(r.trde_qty) };
+      })
       .filter((b) => b.close > 0 && b.date.length === 10)
-      .sort((a, b) => a.date.localeCompare(b.date)); // 오래된→최신
+      .sort((a, b) => a.datetime.localeCompare(b.datetime)); // 오래된→최신
     return bars.slice(-count);
   }
 
