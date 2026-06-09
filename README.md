@@ -236,7 +236,11 @@ Deploy with `save_strategy({ tree, stopLossPercent: 5, tpLadder: [{pct:5,sellPct
 
 `save_strategy` → `create_bot` → `start_bot` runs a bot that re-evaluates on each closed bar using the **same backtest engine** (so live mirrors backtest, including ladder partial fills). State lives in a local `node:sqlite` store — no account, no cloud.
 
-`open_dashboard` serves a real-time HTML dashboard at `127.0.0.1` (random per-launch token, read-only, Binance public WS for live unrealized PnL). It's built for **non-experts**: plain-language strategy summaries ("only buys in an uptrend when oversold"), 🟢 winning / 🔴 losing / ⚪ idle pills, realized vs unrealized PnL, and multi-symbol scanner positions — with a "details" toggle for the raw strategy DSL.
+`open_dashboard` serves a real-time HTML dashboard at `127.0.0.1` (random per-launch token, Binance public WS for live unrealized PnL). It's built for **non-experts**: plain-language strategy summaries ("only buys in an uptrend when oversold"), 🟢 winning / 🔴 losing / ⚪ idle pills, realized vs unrealized PnL, and multi-symbol scanner positions — with a "details" toggle for the raw strategy DSL.
+
+**Pro charting (TradingView-grade, no paid library):** built on `lightweight-charts` v5 — 1m–1M timeframes, **18 toggleable indicators with editable parameters** (Bollinger σ, Supertrend multiplier, MACD fast/slow/signal, Stochastic K/D, …), **separate oscillator panes**, on-chart **drawing tools** (trend lines / horizontal lines, persisted per bot in `localStorage`), the bot's own strategy indicators + entry/SL/TP markers, **live ticking** (crypto via Binance kline WS, KR stocks via polling), and **KST-unified time axis**.
+
+**Manual trading & protective orders (BYOK, testnet-gated):** place market/limit **buy/sell** straight from a bot card, and set **take-profit / stop-loss by dragging lines on the chart** → a real Binance-spot **OCO** order (one-cancels-the-other: if TP fills, the SL auto-cancels, and vice-versa). Every order goes through the *same* safety pipeline as the bots — `liveGate` (testnet/mock only unless the master switch is on) → held-quantity & direction re-check on the server (client values are never trusted) → notional caps → **two-step confirm token** (preview → confirm, hash-bound, single-use, 5-min TTL) → audit log. The dashboard is the *only* place these run, and they're **off by default** on mainnet.
 
 <div align="center">
   <img src="docs/img/dashboard.png" alt="quant-mcp dashboard" width="80%"/>
@@ -251,6 +255,7 @@ Deploy with `save_strategy({ tree, stopLossPercent: 5, tpLadder: [{pct:5,sellPct
 - **Sizing & portfolio:** `suggest_position_size`, `portfolio_risk`, `allocate_portfolio` — vol-targeting, ATR, Kelly, heat, MDD circuit breakers, correlation adjustment.
 - **False-discovery gates:** walk-forward OOS, PSR/DSR (deflated Sharpe), `strategy_factory`.
 - **Execution core (key-free, tested):** exchange-resting stop / take-profit / trailing planning (`planProtectiveOrders`), position-drift reconciliation vs the exchange, balance-based sizing, and fill-status classification — so a stop is protected even if the bot process is down. (Live wiring is testnet-gated; see `docs/p0-execution-layer.md`.)
+- **Manual protective orders (testnet-verified):** drag TP/SL on the chart → a real Binance-spot **OCO** so the exchange holds your stop *and* target as a linked pair, independent of any bot process. Routed through the same `liveGate` + held-quantity re-check + caps + two-step confirm-token pipeline; mainnet stays off until the master switch.
 
 ---
 
@@ -288,6 +293,8 @@ src/mcp-server/   stdio MCP server + 22 tools
 - ✅ Paper bot runner + real-time dashboard
 - ✅ P0 execution core (resting stops / reconcile / balance sizing) — key-free, tested
 - ✅ Live money-path verified on Binance **testnet** (entry → resting SL/TP → cancel → close)
+- ✅ Pro dashboard: TradingView-grade charts (18 indicators w/ editable params, multi-pane oscillators, drawing tools, live ticking, KST axis)
+- ✅ Manual trading + drag-to-set TP/SL **OCO** protective orders — same two-step-token safety pipeline, testnet-verified
 - ✅ Mainnet pilot prep: GO/NO-GO pre-flight (`verify-mainnet-readiness.ts`) + [runbook](docs/mainnet-pilot-runbook.md) — withdrawal-OFF / IP / hard-limit checks, **zero orders**
 - ⏳ Mainnet pilot (real funds — your decision; small-size, master switch) · limit orders · futures protective stops
 - ⏳ Non-crypto data (equities/FX), order-book/microstructure, options
