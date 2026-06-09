@@ -214,12 +214,13 @@ function buildDetail(
 
 type ChartPt = { time: number; value: number };
 /** 전략 트리 → 사용 지표 {ind,period} 수집(중복 제거). 차트 오버레이 계산용. */
-function collectIndicatorSpecs(node: unknown, acc: { ind: string; period: number }[] = []): { ind: string; period: number }[] {
+type IndSpec = { ind: string; period: number; params: number[] }; // params[0]=period(하위호환), 이후=stddev/mult 등
+function collectIndicatorSpecs(node: unknown, acc: IndSpec[] = []): IndSpec[] {
   const n = node as Record<string, unknown>;
   if (!n || typeof n !== "object") return acc;
   const push = (ind?: string, period?: number) => {
     if (!ind) return; const k = ind.toLowerCase(); const p = period ?? 14;
-    if (!acc.some((s) => s.ind === k && s.period === p)) acc.push({ ind: k, period: p });
+    if (!acc.some((s) => s.ind === k && s.period === p)) acc.push({ ind: k, period: p, params: [p] }); // 전략 트리=단일 period
   };
   const c = n.condition as { type?: string; indicator?: string; params?: { period?: number } } | undefined;
   if (c?.type === "indicator") push(c.indicator, c.params?.period);
@@ -234,13 +235,15 @@ const seriesAt = (bars: { time: number }[], vals: number[]): ChartPt[] =>
 // 차트 토글로 켤 수 있는 지표 화이트리스트(임의 입력 차단). 키는 "ind" 또는 "ind:period".
 const TOGGLE_INDS = new Set(["sma", "ema", "bollinger", "vwap", "supertrend", "parabolic_sar", "donchian", "ichimoku", "rsi", "macd", "stochastic", "stochastic_rsi", "adx", "atr", "cci", "mfi", "williams_r", "obv", "roc"]);
 /** 클라이언트가 보낸 토글 지표 목록(["bollinger","sma:50",...])을 spec으로 파싱. 화이트리스트 외엔 무시. 최대 12개. */
-function parseToggleInds(inds?: string[]): { ind: string; period: number }[] {
+function parseToggleInds(inds?: string[]): IndSpec[] {
   if (!Array.isArray(inds)) return [];
-  const out: { ind: string; period: number }[] = [];
+  const out: IndSpec[] = [];
   for (const raw of inds) {
-    const [name, per] = String(raw).toLowerCase().split(":");
+    const parts = String(raw).toLowerCase().split(":");
+    const name = parts[0];
     if (!TOGGLE_INDS.has(name)) continue; // 화이트리스트(volume 등 클라전용 키 제외)를 먼저 → 슬롯 낭비 방지
-    out.push({ ind: name, period: Number(per) || 0 });
+    const params = parts.slice(1).map((x) => Number(x) || 0); // 'ind:p1:p2' → [p1,p2], 빈/NaN=0(기본값 폴백)
+    out.push({ ind: name, period: params[0] || 0, params });
     if (out.length >= 12) break; // 화이트 통과분 기준 최대 12개
   }
   return out;
@@ -248,10 +251,27 @@ function parseToggleInds(inds?: string[]): { ind: string; period: number }[] {
 // 지표별 기본 기간(buildIndicators의 `p||N` 폴백과 동일). 전략·토글 spec의 '실제 사용 기간' 정규화에 사용.
 const IND_DEFAULT: Record<string, number> = { sma: 14, ema: 14, bollinger: 20, vwap: 20, supertrend: 10, donchian: 20, rsi: 14, stochastic: 14, adx: 14, atr: 14, cci: 20, mfi: 14, williams_r: 14, obv: 20, roc: 12 };
 const normPeriod = (ind: string, p: number) => (p > 0 ? p : (IND_DEFAULT[ind] ?? 14));
+// 멀티파라미터 지표 메타([기본,최소,최대] 배열). [0]=기간 외 추가 파라미터. 클라 IND_PARAM.fields와 값 일치 필수.
+const IND_EXTRA: Record<string, { defaults: number[]; min: number[]; max: number[] }> = {
+  bollinger: { defaults: [20, 2], min: [2, 0.5], max: [200, 5] },       // period, stdDev
+  supertrend: { defaults: [10, 3], min: [2, 0.5], max: [100, 10] },     // period, multiplier
+  macd: { defaults: [12, 26, 9], min: [2, 2, 1], max: [100, 200, 100] },// fast, slow, signal
+  stochastic: { defaults: [14, 3], min: [2, 1], max: [100, 50] },       // kPeriod, dPeriod
+};
+// 클라가 보낸 [p1,p2,...]를 지표별 기본/범위로 정규화. 단일파라미터 지표는 [normPeriod] 1개.
+function normParams(ind: string, params: number[]): number[] {
+  const meta = IND_EXTRA[ind];
+  if (!meta) return [normPeriod(ind, params[0] ?? 0)];
+  return meta.defaults.map((def, i) => {
+    const v = params[i];
+    if (typeof v !== "number" || !(v > 0)) return def;
+    return Math.min(meta.max[i], Math.max(meta.min[i], v));
+  });
+}
 
 /** 봉 + 지표 specs → 가격패널 오버레이 + 보조지표. 전략과 동일 core 함수로 계산(차트≡전략).
  *  거래량 지표(VWAP/MFI/OBV)는 bars.volume 필요. 차트 토글로 켠 지표도 같은 경로로 그림. */
-function buildIndicators(bars: { time: number; open: number; high: number; low: number; close: number; volume?: number }[], specs: { ind: string; period: number }[]) {
+function buildIndicators(bars: { time: number; open: number; high: number; low: number; close: number; volume?: number }[], specs: IndSpec[]) {
   const closes = bars.map((b) => b.close), highs = bars.map((b) => b.high), lows = bars.map((b) => b.low), vols = bars.map((b) => b.volume ?? 0);
   const overlays: { label: string; color: string; data: ChartPt[] }[] = [];
   // 오실레이터는 "그룹"(=지표 하나)당 별도 패널. 같은 그룹의 여러 선(MACD+Signal)은 한 패널에 함께.
@@ -260,22 +280,23 @@ function buildIndicators(bars: { time: number; open: number; high: number; low: 
   const C = ["#eab308", "#38bdf8", "#a855f7", "#f97316", "#22d3ee"]; let ci = 0;
   const seen = new Set<string>();
   for (const sp of specs) {
-    const key = `${sp.ind}:${sp.period}`; if (seen.has(key)) continue; seen.add(key); // 전략+토글 중복 제거
-    const color = C[ci++ % C.length], p = sp.period;
+    const np = normParams(sp.ind, sp.params && sp.params.length ? sp.params : [sp.period]); // 정규화 파라미터(기본/범위 적용)
+    const key = `${sp.ind}:${np.join(":")}`; if (seen.has(key)) continue; seen.add(key); // 파라미터 전체로 dedup(stddev/mult 다르면 별도)
+    const color = C[ci++ % C.length], p = np[0];
     switch (sp.ind) {
       // ── 가격패널 오버레이(pane 0) ──
       case "sma": overlays.push({ label: `SMA(${p})`, color, data: seriesAt(bars, sma(closes, p)) }); break;
       case "ema": overlays.push({ label: `EMA(${p})`, color, data: seriesAt(bars, ema(closes, p)) }); break;
-      case "bollinger": case "bollinger_bands": { const bb = bollingerBands(closes, p || 20); overlays.push({ label: `BB(${p || 20})상`, color: "#64748b", data: seriesAt(bars, bb.upper) }, { label: "BB중", color, data: seriesAt(bars, bb.middle) }, { label: "BB하", color: "#64748b", data: seriesAt(bars, bb.lower) }); break; }
-      case "vwap": overlays.push({ label: `VWAP(${p || 20})`, color: "#f59e0b", data: seriesAt(bars, vwap(closes, highs, lows, vols, p || 20)) }); break;
-      case "supertrend": overlays.push({ label: "슈퍼트렌드", color: "#34d399", data: seriesAt(bars, supertrend(closes, highs, lows, p || 10, 3)) }); break;
+      case "bollinger": case "bollinger_bands": { const sd = np[1]; const bb = bollingerBands(closes, p, sd); overlays.push({ label: `BB(${p},${sd})상`, color: "#64748b", data: seriesAt(bars, bb.upper) }, { label: "BB중", color, data: seriesAt(bars, bb.middle) }, { label: "BB하", color: "#64748b", data: seriesAt(bars, bb.lower) }); break; }
+      case "vwap": overlays.push({ label: `VWAP(${p})`, color: "#f59e0b", data: seriesAt(bars, vwap(closes, highs, lows, vols, p)) }); break;
+      case "supertrend": { const mult = np[1]; overlays.push({ label: `슈퍼트렌드(${p},${mult})`, color: "#34d399", data: seriesAt(bars, supertrend(closes, highs, lows, p, mult)) }); break; }
       case "parabolic_sar": case "parabolicsar": overlays.push({ label: "Parabolic SAR", color: "#c084fc", data: seriesAt(bars, parabolicSar(highs, lows)) }); break;
-      case "donchian": { const dc = donchian(highs, lows, p || 20); overlays.push({ label: `돈치안(${p || 20})상`, color: "#64748b", data: seriesAt(bars, dc.upper) }, { label: "돈치안하", color: "#64748b", data: seriesAt(bars, dc.lower) }); break; }
+      case "donchian": { const dc = donchian(highs, lows, p); overlays.push({ label: `돈치안(${p})상`, color: "#64748b", data: seriesAt(bars, dc.upper) }, { label: "돈치안하", color: "#64748b", data: seriesAt(bars, dc.lower) }); break; }
       case "ichimoku": { const ic = ichimoku(highs, lows); overlays.push({ label: "전환선", color: "#38bdf8", data: seriesAt(bars, ic.tenkan) }, { label: "기준선", color: "#f43f5e", data: seriesAt(bars, ic.kijun) }, { label: "선행A", color: "#22c55e", data: seriesAt(bars, ic.senkouA) }, { label: "선행B", color: "#eab308", data: seriesAt(bars, ic.senkouB) }); break; }
       // ── 하단 보조지표(지표당 독립 패널) ──
-      case "rsi": oscGroups.push({ title: `RSI(${p || 14})`, guides: [30, 70], series: [{ label: `RSI(${p || 14})`, color, data: seriesAt(bars, rsi(closes, p || 14)) }] }); break;
-      case "macd": { const m = macd(closes); oscGroups.push({ title: "MACD", series: [{ label: "MACD", color, data: seriesAt(bars, m.macd) }, { label: "Signal", color: "#f97316", data: seriesAt(bars, m.signal) }] }); break; }
-      case "stochastic": { const st = stochastic(closes, highs, lows, p || 14); oscGroups.push({ title: "Stoch", guides: [20, 80], series: [{ label: "Stoch %K", color, data: seriesAt(bars, st.k) }] }); break; }
+      case "rsi": oscGroups.push({ title: `RSI(${p})`, guides: [30, 70], series: [{ label: `RSI(${p})`, color, data: seriesAt(bars, rsi(closes, p)) }] }); break;
+      case "macd": { const m = macd(closes, np[0], np[1], np[2]); oscGroups.push({ title: `MACD(${np[0]},${np[1]},${np[2]})`, series: [{ label: "MACD", color, data: seriesAt(bars, m.macd) }, { label: "Signal", color: "#f97316", data: seriesAt(bars, m.signal) }] }); break; }
+      case "stochastic": { const st = stochastic(closes, highs, lows, np[0], np[1]); oscGroups.push({ title: `Stoch(${np[0]},${np[1]})`, guides: [20, 80], series: [{ label: "Stoch %K", color, data: seriesAt(bars, st.k) }] }); break; }
       case "stochastic_rsi": { const sr = stochasticRsi(closes); oscGroups.push({ title: "StochRSI", guides: [20, 80], series: [{ label: "StochRSI %K", color, data: seriesAt(bars, sr.k) }] }); break; }
       case "adx": oscGroups.push({ title: `ADX(${p || 14})`, guides: [25], series: [{ label: `ADX(${p || 14})`, color, data: seriesAt(bars, adx(closes, highs, lows, p || 14)) }] }); break;
       case "atr": oscGroups.push({ title: `ATR(${p || 14})`, series: [{ label: `ATR(${p || 14})`, color, data: seriesAt(bars, atr(closes, highs, lows, p || 14)) }] }); break;
@@ -386,10 +407,11 @@ async function candlesFor(botId: string, tf?: string, inds?: string[]): Promise<
     const comp = store.getComposite(bot.composite_strategy_id);
     // 전략이 쓰는 지표(차트≡전략) + 사용자가 차트에서 토글로 켠 지표를 합쳐서 그림.
     const stratSpecs = collectIndicatorSpecs(comp?.root_node ?? {});
-    // (종류, 정규화 기간) 단위 dedup: 전략 RSI(14)와 토글 RSI(30)은 다른 키라 둘 다 그림(기간 조정 반영),
-    // 전략 RSI(14)와 토글 RSI(14)만 1개로 합침. (종류만 비교하면 기간 다른 토글이 통째 폐기되던 버그 수정)
-    const stratKeys = new Set(stratSpecs.map((s) => `${s.ind}:${normPeriod(s.ind, s.period)}`));
-    const toggleSpecs = parseToggleInds(inds).filter((s) => !stratKeys.has(`${s.ind}:${normPeriod(s.ind, s.period)}`));
+    // (종류, 정규화 파라미터) 단위 dedup — buildIndicators seen키와 동일 규약(INV-4). 전략 RSI(14)+토글 RSI(30)·
+    // BB(20,2)+BB(20,3)은 다른 키라 둘 다 그림, 전략 RSI(14)+토글 RSI(14)만 1개로 합침.
+    const keyOf = (s: IndSpec) => `${s.ind}:${normParams(s.ind, s.params && s.params.length ? s.params : [s.period]).join(":")}`;
+    const stratKeys = new Set(stratSpecs.map(keyOf));
+    const toggleSpecs = parseToggleInds(inds).filter((s) => !stratKeys.has(keyOf(s)));
     const ind = buildIndicators(bars, [...stratSpecs, ...toggleSpecs]);
     const priceLines = buildPriceLines(bot, comp, ccy);
     const markers = buildMarkers(bot, bars, ccy);
@@ -781,14 +803,43 @@ function renderTfButtons(cur){var tfs=['1m','5m','30m','1h','1d','1w','1mo'];
 // 트뷰처럼 켜고끄는 지표 메뉴. 가격 위 오버레이 + 하단 보조지표. 선택은 localStorage 보존(틱 재렌더에도 유지).
 var IND_MENU=[{k:'volume',n:'거래량'},{k:'bollinger',n:'볼린저'},{k:'vwap',n:'VWAP'},{k:'supertrend',n:'슈퍼트렌드'},{k:'ichimoku',n:'일목'},{k:'sma:50',n:'SMA50'},{k:'ema:200',n:'EMA200'},{k:'parabolic_sar',n:'SAR'},{k:'donchian',n:'돈치안'},{k:'rsi',n:'RSI'},{k:'macd',n:'MACD'},{k:'stochastic',n:'스토캐스틱'},{k:'adx',n:'ADX'},{k:'atr',n:'ATR'},{k:'cci',n:'CCI'},{k:'mfi',n:'MFI'},{k:'williams_r',n:'윌리엄스%R'},{k:'obv',n:'OBV'},{k:'roc',n:'ROC'}];
 var chartInds=new Set();try{chartInds=new Set(JSON.parse(localStorage.getItem('qmInds')||'[]'))}catch(e){}
-// 기간을 갖는 지표만 인라인 숫자조정 노출(서버 buildIndicators 기본값과 일치). 없는 지표=복합/고정(macd·일목·SAR·StochRSI)→조정 안함.
-var IND_PARAM={sma:{n:'SMA',d:50,min:2,max:400},ema:{n:'EMA',d:200,min:2,max:400},bollinger:{n:'볼린저',d:20,min:2,max:200},vwap:{n:'VWAP',d:20,min:2,max:200},supertrend:{n:'슈퍼트렌드',d:10,min:2,max:100},donchian:{n:'돈치안',d:20,min:2,max:200},rsi:{n:'RSI',d:14,min:2,max:100},stochastic:{n:'스토캐스틱',d:14,min:2,max:100},adx:{n:'ADX',d:14,min:2,max:100},atr:{n:'ATR',d:14,min:2,max:100},cci:{n:'CCI',d:20,min:2,max:200},mfi:{n:'MFI',d:14,min:2,max:100},williams_r:{n:'윌리엄스%R',d:14,min:2,max:100},obv:{n:'OBV',d:20,min:2,max:200},roc:{n:'ROC',d:12,min:2,max:200}};
-// 토글키('ind' 또는 'ind:period') → {base, period}. period 미지정 시 IND_PARAM 기본값. 기간 없는 지표는 null.
-function splitIndKey(k){var a=String(k).split(':');var base=a[0];var per=parseInt(a[1],10);var meta=IND_PARAM[base];if(!meta)return null;return {base:base,period:(per>0?per:meta.d),meta:meta};}
-// 켜진 지표의 기간만 칩으로 렌더. 기간 없는/복합 지표는 자동 제외(splitIndKey=null).
-function renderIndParams(){var el=document.getElementById('chartIndParams');if(!el)return;var chips=[];Array.from(chartInds).forEach(function(k){var s=splitIndKey(k);if(!s)return;chips.push('<span class="pchip" title="'+s.base+' 기간">'+s.meta.n+'('+s.period+') <span>기간</span> <input type="number" min="'+s.meta.min+'" max="'+s.meta.max+'" value="'+s.period+'" data-base="'+s.base+'" data-old="'+k+'" onchange="setIndPeriod(this)" onkeydown="if(event.key===&quot;Enter&quot;)this.blur()"></span>');});el.innerHTML=chips.length?'<span class="pplbl">기간 조정</span>'+chips.join(''):'';}
-// 숫자입력 변경 → chartInds에서 옛 키 제거 후 'base:newperiod'로 교체 → 저장 → 차트 재요청.
-function setIndPeriod(inp){var base=inp.dataset.base,oldKey=inp.dataset.old,meta=IND_PARAM[base];if(!meta)return;var v=parseInt(inp.value,10);if(!(v>0))v=meta.d;if(v<meta.min)v=meta.min;if(v>meta.max)v=meta.max;var newKey=base+':'+v;if(newKey===oldKey){inp.value=v;return;}chartInds.delete(oldKey);chartInds.add(newKey);saveInds();openChart(_chartId,_chartTf);}
+// 파라미터를 갖는 지표만 인라인 조정 노출(서버 normParams/IND_EXTRA와 값 일치). fields[i]=i번째 파라미터(0=기간).
+// 멀티파라미터: 볼린저(기간+표준편차)·슈퍼트렌드(기간+배수)·MACD(단/장/시그널)·스토캐스틱(K/D). 일목·SAR·StochRSI=고정→조정 안함.
+var IND_PARAM={
+  sma:{n:'SMA',fields:[{l:'기간',d:50,min:2,max:400}]},
+  ema:{n:'EMA',fields:[{l:'기간',d:200,min:2,max:400}]},
+  bollinger:{n:'볼린저',fields:[{l:'기간',d:20,min:2,max:200},{l:'표준편차',d:2,min:0.5,max:5,step:0.5}]},
+  vwap:{n:'VWAP',fields:[{l:'기간',d:20,min:2,max:200}]},
+  supertrend:{n:'슈퍼트렌드',fields:[{l:'기간',d:10,min:2,max:100},{l:'배수',d:3,min:0.5,max:10,step:0.5}]},
+  donchian:{n:'돈치안',fields:[{l:'기간',d:20,min:2,max:200}]},
+  rsi:{n:'RSI',fields:[{l:'기간',d:14,min:2,max:100}]},
+  stochastic:{n:'스토캐스틱',fields:[{l:'K기간',d:14,min:2,max:100},{l:'D기간',d:3,min:1,max:50}]},
+  macd:{n:'MACD',fields:[{l:'단기',d:12,min:2,max:100},{l:'장기',d:26,min:2,max:200},{l:'시그널',d:9,min:1,max:100}]},
+  adx:{n:'ADX',fields:[{l:'기간',d:14,min:2,max:100}]},
+  atr:{n:'ATR',fields:[{l:'기간',d:14,min:2,max:100}]},
+  cci:{n:'CCI',fields:[{l:'기간',d:20,min:2,max:200}]},
+  mfi:{n:'MFI',fields:[{l:'기간',d:14,min:2,max:100}]},
+  williams_r:{n:'윌리엄스%R',fields:[{l:'기간',d:14,min:2,max:100}]},
+  obv:{n:'OBV',fields:[{l:'기간',d:20,min:2,max:200}]},
+  roc:{n:'ROC',fields:[{l:'기간',d:12,min:2,max:200}]}
+};
+// 토글키('ind' 또는 'ind:p1:p2:...') → {base, params[], meta}. 누락/0 파라미터는 fields[i].d 기본값. 미지원 지표=null.
+function splitIndKey(k){var a=String(k).split(':');var base=a[0];var meta=IND_PARAM[base];if(!meta)return null;
+ var params=meta.fields.map(function(f,i){var v=parseFloat(a[i+1]);return (v>0)?v:f.d;});
+ return {base:base,params:params,meta:meta};}
+// 켜진 지표마다 fields 길이만큼 input 렌더(파라미터 여러개). 미지원/복합 지표는 자동 제외(splitIndKey=null).
+function renderIndParams(){var el=document.getElementById('chartIndParams');if(!el)return;var chips=[];
+ Array.from(chartInds).forEach(function(k){var s=splitIndKey(k);if(!s)return;
+  var inputs=s.meta.fields.map(function(f,i){return f.l+' <input type="number" min="'+f.min+'" max="'+f.max+'" step="'+(f.step||1)+'" value="'+s.params[i]+'" data-base="'+s.base+'" data-idx="'+i+'" data-old="'+k+'" onchange="setIndParams(this)" onkeydown="if(event.key===&quot;Enter&quot;)this.blur()">';}).join(' ');
+  chips.push('<span class="pchip" title="'+s.base+' 파라미터"><span>'+s.meta.n+'</span> '+inputs+'</span>');});
+ el.innerHTML=chips.length?'<span class="pplbl">파라미터 조정</span>'+chips.join(''):'';}
+// 입력 변경 → 옛 키의 전체 파라미터를 읽어 변경된 idx만 교체→정규화 키 'base:p0:p1:...' 재조립→chartInds 교체→저장→차트 재요청.
+function setIndParams(inp){var base=inp.dataset.base,oldKey=inp.dataset.old,idx=parseInt(inp.dataset.idx,10),meta=IND_PARAM[base];if(!meta)return;
+ var s=splitIndKey(oldKey);if(!s)return;var params=s.params.slice();var f=meta.fields[idx];
+ var v=parseFloat(inp.value);if(!(v>0))v=f.d;if(v<f.min)v=f.min;if(v>f.max)v=f.max;params[idx]=v;
+ var newKey=base+':'+params.join(':'); // 단일필드면 'base:p0'(하위호환), 멀티면 'base:p0:p1:...'
+ if(newKey===oldKey){inp.value=v;return;}
+ chartInds.delete(oldKey);chartInds.add(newKey);saveInds();openChart(_chartId,_chartTf);}
 function saveInds(){try{localStorage.setItem('qmInds',JSON.stringify(Array.from(chartInds)))}catch(e){}}
 function renderIndButtons(){document.getElementById('chartInds').innerHTML='<span class="indlbl">지표 추가</span>'+IND_MENU.map(function(m){return '<span class="ib'+(chartInds.has(m.k)?' on':'')+'" data-k="'+m.k+'" onclick="toggleInd(this.dataset.k)">'+m.n+'</span>'}).join('');renderIndParams();}
 function toggleInd(k){if(chartInds.has(k))chartInds.delete(k);else chartInds.add(k);saveInds();openChart(_chartId,_chartTf);}
