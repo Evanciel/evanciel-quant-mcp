@@ -49,11 +49,14 @@ export async function placeOrder(a: {
   const gate = liveGate(broker, market);
   if (!gate.allowed) return { ok: false, error: gate.reason, gate };
 
-  // 가격/노셔널 → 하드리밋
+  // 가격/노셔널 → 하드리밋. 통화 인식(Binance=USDT, 한투/키움=KRW) → 통화별 캡 적용(KR에 USDT 캡 오판 방지).
+  const quoteCurrency = broker === "binance" ? "USDT" : "KRW";
   let price = a.price ?? 0;
   if (!price) { try { price = (await got.adapter.getPrice(a.symbol)).price; } catch { price = 0; } }
+  // 시장가인데 현재가 산출 실패(price=0) → 노셔널 불명. 메인넷(live)에서는 캡 적용 불가하므로 거절(fail-closed, 리스크통제).
+  if (!(price > 0) && gate.env === "live") return { ok: false, error: "현재가 산출 실패 → 노셔널 불명. 메인넷 시장가 거절(지정가로 주문하세요)." };
   const notional = price * a.quantity;
-  const lim = checkLimits({ symbol: a.symbol, notional });
+  const lim = checkLimits({ symbol: a.symbol, notional, quoteCurrency });
   if (!lim.ok) return { ok: false, error: `하드리밋 차단: ${lim.reason}` };
 
   // 2단계 확인토큰(fail-CLOSED)

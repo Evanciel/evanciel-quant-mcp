@@ -1,7 +1,8 @@
 /**
  * dashboard/server.ts — 로컬 실시간 HTML 대시보드(컴패니언 HTTP+SSE). 리서치 권장 (a)안.
  * 보안: 127.0.0.1 바인딩 / 런치별 랜덤 토큰(/api·/events 필수) / Host 검증(DNS-rebinding 차단) /
- *       시크릿 절대 미전송(포지션·플랜만) / 읽기전용(주문 엔드포인트 없음).
+ *       시크릿 절대 미전송(포지션·플랜만). 수동주문(/api/order)은 live-handlers.placeOrder 안전경로만 경유
+ *       (liveGate testnet/mock-only·메인넷 마스터스위치 / 노셔널캡·allowlist / 2단계 confirmToken / 감사로그).
  * 페이지가 Binance 공개 WS로 시세를 직접 받아 미실현손익을 클라이언트 계산(대문자 WS키 사용).
  */
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
@@ -10,6 +11,8 @@ import * as store from "../store/db.js";
 import { BROKER_FIELDS, upsertCredentials, credentialStatus, credentialsPath, enableLive, disableLive, liveSettingsStatus, type BrokerKey } from "../setup/credentials.js";
 import { fetchKlines } from "../data/binance-public.js";
 import { getAdapter } from "../brokers/index.js";
+import { placeOrder } from "../mcp-server/live-handlers.js"; // 수동주문 — 안전경로(2단계토큰/게이트/캡) 재사용
+import type { Broker } from "../brokers/safety.js";
 import { sma, ema, rsi, macd, bollingerBands, stochastic, adx, atr, williamsR, stochasticRsi, cci, supertrend, vwap, mfi, parabolicSar, ichimoku, roc, obv, donchian } from "../core/strategy/indicators.js";
 
 /** POST 본문을 안전하게 읽어 JSON 파싱(상한 64KB, 자격증명 폼은 작음). */
@@ -518,6 +521,27 @@ export function startDashboard(port = 7788): Promise<{ url: string; port: number
       }).catch((e) => { res.writeHead(400, { "content-type": "application/json" }); res.end(JSON.stringify({ ok: false, error: e instanceof Error ? e.message : "bad request" })); });
       return;
     }
+    if (u.pathname === "/api/order") {
+      // 수동 주문 — 안전로직(liveGate/checkLimits/2단계토큰/audit)은 placeOrder 내부에서만 강제. 여기서 재구현·우회 금지.
+      if (req.method !== "POST") { res.writeHead(405).end("method not allowed"); return; }
+      readJsonBody(req).then(async (body) => {
+        const symbol = typeof body.symbol === "string" ? body.symbol.trim() : "";
+        const side = body.side === "buy" || body.side === "sell" ? body.side : null;
+        const quantity = Number(body.quantity);
+        const broker = (typeof body.broker === "string" ? body.broker : "binance") as Broker;
+        const market = body.market === "futures" ? "futures" : "spot";
+        const type = body.type === "limit" ? "limit" : "market";
+        const price = body.price != null && Number(body.price) > 0 ? Number(body.price) : undefined;
+        const confirmToken = typeof body.confirmToken === "string" ? body.confirmToken : undefined;
+        const fail = (code: number, error: string) => { res.writeHead(code, { "content-type": "application/json" }); res.end(JSON.stringify({ ok: false, error })); };
+        if (!symbol || !side || !(quantity > 0)) return fail(400, "입력 오류: symbol·side(buy/sell)·quantity>0 필요");
+        if (type === "limit" && !(price && price > 0)) return fail(400, "지정가 주문은 price>0 필요");
+        // 서버는 클라가 보낸 가격/노셔널/env를 신뢰하지 않음 — placeOrder가 getPrice 재계산+checkLimits+게이트 강제.
+        const r = await placeOrder({ broker, market, symbol, side, type, quantity, price, confirmToken });
+        res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify(r));
+      }).catch((e) => { res.writeHead(400, { "content-type": "application/json" }); res.end(JSON.stringify({ ok: false, error: e instanceof Error ? e.message : "bad request" })); });
+      return;
+    }
     res.writeHead(404).end("not found");
   });
 
@@ -567,6 +591,12 @@ h1{font-size:18px;margin:0 0 2px}.sub{color:#8a94a6;font-size:12px;margin-bottom
 .earn{margin-top:9px;font-size:13px;font-weight:600}
 .more{margin-top:10px;font-size:11px;color:#6b7588;cursor:pointer;user-select:none}.more:hover{color:#8a94a6}
 .cbtn{margin-top:8px;font-size:11px;color:#7aa2f7;cursor:pointer;user-select:none;display:inline-block}.cbtn:hover{color:#a8c0ff}
+.obar{display:flex;gap:8px;margin-top:8px}.obtn{flex:1;text-align:center;font-size:12px;font-weight:700;padding:7px 0;border-radius:8px;cursor:pointer;user-select:none}
+.obtn.buy{background:rgba(16,185,129,.16);color:#10b981;border:1px solid #1c5a44}.obtn.buy:hover{background:rgba(16,185,129,.28)}
+.obtn.sell{background:rgba(244,63,94,.16);color:#f43f5e;border:1px solid #6b2333}.obtn.sell:hover{background:rgba(244,63,94,.28)}
+.envb{font-size:10px;font-weight:700;padding:2px 7px;border-radius:4px;margin-left:6px}
+.envb.safe{background:rgba(122,162,247,.18);color:#7aa2f7}.envb.live{background:rgba(244,63,94,.22);color:#f43f5e}
+.obig{background:#7aa2f7;color:#0b0e14;border:0;border-radius:8px;padding:9px 16px;font-weight:700;font-size:13px;cursor:pointer;margin-top:10px}.obig.danger{background:#f43f5e;color:#fff}
 .cmodal{display:none;position:fixed;inset:0;background:rgba(0,0,0,.66);z-index:50;align-items:center;justify-content:center;padding:16px}
 .cmbox{background:#121622;border:1px solid #222838;border-radius:14px;padding:14px;width:min(900px,94vw)}
 .cmhead{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}
@@ -640,6 +670,11 @@ h1{font-size:18px;margin:0 0 2px}.sub{color:#8a94a6;font-size:12px;margin-bottom
   <div class="indbar" id="chartDraw"></div>
   <div id="chartBody"></div>
   <div class="cmnote" id="chartNote"></div>
+</div></div>
+<div class="cmodal" id="orderModal"><div class="cmbox" style="width:min(440px,94vw)">
+  <div class="cmhead"><b id="orderTitle">주문</b><span class="cmx" onclick="closeOrder()">닫기 ✕</span></div>
+  <div id="orderBody"></div>
+  <div class="setmsg" id="orderMsg"></div>
 </div></div>
 <script>
 const TOKEN=${JSON.stringify(token)};
@@ -898,6 +933,44 @@ function openChart(id,tf){
   else _chartPoll=setInterval(refreshSeries,20000); // KR 실시간 근사(20초마다 키움 차트 재요청). 429 회피용 간격.
  }).catch(function(){document.getElementById('chartTitle').textContent='차트 오류(네트워크)';});}
 function closeChart(){document.getElementById('chartModal').style.display='none';closeKline();clearChartPoll();if(_chart&&_clickHandler){try{_chart.unsubscribeClick(_clickHandler)}catch(e){}}_clickHandler=null;_drawings=[];_pendingTrend=null;_drawLoadedFor=null;_drawMode='none';_priceSeries=null;_ovSeries=[];_oscFlat=[];_markersPrim=null;_volSeries=null;if(_chart){try{_chart.remove()}catch(e){}_chart=null;}document.getElementById('chartBody').innerHTML='';}
+// ── 수동 주문(2단계: 미리보기→확정). 모든 안전판정은 서버 placeOrder가 수행, 클라는 입력·표시만. ──
+var _order=null; // {broker,market,symbol,ccy,side,quantity,type,price,confirmToken}
+function envBadge(env){var live=env==='live';return '<span class="envb '+(live?'live':'safe')+'">'+(live?'⚠ 실거래(LIVE)':String(env||'testnet').toUpperCase()+' 모의')+'</span>';}
+function toggleLimit(on){var w=document.getElementById('olimitwrap');if(w)w.style.display=on?'block':'none';}
+function openOrder(el){var side=el.dataset.side;_order={broker:el.dataset.broker,market:el.dataset.market||'spot',symbol:el.dataset.sym,ccy:el.dataset.ccy,side:side};
+ var m=document.getElementById('orderModal');document.getElementById('orderMsg').textContent='';document.getElementById('orderMsg').className='setmsg';
+ document.getElementById('orderTitle').innerHTML=esc(coin(_order.symbol))+' · '+(side==='buy'?'<span style="color:#10b981">매수</span>':'<span style="color:#f43f5e">매도</span>');
+ document.getElementById('orderBody').innerHTML='<div class="fld"><label>수량</label><input id="oqty" type="text" inputmode="decimal" autocomplete="off" placeholder="예: 0.01"></div>'+
+  '<label style="display:flex;gap:7px;align-items:center;cursor:pointer;margin:6px 0;font-size:12px;color:#8a94a6"><input type="checkbox" id="olimit" onchange="toggleLimit(this.checked)"> 지정가로 주문</label>'+
+  '<div class="fld" id="olimitwrap" style="display:none"><label>지정가</label><input id="oprice" type="text" inputmode="decimal" autocomplete="off" placeholder="한 주 가격"></div>'+
+  '<button class="obig'+(side==='sell'?' danger':'')+'" onclick="submitOrder()">주문 미리보기 →</button>';
+ m.style.display='flex';}
+function closeOrder(){document.getElementById('orderModal').style.display='none';_order=null;}
+function submitOrder(){if(!_order)return;var msg=document.getElementById('orderMsg');
+ var qty=Number(document.getElementById('oqty').value);if(!(qty>0)){msg.className='setmsg err';msg.textContent='수량을 0보다 크게 입력하세요.';return;}
+ _order.quantity=qty;var limit=document.getElementById('olimit').checked;
+ if(limit){var pr=Number(document.getElementById('oprice').value);if(!(pr>0)){msg.className='setmsg err';msg.textContent='지정가를 입력하세요.';return;}_order.type='limit';_order.price=pr;}else{_order.type='market';_order.price=undefined;}
+ msg.className='setmsg';msg.textContent='미리보기 불러오는 중…';
+ fetch('/api/order?token='+TOKEN,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({broker:_order.broker,market:_order.market,symbol:_order.symbol,side:_order.side,type:_order.type,quantity:_order.quantity,price:_order.price})})
+  .then(function(r){return r.json()}).then(function(d){
+   if(!d.ok){msg.className='setmsg err';msg.textContent='차단/오류: '+(d.error||'알 수 없음');return;}
+   if(d.phase==='preview'){_order.confirmToken=d.confirmToken;var p=d.preview||{};var live=p.env==='live';
+    document.getElementById('orderBody').innerHTML='<div class="strat"><div class="drow"><b>심볼</b>'+esc(p.symbol)+envBadge(p.env)+'</div>'+
+     '<div class="drow"><b>방향</b>'+(p.side==='buy'?'매수':'매도')+' · '+esc(p.type)+'</div>'+
+     '<div class="drow"><b>수량</b>'+esc(p.quantity)+'</div>'+
+     '<div class="drow"><b>가격</b>'+esc(p.price)+'</div>'+
+     '<div class="drow"><b>예상금액</b>'+esc(p.notional)+' '+esc(_order.ccy||'')+'</div></div>'+
+     (live?'<div class="setmsg err" style="margin-top:8px">⚠ 실거래(LIVE) — 실제 자금이 사용됩니다. 한 번 더 확인하세요.</div>':'<div class="hint" style="margin-top:8px">모의(가짜돈) 환경입니다.</div>')+
+     '<button class="obig'+(live?' danger':'')+'" onclick="confirmOrder()">'+(live?'⚠ 실주문 확정':'주문 확정')+'</button>';
+    msg.textContent='';return;}
+   msg.className='setmsg err';msg.textContent='예상치 못한 응답';
+  }).catch(function(e){msg.className='setmsg err';msg.textContent='실패: '+e.message;});}
+function confirmOrder(){if(!_order||!_order.confirmToken)return;var msg=document.getElementById('orderMsg');msg.className='setmsg';msg.textContent='주문 전송 중…';
+ fetch('/api/order?token='+TOKEN,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({broker:_order.broker,market:_order.market,symbol:_order.symbol,side:_order.side,type:_order.type,quantity:_order.quantity,price:_order.price,confirmToken:_order.confirmToken})})
+  .then(function(r){return r.json()}).then(function(d){
+   if(d.ok&&d.phase==='executed'){msg.className='setmsg ok';msg.textContent='✅ 주문 완료 ('+esc(d.env)+') · 주문번호 '+esc((d.result&&d.result.orderId)||'-');loadBalances();}
+   else{msg.className='setmsg err';msg.textContent='실패: '+(d.error||'알 수 없음')+' (토큰 만료 시 미리보기부터 다시)';_order.confirmToken=null;}
+  }).catch(function(e){msg.className='setmsg err';msg.textContent='실패: '+e.message;});}
 function card(r){var b=r.b,live=b.mode==='live',open=expanded.has(b.id),rp=r.rp;
  var wr=b.winRate!=null?', '+b.closes+'번 중 '+Math.round(b.winRate*b.closes/100)+'번 수익':'';
  var earn=b.closes>0?'<div class="earn '+(rp>=0?'up':'dn')+'">💰 지금까지 '+signed(rp,r.ccy)+' '+(rp>=0?'벌었어요':'잃었어요')+' <span class="hint">('+b.closes+'번 거래'+wr+')</span></div>':'';
@@ -912,6 +985,8 @@ function card(r){var b=r.b,live=b.mode==='live',open=expanded.has(b.id),rp=r.rp;
   '<div class="plist">'+r.body+'</div>'+earn+
   (acts?'<div class="act">'+acts+'</div>':'')+
   '<div class="cbtn" data-id="'+esc(b.id)+'" onclick="openChart(this.dataset.id)">📈 차트 보기</div>'+
+  '<div class="obar"><span class="obtn buy" data-side="buy" data-broker="'+esc(b.broker)+'" data-market="'+esc(b.market||'spot')+'" data-sym="'+esc(b.symbol)+'" data-ccy="'+esc(r.ccy)+'" onclick="openOrder(this)">매수</span>'+
+   '<span class="obtn sell" data-side="sell" data-broker="'+esc(b.broker)+'" data-market="'+esc(b.market||'spot')+'" data-sym="'+esc(b.symbol)+'" data-ccy="'+esc(r.ccy)+'" onclick="openOrder(this)">매도</span></div>'+
   '<div class="more" data-id="'+esc(b.id)+'" onclick="tgl(this)">'+(open?'간단히 ▴':'전략 자세히 ▾')+'</div>'+
   '<div class="strat" style="display:'+(open?'block':'none')+'">'+detailHtml(b)+'</div>';
  return el;}
