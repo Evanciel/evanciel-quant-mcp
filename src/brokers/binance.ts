@@ -163,7 +163,7 @@ export class BinanceBrokerAdapter extends BaseBrokerAdapter {
   // ── 수량 정규화(LOT_SIZE / MIN_NOTIONAL) ──
   private filterCache = new Map<
     string,
-    { stepSize: number; minQty: number; minNotional: number; tickSize: number }
+    { stepSize: number; minQty: number; minNotional: number; tickSize: number; baseAsset: string }
   >();
 
   private async symbolFilters(symbol: string) {
@@ -193,9 +193,15 @@ export class BinanceBrokerAdapter extends BaseBrokerAdapter {
       minQty: parseFloat(lot.minQty || "0"),
       minNotional: parseFloat(notional.notional || notional.minNotional || "0"),
       tickSize: parseFloat(price.tickSize || "0"),
+      baseAsset: String((symInfo as Record<string, unknown> | undefined)?.baseAsset || ""),
     };
     this.filterCache.set(symbol, f);
     return f;
+  }
+
+  /** 거래소 권위 base 자산(현물). exchangeInfo baseAsset → FDUSD/TUSD/DAI 등 비표준 quote 페어도 정확. 실패 시 "". */
+  async baseAssetOf(symbol: string): Promise<string> {
+    try { return (await this.symbolFilters(symbol)).baseAsset; } catch { return ""; }
   }
 
   /**
@@ -342,6 +348,7 @@ export class BinanceBrokerAdapter extends BaseBrokerAdapter {
         symbol: b.asset,
         name: b.asset,
         quantity: parseFloat(b.free) + parseFloat(b.locked),
+        free: parseFloat(b.free), // ③ 매도가능(locked 제외) — 보호주문 수량 상한용(잠긴 OCO 제외)
         avgPrice: 0,
         currentPrice: 0,
         pnl: 0,

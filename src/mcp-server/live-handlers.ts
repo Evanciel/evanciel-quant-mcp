@@ -55,25 +55,31 @@ export async function placeOrder(a: {
   if (!price) { try { price = (await got.adapter.getPrice(a.symbol)).price; } catch { price = 0; } }
   // 시장가인데 현재가 산출 실패(price=0) → 노셔널 불명. 메인넷(live)에서는 캡 적용 불가하므로 거절(fail-closed, 리스크통제).
   if (!(price > 0) && gate.env === "live") return { ok: false, error: "현재가 산출 실패 → 노셔널 불명. 메인넷 시장가 거절(지정가로 주문하세요)." };
-  const notional = price * a.quantity;
+  // ① 캡 검증을 '제출될 정규화 수량'으로(minNotional 상향분이 캡 초과한 채 제출되던 구멍 차단). 해시/프리뷰/주문 모두 effQty로 통일.
+  let effQty = a.quantity;
+  if (typeof got.adapter.normalizeQuantity === "function" && price > 0) {
+    try { effQty = await got.adapter.normalizeQuantity(a.symbol, a.quantity, price); } catch { effQty = a.quantity; }
+  }
+  if (!(effQty > 0)) return { ok: false, error: "정규화 후 수량 0(최소수량/스텝 미달)." };
+  const notional = price * effQty;
   const lim = checkLimits({ symbol: a.symbol, notional, quoteCurrency });
   if (!lim.ok) return { ok: false, error: `하드리밋 차단: ${lim.reason}` };
 
-  // 2단계 확인토큰(fail-CLOSED)
-  const hash = orderHash({ broker, market, symbol: a.symbol, side: a.side, type, quantity: a.quantity, price: a.price ?? null, env: gate.env });
+  // 2단계 확인토큰(fail-CLOSED). INV-1: 해시 바인딩 수량 = 프리뷰 수량 = 실제 주문 수량(effQty).
+  const hash = orderHash({ broker, market, symbol: a.symbol, side: a.side, type, quantity: effQty, price: a.price ?? null, env: gate.env });
   if (!a.confirmToken) {
     const token = mintToken(hash);
     return {
       ok: true, phase: "preview", needConfirm: true, confirmToken: token,
-      preview: { broker, market, env: gate.env, symbol: a.symbol, side: a.side, type, quantity: a.quantity, price: a.price ?? "(시장가)", notional: +notional.toFixed(2) },
+      preview: { broker, market, env: gate.env, symbol: a.symbol, side: a.side, type, quantity: effQty, price: a.price ?? "(시장가)", notional: +notional.toFixed(2) },
       note: `⚠️ ${String(gate.env).toUpperCase()} 주문 프리뷰. 검토 후 동일 인자 + 이 confirmToken으로 다시 place_order 호출해야 실제 주문(5분 TTL, 단일사용).`,
     };
   }
   if (!consumeToken(a.confirmToken, hash)) return { ok: false, error: "확인토큰 무효/만료/불일치 → 거절(fail-closed). 프리뷰부터 다시." };
 
-  audit({ event: "order_attempt", broker, market, env: gate.env, symbol: a.symbol, side: a.side, type, quantity: a.quantity, price: a.price ?? null });
+  audit({ event: "order_attempt", broker, market, env: gate.env, symbol: a.symbol, side: a.side, type, quantity: effQty, price: a.price ?? null });
   try {
-    const result = await got.adapter.placeOrder({ symbol: a.symbol, side: a.side, type, quantity: a.quantity, price: a.price });
+    const result = await got.adapter.placeOrder({ symbol: a.symbol, side: a.side, type, quantity: effQty, price: a.price });
     audit({ event: "order_result", broker, env: gate.env, orderId: result.orderId, status: result.status, symbol: result.symbol, side: result.side, qty: result.quantity, price: result.price });
     return { ok: true, phase: "executed", broker, env: gate.env, result };
   } catch (e) {
@@ -98,12 +104,14 @@ export async function placeProtective(a: {
   if (!gate.allowed) return { ok: false, error: gate.reason, gate };
   if (typeof got.adapter.placeOco !== "function") return { ok: false, error: `${broker} 어댑터는 OCO 미지원(현물 크립토만).` };
 
-  // 1) 실보유수량 검증 — 클라 quantity 불신, 거래소 실보유로 상한(현물 SELL only, 공매도 차단).
+  // 1) 실보유수량 검증 — 클라 quantity 불신. base=어댑터 권위(비표준 quote 페어 정확), held=매도가능(free, 잠긴 OCO 제외).
   let held = 0;
   try {
-    const base = a.symbol.replace(/USDT$|USDC$|BUSD$/i, ""); // 현물 base 자산(USDT/USDC/BUSD 페어만 정확)
-    const positions = await got.adapter.getPositions();
-    held = positions.find((p) => p.symbol.toUpperCase() === base.toUpperCase())?.quantity ?? 0;
+    let base = "";
+    if (typeof got.adapter.baseAssetOf === "function") base = await got.adapter.baseAssetOf(a.symbol);
+    if (!base) base = a.symbol.replace(/USDT$|USDC$|BUSD$|FDUSD$|TUSD$|DAI$|USDP$/i, ""); // 폴백(확장 정규식)
+    const pos = (await got.adapter.getPositions()).find((p) => p.symbol.toUpperCase() === base.toUpperCase());
+    held = pos?.free ?? pos?.quantity ?? 0; // ③ free 우선(locked 제외=-2010 사전차단), 미상이면 quantity 폴백
   } catch { held = 0; } // 조회 실패 → 0 → 아래에서 fail-closed 거절
   if (!(a.quantity > 0)) return { ok: false, error: "수량은 0보다 커야 합니다." };
   if (!(held > 0)) return { ok: false, error: "보유 수량 없음(거래소 조회 실패 또는 미보유) → 보호주문 거절(fail-closed)." };
@@ -121,28 +129,36 @@ export async function placeProtective(a: {
   if (!(a.stopPrice < mark)) return { ok: false, error: `손절가 ${a.stopPrice}는 현재가 ${mark}보다 낮아야 합니다.` };
   if (a.stopLimitPrice != null && a.stopLimitPrice > a.stopPrice) return { ok: false, error: "손절 지정가는 트리거가 이하여야 합니다." };
 
-  // 3) 하드리밋 — TP·SL 노셔널 각각 캡(한쪽만 우회 불가).
+  // ① 캡 검증·해시·주문 모두 '제출될 정규화 수량(effQty)'으로 통일(placeOco가 내부에서 normalizeQuantity 절사 → 검증==제출).
+  let effQty = a.quantity;
+  if (typeof got.adapter.normalizeQuantity === "function") {
+    try { effQty = await got.adapter.normalizeQuantity(a.symbol, a.quantity, a.stopPrice); } catch { effQty = a.quantity; }
+  }
+  if (!(effQty > 0)) return { ok: false, error: "정규화 후 수량 0(스텝/최소 미달)." };
+  if (effQty > held + 1e-9) return { ok: false, error: `정규화 수량 ${effQty} > 실보유(매도가능) ${held}.` };
+
+  // 3) 하드리밋 — TP·SL 노셔널 각각 캡(한쪽만 우회 불가). 정규화 수량 기준.
   const quoteCurrency = broker === "binance" ? "USDT" : "KRW";
-  const tpLim = checkLimits({ symbol: a.symbol, notional: a.takeProfitPrice * a.quantity, quoteCurrency });
+  const tpLim = checkLimits({ symbol: a.symbol, notional: a.takeProfitPrice * effQty, quoteCurrency });
   if (!tpLim.ok) return { ok: false, error: `하드리밋 차단(익절): ${tpLim.reason}` };
-  const slLim = checkLimits({ symbol: a.symbol, notional: a.stopPrice * a.quantity, quoteCurrency });
+  const slLim = checkLimits({ symbol: a.symbol, notional: a.stopPrice * effQty, quoteCurrency });
   if (!slLim.ok) return { ok: false, error: `하드리밋 차단(손절): ${slLim.reason}` };
 
-  // 4) 2단계 confirmToken(fail-CLOSED) — kind:oco + tp/sl/qty 해시 바인딩(변조·교차사용 차단).
-  const hash = orderHash({ broker, market, kind: "oco", symbol: a.symbol, quantity: a.quantity, tp: a.takeProfitPrice, sl: a.stopPrice, sll: a.stopLimitPrice ?? null, env: gate.env });
+  // 4) 2단계 confirmToken(fail-CLOSED) — kind:oco + tp/sl/qty(effQty) 해시 바인딩. INV-1: 해시=프리뷰=주문 수량 일치.
+  const hash = orderHash({ broker, market, kind: "oco", symbol: a.symbol, quantity: effQty, tp: a.takeProfitPrice, sl: a.stopPrice, sll: a.stopLimitPrice ?? null, env: gate.env });
   if (!a.confirmToken) {
     const token = mintToken(hash);
     return {
       ok: true, phase: "preview", needConfirm: true, confirmToken: token,
-      preview: { broker, market, env: gate.env, symbol: a.symbol, side: "sell", quantity: a.quantity, takeProfitPrice: a.takeProfitPrice, stopPrice: a.stopPrice, currentPrice: +mark.toFixed(8), held },
+      preview: { broker, market, env: gate.env, symbol: a.symbol, side: "sell", quantity: effQty, takeProfitPrice: a.takeProfitPrice, stopPrice: a.stopPrice, currentPrice: +mark.toFixed(8), held },
       note: `⚠️ ${String(gate.env).toUpperCase()} OCO 보호주문 프리뷰(익절+손절 묶음, 한쪽 체결 시 다른쪽 자동취소). 동일 인자+confirmToken으로 재호출해야 실제 주문(5분 TTL, 단일사용).`,
     };
   }
   if (!consumeToken(a.confirmToken, hash)) return { ok: false, error: "확인토큰 무효/만료/불일치 → 거절(fail-closed). 프리뷰부터 다시." };
 
-  audit({ event: "oco_attempt", broker, market, env: gate.env, symbol: a.symbol, quantity: a.quantity, tp: a.takeProfitPrice, sl: a.stopPrice });
+  audit({ event: "oco_attempt", broker, market, env: gate.env, symbol: a.symbol, quantity: effQty, tp: a.takeProfitPrice, sl: a.stopPrice });
   try {
-    const result = await got.adapter.placeOco({ symbol: a.symbol, quantity: a.quantity, takeProfitPrice: a.takeProfitPrice, stopPrice: a.stopPrice, stopLimitPrice: a.stopLimitPrice });
+    const result = await got.adapter.placeOco({ symbol: a.symbol, quantity: effQty, takeProfitPrice: a.takeProfitPrice, stopPrice: a.stopPrice, stopLimitPrice: a.stopLimitPrice });
     audit({ event: "oco_result", broker, env: gate.env, orderListId: result.orderListId, symbol: a.symbol });
     return { ok: true, phase: "executed", broker, env: gate.env, result };
   } catch (e) {
@@ -159,7 +175,13 @@ export async function getProtective(a: { broker?: Broker; symbol: string }) {
   const gate = liveGate(broker, market);
   if (!gate.allowed) return { ok: false, active: false, held: 0, error: gate.reason };
   let held = 0;
-  try { const base = a.symbol.replace(/USDT$|USDC$|BUSD$/i, ""); const ps = await got.adapter.getPositions(); held = ps.find((p) => p.symbol.toUpperCase() === base.toUpperCase())?.quantity ?? 0; } catch { held = 0; }
+  try {
+    let base = "";
+    if (typeof got.adapter.baseAssetOf === "function") base = await got.adapter.baseAssetOf(a.symbol);
+    if (!base) base = a.symbol.replace(/USDT$|USDC$|BUSD$|FDUSD$|TUSD$|DAI$|USDP$/i, "");
+    const pos = (await got.adapter.getPositions()).find((p) => p.symbol.toUpperCase() === base.toUpperCase());
+    held = pos?.free ?? pos?.quantity ?? 0; // placeProtective와 동일 의미(매도가능 free 우선)
+  } catch { held = 0; }
   let oco: { orderListId: string; tpPrice: number; slPrice: number } | null = null;
   if (typeof got.adapter.getOpenOco === "function") { try { oco = await got.adapter.getOpenOco(a.symbol); } catch { oco = null; } }
   return { ok: true, env: gate.env, held: +held, active: !!oco, orderListId: oco?.orderListId, tpPrice: oco?.tpPrice, slPrice: oco?.slPrice };

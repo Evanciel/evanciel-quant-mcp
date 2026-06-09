@@ -27,11 +27,8 @@ async function fillOrder(bot: store.BotRow, side: "buy" | "sell", qty: number, p
   const market = "spot" as "spot" | "futures"; // quant-mcp 러너는 현물만(선물 라이브는 stock-autotrade). 향후 선물 지원 시 심볼/설정 기반 분기.
   const gate = liveGate(broker, market);
   if (!gate.allowed) { store.insertLog(bot.id, "gate", `라이브 차단(${gate.reason}) → 페이퍼`); return { live: false, price, note: "게이트 차단→페이퍼" }; }
-  // 하드리밋: 노셔널캡 + 심볼 allowlist + 일일손실 서킷(스캐너 멀티심볼도 심볼별로 통과해야 실주문).
   // 통화 인식: Binance=USDT, 한투/키움=KRW → 통화별 안전 기본 캡(KRW 봇에 달러캡 적용 버그 방지).
   const quoteCurrency = broker === "binance" ? "USDT" : "KRW";
-  const lim = checkLimits({ symbol, notional: price * qty, quoteCurrency });
-  if (!lim.ok) { store.insertLog(bot.id, "gate", `하드리밋(${symbol} ${lim.reason}) → 페이퍼`); return { live: false, price, note: "리밋→페이퍼" }; }
   const got = getAdapter(broker, market);
   if (!got) { store.insertLog(bot.id, "gate", "어댑터 없음 → 페이퍼"); return { live: false, price, note: "어댑터없음→페이퍼" }; }
   // 거래소 LOT_SIZE(stepSize)로 수량 정규화 — 안 하면 -1013(LOT_SIZE) 거부. minQty/minNotional 보정 포함.
@@ -48,6 +45,9 @@ async function fillOrder(bot: store.BotRow, side: "buy" | "sell", qty: number, p
     } catch { /* 잔고조회 실패 시 정규화수량 그대로(하드리밋이 상한) */ }
   }
   if (!(nq > 0)) { store.insertLog(bot.id, "gate", `수량 정규화/잔고 0(${qty}→${nq}) → 페이퍼`); return { live: false, price, note: "수량0→페이퍼" }; }
+  // ① 하드리밋(노셔널캡 + allowlist + 일일손실 서킷)을 '최종 제출 수량(nq)'으로 검증 — minNotional 상향분이 캡 넘으면 차단(검증==제출).
+  const lim = checkLimits({ symbol, notional: price * nq, quoteCurrency });
+  if (!lim.ok) { store.insertLog(bot.id, "gate", `하드리밋(${symbol} ${lim.reason}) → 페이퍼`); return { live: false, price, note: "리밋→페이퍼" }; }
   // clientOrderId ≤36자([a-zA-Z0-9-_]): botId 앞 8자 + side + base36 시각(~18자). 모호한 실패 후 reconcile에 재사용.
   const cid = `o${bot.id.slice(0, 8)}${side[0]}${Date.now().toString(36)}`;
   audit({ event: "bot_order_attempt", botId: bot.id, broker, env: gate.env, symbol, side, qty: nq, price });

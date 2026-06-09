@@ -26,6 +26,7 @@ export interface Position {
   symbol: string;
   name: string;
   quantity: number;
+  free?: number; // 현물 매도가능 수량(=balances.free, 잠긴 OCO 제외). 미설정=미상(선물/KIS/키움).
   avgPrice: number;
   currentPrice: number;
   pnl: number;
@@ -89,4 +90,6 @@ export interface BrokerAdapter {
   cancelOco?(symbol: string, orderListId: string): Promise<boolean>;
   // 심볼의 상주 OCO 조회(세션 간 상태 복원·중복 등록 방지). 없으면 null.
   getOpenOco?(symbol: string): Promise<{ orderListId: string; tpPrice: number; slPrice: number } | null>;
+  // 거래소 권위 base 자산(비표준 quote 페어 정확). 미구현 어댑터=undefined → 호출측 정규식 폴백.
+  baseAssetOf?(symbol: string): Promise<string>;
 }
