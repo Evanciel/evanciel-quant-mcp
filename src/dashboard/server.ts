@@ -10,7 +10,7 @@ import * as store from "../store/db.js";
 import { BROKER_FIELDS, upsertCredentials, credentialStatus, credentialsPath, enableLive, disableLive, liveSettingsStatus, type BrokerKey } from "../setup/credentials.js";
 import { fetchKlines } from "../data/binance-public.js";
 import { getAdapter } from "../brokers/index.js";
-import { sma, ema, rsi, macd, bollingerBands, stochastic, adx } from "../core/strategy/indicators.js";
+import { sma, ema, rsi, macd, bollingerBands, stochastic, adx, atr, williamsR, stochasticRsi, cci, supertrend, vwap, mfi, parabolicSar, ichimoku, roc, obv, donchian } from "../core/strategy/indicators.js";
 
 /** POST 본문을 안전하게 읽어 JSON 파싱(상한 64KB, 자격증명 폼은 작음). */
 function readJsonBody(req: IncomingMessage): Promise<Record<string, unknown>> {
@@ -231,22 +231,55 @@ function collectIndicatorSpecs(node: unknown, acc: { ind: string; period: number
 }
 const seriesAt = (bars: { time: number }[], vals: number[]): ChartPt[] =>
   vals.map((v, i) => ({ time: bars[i].time, value: v })).filter((p) => Number.isFinite(p.value));
-/** 봉 + 지표 specs → 가격패널 오버레이(SMA/EMA/BB) + 보조지표(RSI/MACD/Stoch/ADX). 전략과 동일 함수로 계산. */
-function buildIndicators(bars: { time: number; open: number; high: number; low: number; close: number }[], specs: { ind: string; period: number }[]) {
-  const closes = bars.map((b) => b.close), highs = bars.map((b) => b.high), lows = bars.map((b) => b.low);
+// 차트 토글로 켤 수 있는 지표 화이트리스트(임의 입력 차단). 키는 "ind" 또는 "ind:period".
+const TOGGLE_INDS = new Set(["sma", "ema", "bollinger", "vwap", "supertrend", "parabolic_sar", "donchian", "ichimoku", "rsi", "macd", "stochastic", "stochastic_rsi", "adx", "atr", "cci", "mfi", "williams_r", "obv", "roc"]);
+/** 클라이언트가 보낸 토글 지표 목록(["bollinger","sma:50",...])을 spec으로 파싱. 화이트리스트 외엔 무시. 최대 12개. */
+function parseToggleInds(inds?: string[]): { ind: string; period: number }[] {
+  if (!Array.isArray(inds)) return [];
+  const out: { ind: string; period: number }[] = [];
+  for (const raw of inds.slice(0, 12)) {
+    const [name, per] = String(raw).toLowerCase().split(":");
+    if (!TOGGLE_INDS.has(name)) continue;
+    out.push({ ind: name, period: Number(per) || 0 });
+  }
+  return out;
+}
+
+/** 봉 + 지표 specs → 가격패널 오버레이 + 보조지표. 전략과 동일 core 함수로 계산(차트≡전략).
+ *  거래량 지표(VWAP/MFI/OBV)는 bars.volume 필요. 차트 토글로 켠 지표도 같은 경로로 그림. */
+function buildIndicators(bars: { time: number; open: number; high: number; low: number; close: number; volume?: number }[], specs: { ind: string; period: number }[]) {
+  const closes = bars.map((b) => b.close), highs = bars.map((b) => b.high), lows = bars.map((b) => b.low), vols = bars.map((b) => b.volume ?? 0);
   const overlays: { label: string; color: string; data: ChartPt[] }[] = [];
   const oscillators: { label: string; color: string; data: ChartPt[]; guides?: number[] }[] = [];
   const C = ["#eab308", "#38bdf8", "#a855f7", "#f97316", "#22d3ee"]; let ci = 0;
+  const seen = new Set<string>();
   for (const sp of specs) {
+    const key = `${sp.ind}:${sp.period}`; if (seen.has(key)) continue; seen.add(key); // 전략+토글 중복 제거
     const color = C[ci++ % C.length], p = sp.period;
-    if (sp.ind === "sma") overlays.push({ label: `SMA(${p})`, color, data: seriesAt(bars, sma(closes, p)) });
-    else if (sp.ind === "ema") overlays.push({ label: `EMA(${p})`, color, data: seriesAt(bars, ema(closes, p)) });
-    else if (sp.ind === "bollinger" || sp.ind === "bollinger_bands") { const bb = bollingerBands(closes, p || 20); overlays.push({ label: `BB(${p || 20})상`, color: "#64748b", data: seriesAt(bars, bb.upper) }, { label: "BB중", color, data: seriesAt(bars, bb.middle) }, { label: "BB하", color: "#64748b", data: seriesAt(bars, bb.lower) }); }
-    else if (sp.ind === "rsi") oscillators.push({ label: `RSI(${p})`, color, data: seriesAt(bars, rsi(closes, p)), guides: [30, 70] });
-    else if (sp.ind === "macd") { const m = macd(closes); oscillators.push({ label: "MACD", color, data: seriesAt(bars, m.macd) }, { label: "Signal", color: "#f97316", data: seriesAt(bars, m.signal) }); }
-    else if (sp.ind === "stochastic") { const st = stochastic(closes, highs, lows, p || 14); oscillators.push({ label: "Stoch %K", color, data: seriesAt(bars, st.k), guides: [20, 80] }); }
-    else if (sp.ind === "adx") oscillators.push({ label: `ADX(${p})`, color, data: seriesAt(bars, adx(closes, highs, lows, p || 14)), guides: [25] });
-    // vwap/supertrend/ichimoku/cci/mfi/williams_r 등은 차트 미지원 → 스킵(설명 패널엔 표기됨)
+    switch (sp.ind) {
+      // ── 가격패널 오버레이 ──
+      case "sma": overlays.push({ label: `SMA(${p})`, color, data: seriesAt(bars, sma(closes, p)) }); break;
+      case "ema": overlays.push({ label: `EMA(${p})`, color, data: seriesAt(bars, ema(closes, p)) }); break;
+      case "bollinger": case "bollinger_bands": { const bb = bollingerBands(closes, p || 20); overlays.push({ label: `BB(${p || 20})상`, color: "#64748b", data: seriesAt(bars, bb.upper) }, { label: "BB중", color, data: seriesAt(bars, bb.middle) }, { label: "BB하", color: "#64748b", data: seriesAt(bars, bb.lower) }); break; }
+      case "vwap": overlays.push({ label: `VWAP(${p || 20})`, color: "#f59e0b", data: seriesAt(bars, vwap(closes, highs, lows, vols, p || 20)) }); break;
+      case "supertrend": overlays.push({ label: "슈퍼트렌드", color: "#34d399", data: seriesAt(bars, supertrend(closes, highs, lows, p || 10, 3)) }); break;
+      case "parabolic_sar": case "parabolicsar": overlays.push({ label: "Parabolic SAR", color: "#c084fc", data: seriesAt(bars, parabolicSar(highs, lows)) }); break;
+      case "donchian": { const dc = donchian(highs, lows, p || 20); overlays.push({ label: `돈치안(${p || 20})상`, color: "#64748b", data: seriesAt(bars, dc.upper) }, { label: "돈치안하", color: "#64748b", data: seriesAt(bars, dc.lower) }); break; }
+      case "ichimoku": { const ic = ichimoku(highs, lows); overlays.push({ label: "전환선", color: "#38bdf8", data: seriesAt(bars, ic.tenkan) }, { label: "기준선", color: "#f43f5e", data: seriesAt(bars, ic.kijun) }, { label: "선행A", color: "#22c55e", data: seriesAt(bars, ic.senkouA) }, { label: "선행B", color: "#eab308", data: seriesAt(bars, ic.senkouB) }); break; }
+      // ── 하단 보조지표(오실레이터) ──
+      case "rsi": oscillators.push({ label: `RSI(${p || 14})`, color, data: seriesAt(bars, rsi(closes, p || 14)), guides: [30, 70] }); break;
+      case "macd": { const m = macd(closes); oscillators.push({ label: "MACD", color, data: seriesAt(bars, m.macd) }, { label: "Signal", color: "#f97316", data: seriesAt(bars, m.signal) }); break; }
+      case "stochastic": { const st = stochastic(closes, highs, lows, p || 14); oscillators.push({ label: "Stoch %K", color, data: seriesAt(bars, st.k), guides: [20, 80] }); break; }
+      case "stochastic_rsi": { const sr = stochasticRsi(closes); oscillators.push({ label: "StochRSI %K", color, data: seriesAt(bars, sr.k), guides: [20, 80] }); break; }
+      case "adx": oscillators.push({ label: `ADX(${p || 14})`, color, data: seriesAt(bars, adx(closes, highs, lows, p || 14)), guides: [25] }); break;
+      case "atr": oscillators.push({ label: `ATR(${p || 14})`, color, data: seriesAt(bars, atr(closes, highs, lows, p || 14)) }); break;
+      case "cci": oscillators.push({ label: `CCI(${p || 20})`, color, data: seriesAt(bars, cci(closes, highs, lows, p || 20)), guides: [-100, 100] }); break;
+      case "mfi": oscillators.push({ label: `MFI(${p || 14})`, color, data: seriesAt(bars, mfi(closes, highs, lows, vols, p || 14)), guides: [20, 80] }); break;
+      case "williams_r": case "williamsr": oscillators.push({ label: `윌리엄스%R(${p || 14})`, color, data: seriesAt(bars, williamsR(closes, highs, lows, p || 14)), guides: [-80, -20] }); break;
+      case "obv": oscillators.push({ label: "OBV", color, data: seriesAt(bars, obv(closes, vols, p || 20)) }); break;
+      case "roc": oscillators.push({ label: `ROC(${p || 12})`, color, data: seriesAt(bars, roc(closes, p || 12)), guides: [0] }); break;
+      default: break; // 미지원 지표는 스킵(설명 패널엔 표기됨)
+    }
   }
   return { overlays, oscillators };
 }
@@ -323,29 +356,33 @@ async function livePrices() {
   }
   return out;
 }
-async function candlesFor(botId: string, tf?: string): Promise<{ ok: boolean; symbol?: string; broker?: string; ccy?: string; interval?: string; intraday?: boolean; bars?: { time: number; open: number; high: number; low: number; close: number }[]; overlays?: unknown[]; oscillators?: unknown[]; priceLines?: unknown[]; markers?: unknown[]; error?: string }> {
+async function candlesFor(botId: string, tf?: string, inds?: string[]): Promise<{ ok: boolean; symbol?: string; broker?: string; ccy?: string; interval?: string; intraday?: boolean; bars?: { time: number; open: number; high: number; low: number; close: number }[]; overlays?: unknown[]; oscillators?: unknown[]; priceLines?: unknown[]; markers?: unknown[]; error?: string }> {
   const bot = store.getBot(botId);
   if (!bot) return { ok: false, error: "봇 없음" };
   const toUnix = (s: string) => Math.floor(Date.parse(s.length === 10 ? s + "T00:00:00Z" : s) / 1000);
   try {
     const iv = (tf && /^(1m|5m|15m|30m|1h|4h|1d|1w|1mo)$/.test(tf)) ? tf : secToTfToken(bot.interval_seconds);
     const intraday = /m$/.test(iv) || /h$/.test(iv); // 분/시간봉이면 시각 표시
-    let raw: { date: string; datetime?: string; open: number; high: number; low: number; close: number }[] = [];
+    let raw: { date: string; datetime?: string; open: number; high: number; low: number; close: number; volume?: number }[] = [];
     if (bot.broker === "binance") {
       raw = await fetchKlines(bot.symbol, TF_BINANCE[iv] ?? "1d", iv === "1mo" ? 120 : 200);
     } else {
-      const ad = getAdapter(bot.broker as Parameters<typeof getAdapter>[0], "spot")?.adapter as { getCandles?: (s: string, i: string, n: number) => Promise<{ date: string; datetime?: string; open: number; high: number; low: number; close: number }[]> } | undefined;
+      const ad = getAdapter(bot.broker as Parameters<typeof getAdapter>[0], "spot")?.adapter as { getCandles?: (s: string, i: string, n: number) => Promise<{ date: string; datetime?: string; open: number; high: number; low: number; close: number; volume?: number }[]> } | undefined;
       if (!ad?.getCandles) return { ok: false, error: `${bot.broker} 차트 데이터 미지원(키 필요할 수 있음)` };
       raw = await ad.getCandles(bot.symbol, iv, 200);
     }
     const bars = raw
-      .map((b) => ({ time: toUnix(b.datetime ?? b.date), open: b.open, high: b.high, low: b.low, close: b.close }))
+      .map((b) => ({ time: toUnix(b.datetime ?? b.date), open: b.open, high: b.high, low: b.low, close: b.close, volume: b.volume ?? 0 }))
       .filter((b) => Number.isFinite(b.time) && b.close > 0)
       .sort((a, b) => a.time - b.time)
       .filter((b, i, arr) => i === 0 || b.time !== arr[i - 1].time);
     const ccy = bot.broker === "binance" ? "USD" : "KRW";
     const comp = store.getComposite(bot.composite_strategy_id);
-    const ind = buildIndicators(bars, collectIndicatorSpecs(comp?.root_node ?? {}));
+    // 전략이 쓰는 지표(차트≡전략) + 사용자가 차트에서 토글로 켠 지표를 합쳐서 그림.
+    const stratSpecs = collectIndicatorSpecs(comp?.root_node ?? {});
+    const stratInds = new Set(stratSpecs.map((s) => s.ind)); // 전략이 이미 그리는 지표 종류
+    const toggleSpecs = parseToggleInds(inds).filter((s) => !stratInds.has(s.ind)); // 중복 종류(예: 전략 RSI + 토글 RSI) 제거
+    const ind = buildIndicators(bars, [...stratSpecs, ...toggleSpecs]);
     const priceLines = buildPriceLines(bot, comp, ccy);
     const markers = buildMarkers(bot, bars, ccy);
     return { ok: true, symbol: bot.symbol, broker: bot.broker, ccy, interval: iv, intraday, bars, overlays: ind.overlays, oscillators: ind.oscillators, priceLines, markers };
@@ -396,7 +433,9 @@ export function startDashboard(port = 7788): Promise<{ url: string; port: number
       res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify(snapshot())); return;
     }
     if (u.pathname === "/api/candles") {
-      candlesFor(u.searchParams.get("bot") || "", u.searchParams.get("tf") || undefined).then((r) => {
+      const indParam = u.searchParams.get("ind"); // 토글로 켠 지표(쉼표구분: "bollinger,vwap,sma:50")
+      const indList = indParam ? indParam.split(",").map((s) => s.trim()).filter(Boolean) : undefined;
+      candlesFor(u.searchParams.get("bot") || "", u.searchParams.get("tf") || undefined, indList).then((r) => {
         res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify(r));
       }).catch((e) => { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify({ ok: false, error: e instanceof Error ? e.message : "err" })); });
       return;
@@ -510,6 +549,10 @@ h1{font-size:18px;margin:0 0 2px}.sub{color:#8a94a6;font-size:12px;margin-bottom
 .tfbar{display:flex;gap:6px;margin:2px 0 10px;flex-wrap:wrap}
 .tfb{font-size:12px;color:#8a94a6;background:#0e1320;border:1px solid #222838;border-radius:6px;padding:4px 10px;cursor:pointer;user-select:none}
 .tfb:hover{color:#e6e6e6}.tfb.on{background:#7aa2f7;color:#0b0e14;border-color:#7aa2f7;font-weight:700}
+.indbar{display:flex;gap:5px;margin:0 0 10px;flex-wrap:wrap;align-items:center}
+.indbar .indlbl{font-size:11px;color:#6b7588;margin-right:2px}
+.ib{font-size:11px;color:#8a94a6;background:#0e1320;border:1px solid #222838;border-radius:5px;padding:3px 8px;cursor:pointer;user-select:none}
+.ib:hover{color:#e6e6e6}.ib.on{background:#22d3ee;color:#0b0e14;border-color:#22d3ee;font-weight:700}
 .gear{cursor:pointer;color:#7aa2f7;font-size:12px;margin-left:8px;user-select:none}.gear:hover{color:#a8c0ff}
 .setpanel{margin-bottom:16px}
 .setnote{font-size:12px;color:#8a94a6;margin:8px 0 12px;line-height:1.5}.setnote code{background:#0e1320;padding:1px 5px;border-radius:4px;color:#c9d2e3}
@@ -554,6 +597,7 @@ h1{font-size:18px;margin:0 0 2px}.sub{color:#8a94a6;font-size:12px;margin-bottom
 <div class="cmodal" id="chartModal"><div class="cmbox">
   <div class="cmhead"><b id="chartTitle">차트</b><span class="cmx" onclick="closeChart()">닫기 ✕</span></div>
   <div class="tfbar" id="chartTf"></div>
+  <div class="indbar" id="chartInds"></div>
   <div id="chartBody"></div>
   <div class="cmnote" id="chartNote"></div>
 </div></div>
@@ -598,16 +642,24 @@ function posRow(p,c){const px=prices.get(p.symbol)??p.entryAvg;const sign=p.side
  return {html,abs};}
 function statusPill(sum,hasPos){if(!hasPos)return '<span class="pill wait">⚪ 대기 중</span>';
  return sum>=0?'<span class="pill win">🟢 수익 중</span>':'<span class="pill lose">🔴 손실 중</span>';}
-let _chart=null,_chartId=null;
+let _chart=null,_chartId=null,_chartTf=null;
 function tfLabel(t){return {'1m':'1분','5m':'5분','30m':'30분','1h':'1시간','1d':'일','1w':'주','1mo':'월'}[t]||t;}
 function renderTfButtons(cur){var tfs=['1m','5m','30m','1h','1d','1w','1mo'];
  document.getElementById('chartTf').innerHTML=tfs.map(function(t){return '<span class="tfb'+(t===cur?' on':'')+'" data-tf="'+t+'" onclick="openChart(_chartId,this.dataset.tf)">'+tfLabel(t)+'</span>';}).join('');}
+// 트뷰처럼 켜고끄는 지표 메뉴. 가격 위 오버레이 + 하단 보조지표. 선택은 localStorage 보존(틱 재렌더에도 유지).
+var IND_MENU=[{k:'bollinger',n:'볼린저'},{k:'vwap',n:'VWAP'},{k:'supertrend',n:'슈퍼트렌드'},{k:'ichimoku',n:'일목'},{k:'sma:50',n:'SMA50'},{k:'ema:200',n:'EMA200'},{k:'parabolic_sar',n:'SAR'},{k:'donchian',n:'돈치안'},{k:'rsi',n:'RSI'},{k:'macd',n:'MACD'},{k:'stochastic',n:'스토캐스틱'},{k:'adx',n:'ADX'},{k:'atr',n:'ATR'},{k:'cci',n:'CCI'},{k:'mfi',n:'MFI'},{k:'williams_r',n:'윌리엄스%R'},{k:'obv',n:'OBV'},{k:'roc',n:'ROC'}];
+var chartInds=new Set();try{chartInds=new Set(JSON.parse(localStorage.getItem('qmInds')||'[]'))}catch(e){}
+function saveInds(){try{localStorage.setItem('qmInds',JSON.stringify(Array.from(chartInds)))}catch(e){}}
+function renderIndButtons(){document.getElementById('chartInds').innerHTML='<span class="indlbl">지표 추가</span>'+IND_MENU.map(function(m){return '<span class="ib'+(chartInds.has(m.k)?' on':'')+'" data-k="'+m.k+'" onclick="toggleInd(this.dataset.k)">'+m.n+'</span>'}).join('');}
+function toggleInd(k){if(chartInds.has(k))chartInds.delete(k);else chartInds.add(k);saveInds();openChart(_chartId,_chartTf);}
 function openChart(id,tf){_chartId=id;var modal=document.getElementById('chartModal'),body=document.getElementById('chartBody');
  document.getElementById('chartTitle').textContent='차트 불러오는 중…';modal.style.display='flex';
- fetch('/api/candles?token='+TOKEN+'&bot='+encodeURIComponent(id)+(tf?'&tf='+tf:'')).then(function(r){return r.json()}).then(function(d){
+ var indQ=chartInds.size?'&ind='+encodeURIComponent(Array.from(chartInds).join(',')):'';
+ fetch('/api/candles?token='+TOKEN+'&bot='+encodeURIComponent(id)+(tf?'&tf='+tf:'')+indQ).then(function(r){return r.json()}).then(function(d){
   if(!d.ok){document.getElementById('chartTitle').textContent='차트 오류: '+(d.error||'불러오기 실패');document.getElementById('chartTf').innerHTML='';return;}
   var isC=d.broker==='binance';
-  renderTfButtons(d.interval);
+  _chartTf=d.interval;
+  renderTfButtons(d.interval);renderIndButtons();
   var names=[].concat((d.overlays||[]).map(function(o){return o.label}),(d.oscillators||[]).map(function(o){return o.label}));
   document.getElementById('chartTitle').textContent=(isC?coin(d.symbol):d.symbol)+' · '+(isC?'Binance':'키움증권')+' '+tfLabel(d.interval)+(names.length?'  ·  '+names.join(' '):'');
   document.getElementById('chartNote').textContent=(isC?'데이터: Binance 공개 시세':'데이터: 키움증권 실제 차트(모의)')+((d.priceLines||[]).length?'  ·  노랑=진입 빨강=손절 초록=익절':'')+((d.markers||[]).length?'  ·  ▲진입/매수 ▼청산':'');
