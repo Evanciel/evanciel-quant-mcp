@@ -237,13 +237,17 @@ const TOGGLE_INDS = new Set(["sma", "ema", "bollinger", "vwap", "supertrend", "p
 function parseToggleInds(inds?: string[]): { ind: string; period: number }[] {
   if (!Array.isArray(inds)) return [];
   const out: { ind: string; period: number }[] = [];
-  for (const raw of inds.slice(0, 12)) {
+  for (const raw of inds) {
     const [name, per] = String(raw).toLowerCase().split(":");
-    if (!TOGGLE_INDS.has(name)) continue;
+    if (!TOGGLE_INDS.has(name)) continue; // 화이트리스트(volume 등 클라전용 키 제외)를 먼저 → 슬롯 낭비 방지
     out.push({ ind: name, period: Number(per) || 0 });
+    if (out.length >= 12) break; // 화이트 통과분 기준 최대 12개
   }
   return out;
 }
+// 지표별 기본 기간(buildIndicators의 `p||N` 폴백과 동일). 전략·토글 spec의 '실제 사용 기간' 정규화에 사용.
+const IND_DEFAULT: Record<string, number> = { sma: 14, ema: 14, bollinger: 20, vwap: 20, supertrend: 10, donchian: 20, rsi: 14, stochastic: 14, adx: 14, atr: 14, cci: 20, mfi: 14, williams_r: 14, obv: 20, roc: 12 };
+const normPeriod = (ind: string, p: number) => (p > 0 ? p : (IND_DEFAULT[ind] ?? 14));
 
 /** 봉 + 지표 specs → 가격패널 오버레이 + 보조지표. 전략과 동일 core 함수로 계산(차트≡전략).
  *  거래량 지표(VWAP/MFI/OBV)는 bars.volume 필요. 차트 토글로 켠 지표도 같은 경로로 그림. */
@@ -382,8 +386,10 @@ async function candlesFor(botId: string, tf?: string, inds?: string[]): Promise<
     const comp = store.getComposite(bot.composite_strategy_id);
     // 전략이 쓰는 지표(차트≡전략) + 사용자가 차트에서 토글로 켠 지표를 합쳐서 그림.
     const stratSpecs = collectIndicatorSpecs(comp?.root_node ?? {});
-    const stratInds = new Set(stratSpecs.map((s) => s.ind)); // 전략이 이미 그리는 지표 종류
-    const toggleSpecs = parseToggleInds(inds).filter((s) => !stratInds.has(s.ind)); // 중복 종류(예: 전략 RSI + 토글 RSI) 제거
+    // (종류, 정규화 기간) 단위 dedup: 전략 RSI(14)와 토글 RSI(30)은 다른 키라 둘 다 그림(기간 조정 반영),
+    // 전략 RSI(14)와 토글 RSI(14)만 1개로 합침. (종류만 비교하면 기간 다른 토글이 통째 폐기되던 버그 수정)
+    const stratKeys = new Set(stratSpecs.map((s) => `${s.ind}:${normPeriod(s.ind, s.period)}`));
+    const toggleSpecs = parseToggleInds(inds).filter((s) => !stratKeys.has(`${s.ind}:${normPeriod(s.ind, s.period)}`));
     const ind = buildIndicators(bars, [...stratSpecs, ...toggleSpecs]);
     const priceLines = buildPriceLines(bot, comp, ccy);
     const markers = buildMarkers(bot, bars, ccy);
@@ -675,6 +681,7 @@ function setupKline(sym,tf){closeKline();
  try{var ws=new WebSocket('wss://stream.binance.com:9443/ws/'+sym.toLowerCase()+'@kline_'+klineIv(tf));_klineWs=ws;
   ws.onmessage=function(e){if(!_priceSeries||ws!==_klineWs)return;var k;try{k=JSON.parse(e.data).k}catch(err){return;}if(!k)return;
    try{_priceSeries.update({time:Math.floor(k.t/1000),open:+k.o,high:+k.h,low:+k.l,close:+k.c})}catch(err){}
+   if(_volSeries){try{_volSeries.update({time:Math.floor(k.t/1000),value:Number(k.v)||0,color:(+k.c>=+k.o?'rgba(16,185,129,.45)':'rgba(244,63,94,.45)')})}catch(err){}} // 거래량 막대도 현재봉 동기(k.v=base거래량)
    if(k.x)refreshSeries();}; // 봉 마감 → 지표/마커 재계산
  }catch(e){}}
 // 봉 마감 시 1회: 지표 다시 받아 기존 시리즈에 setData(차트/패널 유지 → 깜빡임·줌리셋 없음).
@@ -717,17 +724,18 @@ function onChartClick(param){
     _drawings.push({kind:'trend',p1:a,p2:b,series:ls});
     return;
   }
-  if(_drawMode==='erase'){ // 클릭 가격에 가장 가까운 드로잉 1개 삭제
-    var pt2=clickToPoint(param);if(!pt2)return;var best=-1,bd=1e18;
-    for(var i=0;i<_drawings.length;i++){var dr=_drawings[i];var dp;
-      if(dr.kind==='hline')dp=Math.abs(dr.price-pt2.price);
-      else{ // 추세선: 클릭 time에서 보간한 가격과의 차
-        var s1=dr.p1,s2=dr.p2;var yp;
+  if(_drawMode==='erase'){ // 클릭 근처(화면 픽셀 임계 내) 드로잉 1개만 삭제. 빈 영역 클릭=미삭제.
+    var pt2=clickToPoint(param);if(!pt2)return;var best=-1,bd=1e18,cy=param.point.y,THRESH=8; // px
+    for(var i=0;i<_drawings.length;i++){var dr=_drawings[i],yp;
+      if(dr.kind==='hline')yp=dr.price;
+      else{ // 추세선: 클릭 time에서 보간한 가격(범위 밖이면 엔드포인트 클램프)
+        var s1=dr.p1,s2=dr.p2;
         if(pt2.time<=s1.time)yp=s1.price;else if(pt2.time>=s2.time)yp=s2.price;
-        else yp=s1.price+(s2.price-s1.price)*((pt2.time-s1.time)/(s2.time-s1.time));
-        dp=Math.abs(yp-pt2.price);}
-      if(dp<bd){bd=dp;best=i;}}
-    if(best>=0){removeDrawing(_drawings[best]);_drawings.splice(best,1);}
+        else yp=s1.price+(s2.price-s1.price)*((pt2.time-s1.time)/(s2.time-s1.time));}
+      var yc;try{yc=_priceSeries.priceToCoordinate(yp)}catch(e){yc=null;}
+      if(yc==null)continue;var dpx=Math.abs(yc-cy);
+      if(dpx<bd){bd=dpx;best=i;}}
+    if(best>=0&&bd<=THRESH){removeDrawing(_drawings[best]);_drawings.splice(best,1);} // 임계 내일 때만 삭제
     return;
   }
 }
@@ -753,7 +761,7 @@ var IND_PARAM={sma:{n:'SMA',d:50,min:2,max:400},ema:{n:'EMA',d:200,min:2,max:400
 // 토글키('ind' 또는 'ind:period') → {base, period}. period 미지정 시 IND_PARAM 기본값. 기간 없는 지표는 null.
 function splitIndKey(k){var a=String(k).split(':');var base=a[0];var per=parseInt(a[1],10);var meta=IND_PARAM[base];if(!meta)return null;return {base:base,period:(per>0?per:meta.d),meta:meta};}
 // 켜진 지표의 기간만 칩으로 렌더. 기간 없는/복합 지표는 자동 제외(splitIndKey=null).
-function renderIndParams(){var el=document.getElementById('chartIndParams');if(!el)return;var chips=[];Array.from(chartInds).forEach(function(k){var s=splitIndKey(k);if(!s)return;chips.push('<span class="pchip" title="'+s.base+' 기간">'+s.meta.n+' <span>기간</span> <input type="number" min="'+s.meta.min+'" max="'+s.meta.max+'" value="'+s.period+'" data-base="'+s.base+'" data-old="'+k+'" onchange="setIndPeriod(this)" onkeydown="if(event.key===&quot;Enter&quot;)this.blur()"></span>');});el.innerHTML=chips.length?'<span class="pplbl">기간 조정</span>'+chips.join(''):'';}
+function renderIndParams(){var el=document.getElementById('chartIndParams');if(!el)return;var chips=[];Array.from(chartInds).forEach(function(k){var s=splitIndKey(k);if(!s)return;chips.push('<span class="pchip" title="'+s.base+' 기간">'+s.meta.n+'('+s.period+') <span>기간</span> <input type="number" min="'+s.meta.min+'" max="'+s.meta.max+'" value="'+s.period+'" data-base="'+s.base+'" data-old="'+k+'" onchange="setIndPeriod(this)" onkeydown="if(event.key===&quot;Enter&quot;)this.blur()"></span>');});el.innerHTML=chips.length?'<span class="pplbl">기간 조정</span>'+chips.join(''):'';}
 // 숫자입력 변경 → chartInds에서 옛 키 제거 후 'base:newperiod'로 교체 → 저장 → 차트 재요청.
 function setIndPeriod(inp){var base=inp.dataset.base,oldKey=inp.dataset.old,meta=IND_PARAM[base];if(!meta)return;var v=parseInt(inp.value,10);if(!(v>0))v=meta.d;if(v<meta.min)v=meta.min;if(v>meta.max)v=meta.max;var newKey=base+':'+v;if(newKey===oldKey){inp.value=v;return;}chartInds.delete(oldKey);chartInds.add(newKey);saveInds();openChart(_chartId,_chartTf);}
 function saveInds(){try{localStorage.setItem('qmInds',JSON.stringify(Array.from(chartInds)))}catch(e){}}
@@ -763,7 +771,7 @@ function toggleInd(k){if(chartInds.has(k))chartInds.delete(k);else chartInds.add
 function volData(bars){return (bars||[]).map(function(b){return {time:b.time,value:Number(b.volume)||0,color:(b.close>=b.open?'rgba(16,185,129,.45)':'rgba(244,63,94,.45)')};});}
 function openChart(id,tf){_chartId=id;var modal=document.getElementById('chartModal'),body=document.getElementById('chartBody');
  document.getElementById('chartTitle').textContent='차트 불러오는 중…';modal.style.display='flex';
- var indQ=chartInds.size?'&ind='+encodeURIComponent(Array.from(chartInds).join(',')):'';
+ var _oq=Array.from(chartInds).filter(function(k){return k!=='volume'});var indQ=_oq.length?'&ind='+encodeURIComponent(_oq.join(',')):''; // volume=클라전용(refreshSeries와 일관)
  fetch('/api/candles?token='+TOKEN+'&bot='+encodeURIComponent(id)+(tf?'&tf='+tf:'')+indQ).then(function(r){return r.json()}).then(function(d){
   if(!d.ok){document.getElementById('chartTitle').textContent='차트 오류: '+(d.error||'불러오기 실패');document.getElementById('chartTf').innerHTML='';return;}
   var isC=d.broker==='binance';
