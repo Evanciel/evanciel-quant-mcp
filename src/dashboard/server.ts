@@ -13,6 +13,9 @@ import { fetchKlines } from "../data/binance-public.js";
 import { getAdapter } from "../brokers/index.js";
 import { placeOrder, placeProtective, cancelProtective, getProtective, getAccount } from "../mcp-server/live-handlers.js"; // 수동주문·OCO보호주문·실계정조회 — 안전경로 재사용
 import { computePositionDrift } from "../core/execution/reconcile.js"; // 페이퍼 vs 거래소 실보유 드리프트(정보용)
+import { detectAlerts, Debouncer, AlertBuffer, type BotAlertView } from "../core/alerts/alerts.js"; // 봇 이벤트 알림 엔진(순수)
+import { sendWebhook, validateWebhookUrl } from "../core/alerts/webhook.js"; // Slack/Discord 배달(SSRF 게이트)
+import { alertSettingsStatus } from "../setup/credentials.js";
 import type { Broker } from "../brokers/safety.js";
 import { sma, ema, rsi, macd, bollingerBands, stochastic, adx, atr, williamsR, stochasticRsi, cci, supertrend, vwap, mfi, parabolicSar, ichimoku, roc, obv, donchian } from "../core/strategy/indicators.js";
 
@@ -27,6 +30,39 @@ function readJsonBody(req: IncomingMessage): Promise<Record<string, unknown>> {
 }
 
 let _state: { url: string; port: number; token: string } | null = null;
+
+// ── 알림 엔진(서버 단일 인스턴스) ──────────────────────────────────────────
+const _alertBuf = new AlertBuffer(200);
+const _alertDebounce = new Debouncer();
+let _prevBotViews: BotAlertView[] | null = null;
+let _alertTimer: ReturnType<typeof setInterval> | null = null;
+const ALERT_DEBOUNCE_MS = 60_000; // 같은 봇·같은 종류는 60s 내 1회만 웹훅(폭주 억제)
+
+/** snapshot 봇 행 → 알림 비교용 뷰(필요 필드만). openCount=열린 포지션 수. */
+function toBotViews(bots: ReturnType<typeof snapshot>["bots"]): BotAlertView[] {
+  return bots.map((b) => ({
+    id: b.id, name: b.name, symbol: b.symbol, status: b.status,
+    closes: b.closes, realizedPnl: b.realizedPnl,
+    openCount: Array.isArray(b.positions) ? b.positions.length : 0,
+  }));
+}
+
+/** 5초마다 봇 상태를 비교해 알림 생성 → 버퍼 적재 + (활성 시)디바운스된 웹훅 발사. */
+async function alertTick(): Promise<void> {
+  try {
+    const views = toBotViews(snapshot().bots);
+    const events = detectAlerts(_prevBotViews, views, Date.now(), new Date().toISOString());
+    _prevBotViews = views;
+    if (events.length === 0) return;
+    _alertBuf.push(events); // 피드엔 모든 엣지 이벤트 적재(detectAlerts가 변화시에만 emit → 스팸 없음)
+    const enabled = (process.env.ALERT_ENABLED ?? "").trim() === "true";
+    const url = (process.env.ALERT_WEBHOOK_URL ?? "").trim();
+    if (!enabled || !url) return;
+    const now = Date.now();
+    const toSend = events.filter((e) => _alertDebounce.shouldSend(`${e.kind}:${e.botId}`, now, ALERT_DEBOUNCE_MS));
+    if (toSend.length > 0) await sendWebhook(url, toSend); // 실패는 흡수(로깅 0, URL 시크릿)
+  } catch { /* 알림 엔진 장애가 대시보드를 죽이지 않음 */ }
+}
 
 const OPS: Record<string, string> = { lt: "<", gt: ">", lte: "≤", gte: "≥", cross_above: "↗상향돌파", cross_below: "↘하향돌파", eq: "=", in: "∈", between: "사이" };
 /** 복합 전략 트리 → 사람이 읽는 한 줄 요약("어떤 무기로 짰는지"). */
@@ -449,7 +485,7 @@ function snapshot() {
       activity: store.recentLogs(b.id, 6).map((l) => ({ ts: l.ts, action: l.action, detail: l.detail })),
     };
   });
-  return { bots, updatedAt: new Date().toISOString() };
+  return { bots, alerts: _alertBuf.recent(20), updatedAt: new Date().toISOString() };
 }
 
 function okHost(req: IncomingMessage): boolean {
@@ -519,9 +555,43 @@ export function startDashboard(port = 7788): Promise<{ url: string; port: number
       }).catch((e) => { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify({ ok: false, configured: true, error: e instanceof Error ? e.message : "err" })); });
       return;
     }
+    // 알림: GET=최근 피드 + 설정상태(웹훅 URL 마스킹) / POST=설정 갱신(검증) 또는 테스트 발사.
+    if (u.pathname === "/api/alerts") {
+      if (req.method === "GET") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true, alerts: _alertBuf.recent(50), config: alertSettingsStatus() }));
+        return;
+      }
+      if (req.method === "POST") {
+        readJsonBody(req).then(async (body) => {
+          // 테스트 발사: 현재 저장된 웹훅으로 샘플 1건(저장값 사용, 본문에 URL 안 받음).
+          if (body.test === true) {
+            const url = (process.env.ALERT_WEBHOOK_URL ?? "").trim();
+            if (!url) { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify({ ok: false, error: "웹훅 URL 미설정" })); return; }
+            const r = await sendWebhook(url, [{ id: "test", ts: new Date().toISOString(), level: "info", kind: "test", message: "quant-mcp 알림 테스트 — 정상 연결" }]);
+            res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify({ ok: r.ok, status: r.status, error: r.error }));
+            return;
+          }
+          // 설정 갱신: 웹훅 URL은 저장 전 SSRF 검증(실패 시 저장 안 함). enabled 토글.
+          const updates: Record<string, string> = {};
+          if (typeof body.webhookUrl === "string" && body.webhookUrl.trim()) {
+            const v = validateWebhookUrl(body.webhookUrl);
+            if (!v.ok) { res.writeHead(400, { "content-type": "application/json" }); res.end(JSON.stringify({ ok: false, error: v.error })); return; }
+            updates.ALERT_WEBHOOK_URL = v.url!;
+          }
+          if (typeof body.enabled === "boolean") updates.ALERT_ENABLED = body.enabled ? "true" : "false";
+          if (Object.keys(updates).length > 0) upsertCredentials(updates); // 키 로깅/에코 0
+          res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify({ ok: true, config: alertSettingsStatus() }));
+        }).catch((e) => { res.writeHead(400, { "content-type": "application/json" }); res.end(JSON.stringify({ ok: false, error: e instanceof Error ? e.message : "bad request" })); });
+        return;
+      }
+      res.writeHead(405).end("method not allowed"); return;
+    }
     if (u.pathname === "/events") {
       res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
-      const send = () => res.write(`data: ${JSON.stringify(snapshot())}\n\n`);
+      // SSE 드레인: res.write가 false(클라 백프레셔/느린 소비자)면 다음 틱 스킵 → 버퍼 폭증 방지. close 시 인터벌 정리.
+      let _busy = false;
+      const send = () => { if (_busy) return; const ok = res.write(`data: ${JSON.stringify(snapshot())}\n\n`); if (!ok) { _busy = true; res.once("drain", () => { _busy = false; }); } };
       send();
       const iv = setInterval(send, 5000);
       req.on("close", () => clearInterval(iv));
@@ -626,6 +696,7 @@ export function startDashboard(port = 7788): Promise<{ url: string; port: number
     server.listen(port, "127.0.0.1", () => {
       const url = `http://127.0.0.1:${port}/?token=${token}`;
       _state = { url, port, token };
+      if (!_alertTimer) { _prevBotViews = toBotViews(snapshot().bots); _alertTimer = setInterval(() => { void alertTick(); }, 5000); _alertTimer.unref?.(); } // 알림 엔진 시동(기준선 선적재)
       resolve({ url, port });
     });
   });
@@ -675,6 +746,7 @@ h1{font-size:18px;margin:0 0 2px}.sub{color:#8a94a6;font-size:12px;margin-bottom
 .envb.safe{background:rgba(122,162,247,.18);color:#7aa2f7}.envb.live{background:rgba(244,63,94,.22);color:#f43f5e}
 .obig{background:#7aa2f7;color:#0b0e14;border:0;border-radius:8px;padding:9px 16px;font-weight:700;font-size:13px;cursor:pointer;margin-top:10px}.obig.danger{background:#f43f5e;color:#fff}
 .acctpanel{grid-column:1/-1;margin-top:4px;border-color:#2a3550}.acctpanel .k{font-size:13px}
+.alertfeed{margin-top:14px}.alertrow{display:flex;gap:8px;align-items:baseline;padding:5px 0;border-top:1px solid #1c2433;font-size:13px}.alertrow:first-child{border-top:0}.alertrow .at{color:#6b7689;font-size:11px;flex:0 0 auto;min-width:58px}.alertrow .am{color:#cfd6e4;flex:1}.alertrow.critical .am{color:#ff6b6b}.alertrow.warn .am{color:#ffc24b}.alertrow .ad{font-size:14px;flex:0 0 auto}.alertempty{color:#6b7689;font-size:13px;padding:6px 0}
 .cmodal{display:none;position:fixed;inset:0;background:rgba(0,0,0,.66);z-index:50;align-items:center;justify-content:center;padding:16px}
 .cmbox{background:#121622;border:1px solid #222838;border-radius:14px;padding:14px;width:min(900px,94vw)}
 .cmhead{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}
@@ -731,6 +803,7 @@ h1{font-size:18px;margin:0 0 2px}.sub{color:#8a94a6;font-size:12px;margin-bottom
   <div class="setnote">🔒 키는 이 컴퓨터의 <code id="credpath">~/.quant-mcp/credentials.env</code> 파일에만 저장돼요(소유자 전용). 화면·채팅·인터넷으로 절대 새어나가지 않고, 한 번 저장하면 다시 보이지 않아요(보안). 발급처는 거래소(예: Binance) 설정에서 받으세요.</div>
   <div id="setbody"></div>
   <div id="setlive" class="livebox"></div>
+  <div id="setalert" class="livebox"></div>
   <div id="setmsg" class="setmsg"></div>
 </div>
 <div class="hdr">
@@ -740,6 +813,7 @@ h1{font-size:18px;margin:0 0 2px}.sub{color:#8a94a6;font-size:12px;margin-bottom
 </div>
 <div class="pos" id="pos"></div>
 <div class="empty" id="empty">아직 봇이 없어요. 자비스에게 "전략 만들어서 봇 돌려줘"라고 말해보세요.</div>
+<div class="card alertfeed" id="alertfeed" style="display:none"><div class="row"><div><b>🔔 알림</b> <span class="hint">봇 이벤트(진입·청산·오류) 실시간</span></div></div><div id="alertlist"></div></div>
 <div class="cmodal" id="chartModal"><div class="cmbox">
   <div class="cmhead"><b id="chartTitle">차트</b><span class="cmx" onclick="closeChart()">닫기 ✕</span></div>
   <div class="tfbar" id="chartTf"></div>
@@ -1207,8 +1281,33 @@ function loadSettings(){fetch('/api/credentials?token='+TOKEN).then(r=>r.json())
   h+='<button class="savebtn" data-broker="'+esc(b)+'">저장</button>';
   sec.innerHTML=h;body.appendChild(sec);
   sec.querySelector('.savebtn').addEventListener('click',()=>saveBroker(b,sec));}
- renderLive(d.live);
+ renderLive(d.live);loadAlertConfig();
 });}
+// 알림 설정(Slack/Discord 웹훅). URL은 SSRF 검증 후에만 저장, 화면엔 마스킹만 표시.
+function loadAlertConfig(){fetch('/api/alerts?token='+TOKEN).then(function(r){return r.json()}).then(function(d){if(d&&d.config)renderAlertCfg(d.config);}).catch(function(){});}
+function renderAlertCfg(c){var box=document.getElementById('setalert');if(!box)return;
+ var on=c.enabled;
+ var h='<div class="lh"><span>🔔 알림(웹훅)</span><span class="'+(on?'on':'off')+'">'+(on?'🟢 켜짐':'⚪ 꺼짐')+'</span></div>';
+ h+='<div class="ld">봇 진입·청산·오류를 Slack/Discord로 받아요. 웹훅 URL은 이 컴퓨터에만 저장(마스킹), Slack·Discord 호스트만 허용(SSRF 차단).</div>';
+ h+='<div class="fld"><label>웹훅 URL</label><input id="alurl" type="password" autocomplete="off" spellcheck="false" placeholder="'+(c.webhookSet?'저장됨: '+esc(c.webhookMasked)+' (바꾸려면 입력)':'https://hooks.slack.com/services/… 또는 discord.com/api/webhooks/…')+'"></div>';
+ h+='<label class="ld" style="display:flex;gap:7px;align-items:center;cursor:pointer"><input type="checkbox" id="alon"'+(on?' checked':'')+'> 알림 보내기 켜기</label>';
+ h+='<div style="display:flex;gap:8px;margin-top:6px"><button class="savebtn" id="alsave">저장</button><button class="savebtn" id="altest" style="background:#26344d">테스트 발사</button></div>';
+ box.innerHTML=h;
+ box.querySelector('#alsave').addEventListener('click',saveAlertCfg);
+ box.querySelector('#altest').addEventListener('click',testAlert);
+}
+function saveAlertCfg(){var msg=document.getElementById('setmsg');var url=document.getElementById('alurl').value.trim();var en=document.getElementById('alon').checked;
+ var body={enabled:en};if(url)body.webhookUrl=url;
+ msg.className='setmsg';msg.textContent='알림 설정 저장 중…';
+ fetch('/api/alerts?token='+TOKEN,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)})
+  .then(function(r){return r.json()}).then(function(d){if(d.ok){msg.className='setmsg ok';msg.textContent='✅ 알림 설정 저장됨.';renderAlertCfg(d.config);}
+   else{msg.className='setmsg err';msg.textContent='저장 실패: '+(d.error||'알 수 없음');}})
+  .catch(function(e){msg.className='setmsg err';msg.textContent='저장 실패: '+e.message;});}
+function testAlert(){var msg=document.getElementById('setmsg');msg.className='setmsg';msg.textContent='테스트 발사 중…';
+ fetch('/api/alerts?token='+TOKEN,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({test:true})})
+  .then(function(r){return r.json()}).then(function(d){if(d.ok){msg.className='setmsg ok';msg.textContent='✅ 테스트 알림 전송됨(채널 확인).';}
+   else{msg.className='setmsg err';msg.textContent='전송 실패: '+(d.error||'알 수 없음');}})
+  .catch(function(e){msg.className='setmsg err';msg.textContent='전송 실패: '+e.message;});}
 function renderLive(live){const box=document.getElementById('setlive');if(!box)return;
  const on=live&&live.masterOn;
  let h='<div class="lh"><span>💸 실거래 모드</span><span class="'+(on?'on':'off')+'">'+(on?'🟢 켜짐(실돈)':'⚪ 꺼짐(연습/페이퍼)')+'</span></div>';
@@ -1268,8 +1367,16 @@ function acctPanelHtml(bk,ccy,ra){
 function cancelAcctProtect(bk,sym,olid){if(!olid){alert('orderListId 없음');return;}
  fetch('/api/protect/cancel?token='+TOKEN,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({broker:bk,symbol:sym,orderListId:olid})}).then(function(r){return r.json()}).then(function(){loadRealAccounts();}).catch(function(){});}
 function loadPrices(){fetch('/api/prices?token='+TOKEN).then(function(r){return r.json()}).then(function(d){if(d&&d.prices){for(const k in d.prices)prices.set(k,d.prices[k]);render();}}).catch(function(){});} // KR 현재가 폴링(~45s) → 카드 평가손익 실값
+function renderAlerts(list){var el=document.getElementById('alertfeed');if(!el)return;var arr=list||[];
+ if(!arr.length){el.style.display='none';return;}
+ el.style.display='block';
+ var icon=function(l){return l==='critical'?'🔴':l==='warn'?'🟡':'🟢';};
+ document.getElementById('alertlist').innerHTML=arr.slice(0,12).map(function(a){
+   var t=new Date(a.ts);var hh=('0'+t.getHours()).slice(-2)+':'+('0'+t.getMinutes()).slice(-2)+':'+('0'+t.getSeconds()).slice(-2);
+   return '<div class="alertrow '+esc(a.level)+'"><span class="ad">'+icon(a.level)+'</span><span class="at">'+hh+'</span><span class="am">'+esc(a.message)+'</span></div>';
+ }).join('');}
 const es=new EventSource('/events?token='+TOKEN);
-es.onmessage=e=>{const s=JSON.parse(e.data);bots=s.bots;document.getElementById('upd').textContent=new Date(s.updatedAt).toLocaleTimeString();subscribe();render()};
+es.onmessage=e=>{const s=JSON.parse(e.data);bots=s.bots;document.getElementById('upd').textContent=new Date(s.updatedAt).toLocaleTimeString();subscribe();render();renderAlerts(s.alerts)};
 render();loadBalances();setTimeout(loadPrices,2500);setInterval(loadBalances,60000);setInterval(loadPrices,45000);
 setTimeout(loadRealAccounts,1500);setInterval(loadRealAccounts,60000); // 거래소 실계정 패널 폴링
 </script></div></body></html>`;

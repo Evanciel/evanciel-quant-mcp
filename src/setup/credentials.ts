@@ -38,7 +38,16 @@ export const BROKER_FIELDS: Record<BrokerKey, { key: string; label: string; secr
 /** 라이브 운영 설정(브로커 무관 글로벌). 마법사/대시보드가 키와 함께 저장 → "키만 넣으면 바로 매매" 친화. */
 export const LIVE_SETTING_KEYS = ["LIVE_TRADING_ENABLED", "LIVE_MAX_NOTIONAL", "LIVE_SYMBOL_ALLOWLIST", "LIVE_DAILY_LOSS_LIMIT"] as const;
 
-const ALL_KEYS = new Set([...Object.values(BROKER_FIELDS).flat().map((f) => f.key), ...LIVE_SETTING_KEYS]);
+/** 알림 설정. ALERT_WEBHOOK_URL은 토큰 포함 → 시크릿 취급(마스킹). ALERT_ENABLED=on/off. */
+export const ALERT_SETTING_KEYS = ["ALERT_WEBHOOK_URL", "ALERT_ENABLED"] as const;
+
+const ALL_KEYS = new Set([...Object.values(BROKER_FIELDS).flat().map((f) => f.key), ...LIVE_SETTING_KEYS, ...ALERT_SETTING_KEYS]);
+
+/** 알림 설정 상태(웹훅 URL은 마스킹). 대시보드 표시용 — 평문 URL 절대 반환 안 함. */
+export function alertSettingsStatus(): { enabled: boolean; webhookSet: boolean; webhookMasked: string } {
+  const url = (process.env.ALERT_WEBHOOK_URL ?? "").trim();
+  return { enabled: (process.env.ALERT_ENABLED ?? "").trim() === "true", webhookSet: !!url, webhookMasked: mask(url) };
+}
 
 /** 통화 인식 안전 기본값(표시/안내용 라벨). 실제 캡 적용은 safety.ts LIVE_DEFAULTS_BY_CCY(USDT/KRW). */
 export const LIVE_DEFAULTS = { USDT: { cap: "100", dailyLoss: "50" }, KRW: { cap: "150000", dailyLoss: "75000" } } as const;
