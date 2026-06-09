@@ -250,14 +250,16 @@ function parseToggleInds(inds?: string[]): { ind: string; period: number }[] {
 function buildIndicators(bars: { time: number; open: number; high: number; low: number; close: number; volume?: number }[], specs: { ind: string; period: number }[]) {
   const closes = bars.map((b) => b.close), highs = bars.map((b) => b.high), lows = bars.map((b) => b.low), vols = bars.map((b) => b.volume ?? 0);
   const overlays: { label: string; color: string; data: ChartPt[] }[] = [];
-  const oscillators: { label: string; color: string; data: ChartPt[]; guides?: number[] }[] = [];
+  // 오실레이터는 "그룹"(=지표 하나)당 별도 패널. 같은 그룹의 여러 선(MACD+Signal)은 한 패널에 함께.
+  type OscSeries = { label: string; color: string; data: ChartPt[] };
+  const oscGroups: { title: string; guides?: number[]; series: OscSeries[] }[] = [];
   const C = ["#eab308", "#38bdf8", "#a855f7", "#f97316", "#22d3ee"]; let ci = 0;
   const seen = new Set<string>();
   for (const sp of specs) {
     const key = `${sp.ind}:${sp.period}`; if (seen.has(key)) continue; seen.add(key); // 전략+토글 중복 제거
     const color = C[ci++ % C.length], p = sp.period;
     switch (sp.ind) {
-      // ── 가격패널 오버레이 ──
+      // ── 가격패널 오버레이(pane 0) ──
       case "sma": overlays.push({ label: `SMA(${p})`, color, data: seriesAt(bars, sma(closes, p)) }); break;
       case "ema": overlays.push({ label: `EMA(${p})`, color, data: seriesAt(bars, ema(closes, p)) }); break;
       case "bollinger": case "bollinger_bands": { const bb = bollingerBands(closes, p || 20); overlays.push({ label: `BB(${p || 20})상`, color: "#64748b", data: seriesAt(bars, bb.upper) }, { label: "BB중", color, data: seriesAt(bars, bb.middle) }, { label: "BB하", color: "#64748b", data: seriesAt(bars, bb.lower) }); break; }
@@ -266,22 +268,22 @@ function buildIndicators(bars: { time: number; open: number; high: number; low: 
       case "parabolic_sar": case "parabolicsar": overlays.push({ label: "Parabolic SAR", color: "#c084fc", data: seriesAt(bars, parabolicSar(highs, lows)) }); break;
       case "donchian": { const dc = donchian(highs, lows, p || 20); overlays.push({ label: `돈치안(${p || 20})상`, color: "#64748b", data: seriesAt(bars, dc.upper) }, { label: "돈치안하", color: "#64748b", data: seriesAt(bars, dc.lower) }); break; }
       case "ichimoku": { const ic = ichimoku(highs, lows); overlays.push({ label: "전환선", color: "#38bdf8", data: seriesAt(bars, ic.tenkan) }, { label: "기준선", color: "#f43f5e", data: seriesAt(bars, ic.kijun) }, { label: "선행A", color: "#22c55e", data: seriesAt(bars, ic.senkouA) }, { label: "선행B", color: "#eab308", data: seriesAt(bars, ic.senkouB) }); break; }
-      // ── 하단 보조지표(오실레이터) ──
-      case "rsi": oscillators.push({ label: `RSI(${p || 14})`, color, data: seriesAt(bars, rsi(closes, p || 14)), guides: [30, 70] }); break;
-      case "macd": { const m = macd(closes); oscillators.push({ label: "MACD", color, data: seriesAt(bars, m.macd) }, { label: "Signal", color: "#f97316", data: seriesAt(bars, m.signal) }); break; }
-      case "stochastic": { const st = stochastic(closes, highs, lows, p || 14); oscillators.push({ label: "Stoch %K", color, data: seriesAt(bars, st.k), guides: [20, 80] }); break; }
-      case "stochastic_rsi": { const sr = stochasticRsi(closes); oscillators.push({ label: "StochRSI %K", color, data: seriesAt(bars, sr.k), guides: [20, 80] }); break; }
-      case "adx": oscillators.push({ label: `ADX(${p || 14})`, color, data: seriesAt(bars, adx(closes, highs, lows, p || 14)), guides: [25] }); break;
-      case "atr": oscillators.push({ label: `ATR(${p || 14})`, color, data: seriesAt(bars, atr(closes, highs, lows, p || 14)) }); break;
-      case "cci": oscillators.push({ label: `CCI(${p || 20})`, color, data: seriesAt(bars, cci(closes, highs, lows, p || 20)), guides: [-100, 100] }); break;
-      case "mfi": oscillators.push({ label: `MFI(${p || 14})`, color, data: seriesAt(bars, mfi(closes, highs, lows, vols, p || 14)), guides: [20, 80] }); break;
-      case "williams_r": case "williamsr": oscillators.push({ label: `윌리엄스%R(${p || 14})`, color, data: seriesAt(bars, williamsR(closes, highs, lows, p || 14)), guides: [-80, -20] }); break;
-      case "obv": oscillators.push({ label: "OBV", color, data: seriesAt(bars, obv(closes, vols, p || 20)) }); break;
-      case "roc": oscillators.push({ label: `ROC(${p || 12})`, color, data: seriesAt(bars, roc(closes, p || 12)), guides: [0] }); break;
+      // ── 하단 보조지표(지표당 독립 패널) ──
+      case "rsi": oscGroups.push({ title: `RSI(${p || 14})`, guides: [30, 70], series: [{ label: `RSI(${p || 14})`, color, data: seriesAt(bars, rsi(closes, p || 14)) }] }); break;
+      case "macd": { const m = macd(closes); oscGroups.push({ title: "MACD", series: [{ label: "MACD", color, data: seriesAt(bars, m.macd) }, { label: "Signal", color: "#f97316", data: seriesAt(bars, m.signal) }] }); break; }
+      case "stochastic": { const st = stochastic(closes, highs, lows, p || 14); oscGroups.push({ title: "Stoch", guides: [20, 80], series: [{ label: "Stoch %K", color, data: seriesAt(bars, st.k) }] }); break; }
+      case "stochastic_rsi": { const sr = stochasticRsi(closes); oscGroups.push({ title: "StochRSI", guides: [20, 80], series: [{ label: "StochRSI %K", color, data: seriesAt(bars, sr.k) }] }); break; }
+      case "adx": oscGroups.push({ title: `ADX(${p || 14})`, guides: [25], series: [{ label: `ADX(${p || 14})`, color, data: seriesAt(bars, adx(closes, highs, lows, p || 14)) }] }); break;
+      case "atr": oscGroups.push({ title: `ATR(${p || 14})`, series: [{ label: `ATR(${p || 14})`, color, data: seriesAt(bars, atr(closes, highs, lows, p || 14)) }] }); break;
+      case "cci": oscGroups.push({ title: `CCI(${p || 20})`, guides: [-100, 100], series: [{ label: `CCI(${p || 20})`, color, data: seriesAt(bars, cci(closes, highs, lows, p || 20)) }] }); break;
+      case "mfi": oscGroups.push({ title: `MFI(${p || 14})`, guides: [20, 80], series: [{ label: `MFI(${p || 14})`, color, data: seriesAt(bars, mfi(closes, highs, lows, vols, p || 14)) }] }); break;
+      case "williams_r": case "williamsr": oscGroups.push({ title: `윌리엄스%R(${p || 14})`, guides: [-80, -20], series: [{ label: `윌리엄스%R(${p || 14})`, color, data: seriesAt(bars, williamsR(closes, highs, lows, p || 14)) }] }); break;
+      case "obv": oscGroups.push({ title: "OBV", series: [{ label: "OBV", color, data: seriesAt(bars, obv(closes, vols, p || 20)) }] }); break;
+      case "roc": oscGroups.push({ title: `ROC(${p || 12})`, guides: [0], series: [{ label: `ROC(${p || 12})`, color, data: seriesAt(bars, roc(closes, p || 12)) }] }); break;
       default: break; // 미지원 지표는 스킵(설명 패널엔 표기됨)
     }
   }
-  return { overlays, oscillators };
+  return { overlays, oscGroups };
 }
 /** 봇 포지션 + composite 리스크 → 차트 수평선(진입가/손절/익절). */
 function buildPriceLines(bot: { symbol: string; position_state?: unknown }, comp: { market?: string; stop_loss_percent?: number | null; take_profit_percent?: number | null } | null | undefined, ccy: string) {
@@ -356,7 +358,7 @@ async function livePrices() {
   }
   return out;
 }
-async function candlesFor(botId: string, tf?: string, inds?: string[]): Promise<{ ok: boolean; symbol?: string; broker?: string; ccy?: string; interval?: string; intraday?: boolean; bars?: { time: number; open: number; high: number; low: number; close: number }[]; overlays?: unknown[]; oscillators?: unknown[]; priceLines?: unknown[]; markers?: unknown[]; error?: string }> {
+async function candlesFor(botId: string, tf?: string, inds?: string[]): Promise<{ ok: boolean; symbol?: string; broker?: string; ccy?: string; interval?: string; intraday?: boolean; bars?: { time: number; open: number; high: number; low: number; close: number }[]; overlays?: unknown[]; oscGroups?: unknown[]; priceLines?: unknown[]; markers?: unknown[]; error?: string }> {
   const bot = store.getBot(botId);
   if (!bot) return { ok: false, error: "봇 없음" };
   const toUnix = (s: string) => Math.floor(Date.parse(s.length === 10 ? s + "T00:00:00Z" : s) / 1000);
@@ -385,7 +387,7 @@ async function candlesFor(botId: string, tf?: string, inds?: string[]): Promise<
     const ind = buildIndicators(bars, [...stratSpecs, ...toggleSpecs]);
     const priceLines = buildPriceLines(bot, comp, ccy);
     const markers = buildMarkers(bot, bars, ccy);
-    return { ok: true, symbol: bot.symbol, broker: bot.broker, ccy, interval: iv, intraday, bars, overlays: ind.overlays, oscillators: ind.oscillators, priceLines, markers };
+    return { ok: true, symbol: bot.symbol, broker: bot.broker, ccy, interval: iv, intraday, bars, overlays: ind.overlays, oscGroups: ind.oscGroups, priceLines, markers };
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : "candles 실패" };
   }
@@ -575,7 +577,7 @@ h1{font-size:18px;margin:0 0 2px}.sub{color:#8a94a6;font-size:12px;margin-bottom
 .lstat{font-size:12px;color:#c9d2e3;margin-top:8px;line-height:1.6}.lstat b{color:#e6e6e6}
 @media(max-width:560px){.fld{grid-template-columns:1fr}}
 @media(max-width:560px){.wrap{padding:14px}.hdr{grid-template-columns:1fr 1fr}.pos{grid-template-columns:1fr}.v{font-size:20px}.sym{font-size:14px}}
-</style><script src="https://unpkg.com/lightweight-charts@4.2.3/dist/lightweight-charts.standalone.production.js"></script></head><body><div class="wrap">
+</style><script src="https://unpkg.com/lightweight-charts@5.2.0/dist/lightweight-charts.standalone.production.js"></script></head><body><div class="wrap">
 <h1>내 자동매매 현황 <span class="dot"></span></h1>
 <div class="sub">봇이 알아서 사고팔아요 · 실시간 시세 반영 <span id="upd" style="color:#8a94a6">—</span>
   <span class="gear" onclick="toggleSettings()">⚙️ API 키 설정</span></div>
@@ -660,22 +662,27 @@ function openChart(id,tf){_chartId=id;var modal=document.getElementById('chartMo
   var isC=d.broker==='binance';
   _chartTf=d.interval;
   renderTfButtons(d.interval);renderIndButtons();
-  var names=[].concat((d.overlays||[]).map(function(o){return o.label}),(d.oscillators||[]).map(function(o){return o.label}));
+  var oscGroups=d.oscGroups||[];
+  var names=[].concat((d.overlays||[]).map(function(o){return o.label}),oscGroups.reduce(function(a,g){return a.concat((g.series||[]).map(function(s){return s.label}))},[]));
   document.getElementById('chartTitle').textContent=(isC?coin(d.symbol):d.symbol)+' · '+(isC?'Binance':'키움증권')+' '+tfLabel(d.interval)+(names.length?'  ·  '+names.join(' '):'');
-  document.getElementById('chartNote').textContent=(isC?'데이터: Binance 공개 시세':'데이터: 키움증권 실제 차트(모의)')+((d.priceLines||[]).length?'  ·  노랑=진입 빨강=손절 초록=익절':'')+((d.markers||[]).length?'  ·  ▲진입/매수 ▼청산':'');
+  document.getElementById('chartNote').textContent=(isC?'데이터: Binance 공개 시세':'데이터: 키움증권 실제 차트(모의)')+((d.priceLines||[]).length?'  ·  노랑=진입 빨강=손절 초록=익절':'')+((d.markers||[]).length?'  ·  ▲진입/매수 ▼청산':'')+(oscGroups.length?'  ·  보조지표 '+oscGroups.length+'개 패널 분리':'');
   body.innerHTML='';if(_chart){try{_chart.remove()}catch(e){}_chart=null;}
-  if(!window.LightweightCharts){document.getElementById('chartTitle').textContent='차트 라이브러리 로드 실패(오프라인?)';return;}
-  var hasOsc=(d.oscillators||[]).length>0;
-  var chart=LightweightCharts.createChart(body,{width:body.clientWidth,height:380,layout:{background:{color:'#0e1320'},textColor:'#c9d2e3'},grid:{vertLines:{color:'#1a2030'},horzLines:{color:'#1a2030'}},timeScale:{timeVisible:!!d.intraday,borderColor:'#222838'},rightPriceScale:{borderColor:'#222838',scaleMargins:hasOsc?{top:0.05,bottom:0.32}:{top:0.08,bottom:0.08}}});
-  var s=chart.addCandlestickSeries({upColor:'#10b981',downColor:'#f43f5e',borderVisible:false,wickUpColor:'#10b981',wickDownColor:'#f43f5e'});
+  if(!window.LightweightCharts||!LightweightCharts.CandlestickSeries){document.getElementById('chartTitle').textContent='차트 라이브러리 로드 실패(오프라인?)';return;}
+  var nOsc=oscGroups.length;
+  var H=Math.min(820,360+nOsc*120); body.style.height=H+'px'; // 보조지표 패널 수만큼 세로 확장
+  var chart=LightweightCharts.createChart(body,{width:body.clientWidth,height:H,layout:{background:{color:'#0e1320'},textColor:'#c9d2e3',panes:{separatorColor:'#222838',separatorHoverColor:'#3a4254',enableResize:true}},grid:{vertLines:{color:'#1a2030'},horzLines:{color:'#1a2030'}},timeScale:{timeVisible:!!d.intraday,borderColor:'#222838'},rightPriceScale:{borderColor:'#222838'}});
+  // pane 0 = 가격(캔들 + 오버레이)
+  var s=chart.addSeries(LightweightCharts.CandlestickSeries,{upColor:'#10b981',downColor:'#f43f5e',borderVisible:false,wickUpColor:'#10b981',wickDownColor:'#f43f5e'},0);
   s.setData(d.bars||[]);
-  (d.overlays||[]).forEach(function(o){var ls=chart.addLineSeries({color:o.color,lineWidth:2,priceLineVisible:false,lastValueVisible:false,crosshairMarkerVisible:false});ls.setData(o.data||[]);});
-  if(hasOsc){
-   (d.oscillators||[]).forEach(function(o,i){var ls=chart.addLineSeries({color:o.color,lineWidth:1.5,priceScaleId:'osc',priceLineVisible:false,lastValueVisible:false,crosshairMarkerVisible:false});ls.setData(o.data||[]);
-    if(i===0&&o.guides)o.guides.forEach(function(g){ls.createPriceLine({price:g,color:'#3a4254',lineWidth:1,lineStyle:1,axisLabelVisible:false});});});
-   chart.priceScale('osc').applyOptions({scaleMargins:{top:0.74,bottom:0.02},borderColor:'#222838'});}
+  (d.overlays||[]).forEach(function(o){var ls=chart.addSeries(LightweightCharts.LineSeries,{color:o.color,lineWidth:2,priceLineVisible:false,lastValueVisible:false,crosshairMarkerVisible:false},0);ls.setData(o.data||[]);});
+  // 보조지표: 그룹(지표)당 별도 패널(pane 1,2,…). 같은 그룹의 선들은 한 패널.
+  oscGroups.forEach(function(g,gi){var pane=gi+1;
+   (g.series||[]).forEach(function(se,si){var ls=chart.addSeries(LightweightCharts.LineSeries,{color:se.color,lineWidth:1.5,priceLineVisible:false,lastValueVisible:false,crosshairMarkerVisible:false},pane);ls.setData(se.data||[]);
+    if(si===0&&g.guides)g.guides.forEach(function(gv){ls.createPriceLine({price:gv,color:'#3a4254',lineWidth:1,lineStyle:1,axisLabelVisible:false});});});});
+  // 패널 높이 비율: 가격 패널을 크게(3), 보조 패널은 각 1.
+  try{var panes=chart.panes();if(panes&&panes.length){panes[0].setStretchFactor(3);for(var pi=1;pi<panes.length;pi++)panes[pi].setStretchFactor(1);}}catch(e){}
   (d.priceLines||[]).forEach(function(pl){s.createPriceLine({price:pl.price,color:pl.color,lineWidth:1,lineStyle:2,axisLabelVisible:true,title:pl.title});});
-  if(d.markers&&d.markers.length){try{s.setMarkers(d.markers)}catch(e){}}
+  if(d.markers&&d.markers.length){try{LightweightCharts.createSeriesMarkers(s,d.markers)}catch(e){}}
   chart.timeScale().fitContent();_chart=chart;
  }).catch(function(){document.getElementById('chartTitle').textContent='차트 오류(네트워크)';});}
 function closeChart(){document.getElementById('chartModal').style.display='none';if(_chart){try{_chart.remove()}catch(e){}_chart=null;}document.getElementById('chartBody').innerHTML='';}
