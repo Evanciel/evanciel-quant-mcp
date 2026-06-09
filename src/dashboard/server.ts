@@ -31,6 +31,12 @@ function readJsonBody(req: IncomingMessage): Promise<Record<string, unknown>> {
 
 let _state: { url: string; port: number; token: string } | null = null;
 
+// 실계정 응답 캐시(거래소 호출 코얼레싱) — /api/account가 매 요청마다 거래소를 때려 레이트리밋 밴나는 것 방지.
+// broker별 TTL 캐시 + in-flight 공유(동시 요청 1회 호출). 읽기전용·시크릿 없음이라 캐싱 안전.
+const _acctCache = new Map<string, { at: number; payload: string }>();
+const _acctInflight = new Map<string, Promise<string>>();
+const ACCT_TTL_MS = 15_000;
+
 // ── 알림 엔진(서버 단일 인스턴스) ──────────────────────────────────────────
 const _alertBuf = new AlertBuffer(200);
 const _alertDebounce = new Debouncer();
@@ -528,31 +534,42 @@ export function startDashboard(port = 7788): Promise<{ url: string; port: number
       return;
     }
     if (u.pathname === "/api/account") {
+      if (req.method !== "GET") { res.writeHead(405).end("method not allowed"); return; }
       // 거래소 실계정(읽기전용) — getAccount가 liveGate 경유·키/시크릿 미노출. 심볼은 서버가 봇에서만 수집(클라 주입 불가).
       const bk = (u.searchParams.get("broker") || "binance");
-      const accBots = store.listBots().filter((b) => b.broker === bk);
-      const market = accBots.some((b) => (store.getComposite(b.composite_strategy_id) as { market?: string } | undefined)?.market === "futures") ? "futures" : "spot";
-      const symbols = [...new Set(accBots.map((b) => b.symbol.toUpperCase()))];
-      // 페이퍼 보유: base 자산별 합산 qty(position_state open). 드리프트 매칭용.
-      const paperByBase = new Map<string, number>();
-      for (const b of accBots) {
-        const ps = b.position_state as { status?: string; qty?: number } | Record<string, { status?: string; qty?: number }> | null;
-        if (!ps || typeof ps !== "object") continue;
-        const base = b.symbol.toUpperCase().replace(/USDT$|USDC$|BUSD$/i, "");
-        const add = (q?: number) => { if (q && q > 0) paperByBase.set(base, (paperByBase.get(base) || 0) + q); };
-        if ((ps as { status?: string }).status === "open") add((ps as { qty?: number }).qty);
-        else for (const v of Object.values(ps as Record<string, { status?: string; qty?: number }>)) if (v?.status === "open") add(v.qty);
-      }
-      getAccount({ broker: bk as Broker, market, symbols }).then((acc) => {
-        let drift: { base: string; localQty: number; exchangeQty: number; severity: string; inSync: boolean }[] = [];
-        if (acc.ok && Array.isArray(acc.positions)) {
-          const exByBase = new Map<string, number>();
-          for (const p of acc.positions) { const k = String(p.symbol).toUpperCase(); exByBase.set(k, (exByBase.get(k) || 0) + (Number(p.quantity) || 0)); }
-          const bases = new Set<string>([...paperByBase.keys(), ...exByBase.keys()]);
-          drift = [...bases].map((base) => { const d = computePositionDrift(paperByBase.get(base) || 0, exByBase.get(base) || 0); return { base, localQty: d.localQty, exchangeQty: d.exchangeQty, severity: d.severity, inSync: d.inSync }; }).filter((d) => d.localQty > 0 || d.exchangeQty > 0);
+      const sendCached = (payload: string) => { res.writeHead(200, { "content-type": "application/json" }); res.end(payload); };
+      const cached = _acctCache.get(bk);
+      if (cached && Date.now() - cached.at < ACCT_TTL_MS) { sendCached(cached.payload); return; } // TTL 내 → 거래소 미호출
+      let inflight = _acctInflight.get(bk); // 동시요청 코얼레싱(거래소 1회만)
+      if (!inflight) {
+        const accBots = store.listBots().filter((b) => b.broker === bk);
+        const market = accBots.some((b) => (store.getComposite(b.composite_strategy_id) as { market?: string } | undefined)?.market === "futures") ? "futures" : "spot";
+        const symbols = [...new Set(accBots.map((b) => b.symbol.toUpperCase()))];
+        // 페이퍼 보유: base 자산별 합산 qty(position_state open). 드리프트 매칭용.
+        const paperByBase = new Map<string, number>();
+        for (const b of accBots) {
+          const ps = b.position_state as { status?: string; qty?: number } | Record<string, { status?: string; qty?: number }> | null;
+          if (!ps || typeof ps !== "object") continue;
+          const base = b.symbol.toUpperCase().replace(/USDT$|USDC$|BUSD$/i, "");
+          const add = (q?: number) => { if (q && q > 0) paperByBase.set(base, (paperByBase.get(base) || 0) + q); };
+          if ((ps as { status?: string }).status === "open") add((ps as { qty?: number }).qty);
+          else for (const v of Object.values(ps as Record<string, { status?: string; qty?: number }>)) if (v?.status === "open") add(v.qty);
         }
-        res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify({ ...acc, market, drift }));
-      }).catch((e) => { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify({ ok: false, configured: true, error: e instanceof Error ? e.message : "err" })); });
+        inflight = getAccount({ broker: bk as Broker, market, symbols }).then((acc) => {
+          let drift: { base: string; localQty: number; exchangeQty: number; severity: string; inSync: boolean }[] = [];
+          if (acc.ok && Array.isArray(acc.positions)) {
+            const exByBase = new Map<string, number>();
+            for (const p of acc.positions) { const k = String(p.symbol).toUpperCase(); exByBase.set(k, (exByBase.get(k) || 0) + (Number(p.quantity) || 0)); }
+            const bases = new Set<string>([...paperByBase.keys(), ...exByBase.keys()]);
+            drift = [...bases].map((base) => { const d = computePositionDrift(paperByBase.get(base) || 0, exByBase.get(base) || 0); return { base, localQty: d.localQty, exchangeQty: d.exchangeQty, severity: d.severity, inSync: d.inSync }; }).filter((d) => d.localQty > 0 || d.exchangeQty > 0);
+          }
+          const payload = JSON.stringify({ ...acc, market, drift });
+          _acctCache.set(bk, { at: Date.now(), payload }); // 성공만 캐시(실패는 즉시 재시도 허용)
+          return payload;
+        }).finally(() => { _acctInflight.delete(bk); });
+        _acctInflight.set(bk, inflight);
+      }
+      inflight.then(sendCached).catch((e) => { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify({ ok: false, configured: true, error: e instanceof Error ? e.message : "err" })); });
       return;
     }
     // 알림: GET=최근 피드 + 설정상태(웹훅 URL 마스킹) / POST=설정 갱신(검증) 또는 테스트 발사.
@@ -588,13 +605,15 @@ export function startDashboard(port = 7788): Promise<{ url: string; port: number
       res.writeHead(405).end("method not allowed"); return;
     }
     if (u.pathname === "/events") {
+      if (req.method !== "GET") { res.writeHead(405).end("method not allowed"); return; }
       res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
-      // SSE 드레인: res.write가 false(클라 백프레셔/느린 소비자)면 다음 틱 스킵 → 버퍼 폭증 방지. close 시 인터벌 정리.
+      // SSE 드레인: res.write가 false(클라 백프레셔/느린 소비자)면 다음 틱 스킵 → 버퍼 폭증 방지. close 시 인터벌+드레인 리스너 정리.
       let _busy = false;
-      const send = () => { if (_busy) return; const ok = res.write(`data: ${JSON.stringify(snapshot())}\n\n`); if (!ok) { _busy = true; res.once("drain", () => { _busy = false; }); } };
+      const onDrain = () => { _busy = false; };
+      const send = () => { if (_busy) return; const ok = res.write(`data: ${JSON.stringify(snapshot())}\n\n`); if (!ok) { _busy = true; res.once("drain", onDrain); } };
       send();
       const iv = setInterval(send, 5000);
-      req.on("close", () => clearInterval(iv));
+      req.on("close", () => { clearInterval(iv); res.removeListener("drain", onDrain); });
       return;
     }
     // 자격증명: GET=마스킹 상태(키값 미반환) / POST=upsert(화이트리스트, chmod 600, 응답도 마스킹만).

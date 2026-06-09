@@ -43,10 +43,12 @@ export const ALERT_SETTING_KEYS = ["ALERT_WEBHOOK_URL", "ALERT_ENABLED"] as cons
 
 const ALL_KEYS = new Set([...Object.values(BROKER_FIELDS).flat().map((f) => f.key), ...LIVE_SETTING_KEYS, ...ALERT_SETTING_KEYS]);
 
-/** 알림 설정 상태(웹훅 URL은 마스킹). 대시보드 표시용 — 평문 URL 절대 반환 안 함. */
+/** 알림 설정 상태. 웹훅 URL은 토큰 포함 시크릿 → 마지막 4자도 노출 안 함(호스트만 식별용 표시). */
 export function alertSettingsStatus(): { enabled: boolean; webhookSet: boolean; webhookMasked: string } {
   const url = (process.env.ALERT_WEBHOOK_URL ?? "").trim();
-  return { enabled: (process.env.ALERT_ENABLED ?? "").trim() === "true", webhookSet: !!url, webhookMasked: mask(url) };
+  let label = "(none)";
+  if (url) { try { label = `${new URL(url).hostname} (설정됨)`; } catch { label = "(설정됨)"; } } // 호스트만, 토큰 0
+  return { enabled: (process.env.ALERT_ENABLED ?? "").trim() === "true", webhookSet: !!url, webhookMasked: label };
 }
 
 /** 통화 인식 안전 기본값(표시/안내용 라벨). 실제 캡 적용은 safety.ts LIVE_DEFAULTS_BY_CCY(USDT/KRW). */

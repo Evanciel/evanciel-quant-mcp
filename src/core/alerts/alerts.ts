@@ -32,7 +32,7 @@ export interface BotAlertView {
   openCount: number; // 열린 포지션 수(extractPositions 길이 등에서 유도)
 }
 
-const won = (n: number) => (n >= 0 ? `+${n}` : `${n}`);
+const won = (n: number) => { const v = Number.isFinite(n) ? n : 0; return v >= 0 ? `+${v}` : `${v}`; };
 
 /**
  * 직전/현재 봇 스냅샷을 비교해 알림 이벤트를 생성한다(순수).
