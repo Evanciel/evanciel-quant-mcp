@@ -647,6 +647,12 @@ function statusPill(sum,hasPos){if(!hasPos)return '<span class="pill wait">⚪ �
 let _chart=null,_chartId=null,_chartTf=null,_klineWs=null,_priceSeries=null,_ovSeries=[],_oscFlat=[],_markersPrim=null,_refreshing=false,_chartPoll=null;
 function clearChartPoll(){if(_chartPoll){clearInterval(_chartPoll);_chartPoll=null;}}
 function tfLabel(t){return {'1m':'1분','5m':'5분','30m':'30분','1h':'1시간','1d':'일','1w':'주','1mo':'월'}[t]||t;}
+// 시각 표기 KST 통일: 데이터는 안 건드리고 표시만. KR 봉시각=KST벽시계가 UTC로 인코딩됨(shift 0),
+// 코인 봉시각=실제 UTC(shift +9h) → 둘 다 (shift 적용 후) UTC 게터로 읽으면 KST 벽시계가 나옴.
+function _p2(n){return n<10?'0'+n:''+n;}
+function kstTime(t){var d=new Date(t*1000);return _p2(d.getUTCHours())+':'+_p2(d.getUTCMinutes());}
+function kstDate(t){var d=new Date(t*1000);return (d.getUTCMonth()+1)+'/'+d.getUTCDate();}
+function kstFull(t){var d=new Date(t*1000);return d.getUTCFullYear()+'-'+_p2(d.getUTCMonth()+1)+'-'+_p2(d.getUTCDate())+' '+_p2(d.getUTCHours())+':'+_p2(d.getUTCMinutes());}
 // 실시간 차트(코인): 바이낸스 kline WS로 현재 봉 매 틱 갱신 + 봉 종료 시 지표 재계산(setData, 차트 재생성 없음=무깜빡).
 function klineIv(t){return t==='1mo'?'1M':t;} // 우리 토큰→바이낸스 kline 인터벌(월만 1M)
 function closeKline(){if(_klineWs){try{_klineWs.close()}catch(e){}_klineWs=null;}}
@@ -686,12 +692,18 @@ function openChart(id,tf){_chartId=id;var modal=document.getElementById('chartMo
   var oscGroups=d.oscGroups||[];
   var names=[].concat((d.overlays||[]).map(function(o){return o.label}),oscGroups.reduce(function(a,g){return a.concat((g.series||[]).map(function(s){return s.label}))},[]));
   document.getElementById('chartTitle').textContent=(isC?coin(d.symbol):d.symbol)+' · '+(isC?'Binance':'키움증권')+' '+tfLabel(d.interval)+(names.length?'  ·  '+names.join(' '):'');
-  document.getElementById('chartNote').textContent=(isC?'데이터: Binance 공개 시세 · 실시간(WS)':'데이터: 키움증권 실제 차트(모의) · 실시간(20초 폴링)')+((d.priceLines||[]).length?'  ·  노랑=진입 빨강=손절 초록=익절':'')+((d.markers||[]).length?'  ·  ▲진입/매수 ▼청산':'')+(oscGroups.length?'  ·  보조지표 '+oscGroups.length+'개 패널 분리':'');
+  document.getElementById('chartNote').textContent=(isC?'데이터: Binance 공개 시세 · 실시간(WS)':'데이터: 키움증권 실제 차트(모의) · 실시간(20초 폴링)')+'  ·  시각 KST'+((d.priceLines||[]).length?'  ·  노랑=진입 빨강=손절 초록=익절':'')+((d.markers||[]).length?'  ·  ▲진입/매수 ▼청산':'')+(oscGroups.length?'  ·  보조지표 '+oscGroups.length+'개 패널 분리':'');
   body.innerHTML='';if(_chart){try{_chart.remove()}catch(e){}_chart=null;}
   if(!window.LightweightCharts||!LightweightCharts.CandlestickSeries){document.getElementById('chartTitle').textContent='차트 라이브러리 로드 실패(오프라인?)';return;}
   var nOsc=oscGroups.length;
   var H=Math.min(820,360+nOsc*120); body.style.height=H+'px'; // 보조지표 패널 수만큼 세로 확장
-  var chart=LightweightCharts.createChart(body,{width:body.clientWidth,height:H,layout:{background:{color:'#0e1320'},textColor:'#c9d2e3',panes:{separatorColor:'#222838',separatorHoverColor:'#3a4254',enableResize:true}},grid:{vertLines:{color:'#1a2030'},horzLines:{color:'#1a2030'}},timeScale:{timeVisible:!!d.intraday,borderColor:'#222838'},rightPriceScale:{borderColor:'#222838'}});
+  var tzShift=isC?32400:0; // 코인=실제 UTC라 +9h 보정, KR=이미 KST벽시계 → 둘 다 KST로 표시
+  var chart=LightweightCharts.createChart(body,{width:body.clientWidth,height:H,
+    layout:{background:{color:'#0e1320'},textColor:'#c9d2e3',panes:{separatorColor:'#222838',separatorHoverColor:'#3a4254',enableResize:true}},
+    grid:{vertLines:{color:'#1a2030'},horzLines:{color:'#1a2030'}},
+    localization:{timeFormatter:function(t){return kstFull(t+tzShift)+' KST';}}, // 크로스헤어 시각
+    timeScale:{timeVisible:!!d.intraday,borderColor:'#222838',tickMarkFormatter:function(t,type){return type>=3?kstTime(t+tzShift):kstDate(t+tzShift);}}, // 축 눈금(type>=3=시간)
+    rightPriceScale:{borderColor:'#222838'}});
   // pane 0 = 가격(캔들 + 오버레이). 시리즈 참조 보관(실시간 갱신용).
   _ovSeries=[];_oscFlat=[];
   var s=chart.addSeries(LightweightCharts.CandlestickSeries,{upColor:'#10b981',downColor:'#f43f5e',borderVisible:false,wickUpColor:'#10b981',wickDownColor:'#f43f5e'},0);
