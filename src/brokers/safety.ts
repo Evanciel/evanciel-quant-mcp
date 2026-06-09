@@ -96,8 +96,10 @@ export function orderHash(o: Record<string, unknown>): string {
   return createHash("sha256").update(JSON.stringify(o)).digest("hex").slice(0, 16);
 }
 export function mintToken(hash: string): string {
+  const now = Date.now();
+  for (const [k, v] of TOKENS) if (v.exp <= now) TOKENS.delete(k); // 만료 토큰 스윕(미사용 프리뷰 토큰 메모리 누적 방지)
   const tok = randomBytes(12).toString("hex");
-  TOKENS.set(tok, { hash, exp: Date.now() + TTL_MS });
+  TOKENS.set(tok, { hash, exp: now + TTL_MS });
   return tok;
 }
 export function consumeToken(tok: string, hash: string): boolean {

@@ -221,14 +221,21 @@ type IndSpec = { ind: string; period: number; params: number[] }; // params[0]=p
 function collectIndicatorSpecs(node: unknown, acc: IndSpec[] = []): IndSpec[] {
   const n = node as Record<string, unknown>;
   if (!n || typeof n !== "object") return acc;
-  const push = (ind?: string, period?: number) => {
-    if (!ind) return; const k = ind.toLowerCase(); const p = period ?? 14;
-    if (!acc.some((s) => s.ind === k && s.period === p)) acc.push({ ind: k, period: p, params: [p] }); // 전략 트리=단일 period
+  // 전략 조건의 지표 파라미터를 코어 indicators.ts와 동일 키·순서로 전부 수집 → 차트≡전략(stdDev/multiplier/MACD/stochastic 포함).
+  const push = (ind?: string, params?: Record<string, number>) => {
+    if (!ind) return; const k = ind.toLowerCase();
+    let arr: number[];
+    if (k === "bollinger" || k === "bollinger_bands") arr = [params?.period ?? 20, params?.stdDev ?? 2];
+    else if (k === "supertrend") arr = [params?.period ?? 10, params?.multiplier ?? 3];
+    else if (k === "macd") arr = [params?.fast ?? 12, params?.slow ?? 26, params?.signal ?? 9];
+    else if (k === "stochastic") arr = [params?.period ?? 14, params?.dPeriod ?? 3];
+    else arr = [params?.period ?? (IND_DEFAULT[k] ?? 14)];
+    if (!acc.some((s) => s.ind === k && s.params.join(",") === arr.join(","))) acc.push({ ind: k, period: arr[0], params: arr });
   };
-  const c = n.condition as { type?: string; indicator?: string; params?: { period?: number } } | undefined;
-  if (c?.type === "indicator") push(c.indicator, c.params?.period);
-  const s = (n.strategy ?? (n.type === "leaf" ? n : null)) as { rules?: { conditions?: { indicator?: string; params?: { period?: number } }[] }[] } | null;
-  for (const r of s?.rules ?? []) for (const cond of r.conditions ?? []) push(cond.indicator, cond.params?.period);
+  const c = n.condition as { type?: string; indicator?: string; params?: Record<string, number> } | undefined;
+  if (c?.type === "indicator") push(c.indicator, c.params);
+  const s = (n.strategy ?? (n.type === "leaf" ? n : null)) as { rules?: { conditions?: { indicator?: string; params?: Record<string, number> }[] }[] } | null;
+  for (const r of s?.rules ?? []) for (const cond of r.conditions ?? []) push(cond.indicator, cond.params);
   for (const k of ["thenNode", "elseNode", "then", "else"]) if (n[k]) collectIndicatorSpecs(n[k], acc);
   for (const ch of (Array.isArray(n.children) ? n.children : [])) collectIndicatorSpecs(ch, acc);
   return acc;
@@ -264,7 +271,7 @@ const IND_EXTRA: Record<string, { defaults: number[]; min: number[]; max: number
 // 클라가 보낸 [p1,p2,...]를 지표별 기본/범위로 정규화. 단일파라미터 지표는 [normPeriod] 1개.
 function normParams(ind: string, params: number[]): number[] {
   const meta = IND_EXTRA[ind];
-  if (!meta) return [normPeriod(ind, params[0] ?? 0)];
+  if (!meta) return [Math.min(500, normPeriod(ind, params[0] ?? 0))]; // 단일 파라미터도 상한(500)으로 클램프(견고성/일관성)
   return meta.defaults.map((def, i) => {
     const v = params[i];
     if (typeof v !== "number" || !(v > 0)) return def;
@@ -876,8 +883,15 @@ function setIndParams(inp){var base=inp.dataset.base,oldKey=inp.dataset.old,idx=
  if(newKey===oldKey){inp.value=v;return;}
  chartInds.delete(oldKey);chartInds.add(newKey);saveInds();openChart(_chartId,_chartTf);}
 function saveInds(){try{localStorage.setItem('qmInds',JSON.stringify(Array.from(chartInds)))}catch(e){}}
-function renderIndButtons(){document.getElementById('chartInds').innerHTML='<span class="indlbl">지표 추가</span>'+IND_MENU.map(function(m){return '<span class="ib'+(chartInds.has(m.k)?' on':'')+'" data-k="'+m.k+'" onclick="toggleInd(this.dataset.k)">'+m.n+'</span>'}).join('');renderIndParams();}
-function toggleInd(k){if(chartInds.has(k))chartInds.delete(k);else chartInds.add(k);saveInds();openChart(_chartId,_chartTf);}
+// on 판정은 base(콜론 앞) 기준 — 파라미터 조정으로 키가 'sma:80' 등으로 바뀌어도 메뉴 버튼이 켜진 상태 유지.
+function indBase(k){return String(k).split(':')[0];}
+function indOn(base){return Array.from(chartInds).some(function(x){return indBase(x)===base});}
+function renderIndButtons(){document.getElementById('chartInds').innerHTML='<span class="indlbl">지표 추가</span>'+IND_MENU.map(function(m){return '<span class="ib'+(indOn(indBase(m.k))?' on':'')+'" data-k="'+m.k+'" onclick="toggleInd(this.dataset.k)">'+m.n+'</span>'}).join('');renderIndParams();}
+// 같은 base가 켜져 있으면(파라미터 변형 포함) 전부 끔, 아니면 메뉴 기본키 추가 → 재클릭 중복 방지.
+function toggleInd(k){var base=indBase(k);
+ if(indOn(base)){Array.from(chartInds).forEach(function(x){if(indBase(x)===base)chartInds.delete(x);});}
+ else{chartInds.add(k);}
+ saveInds();openChart(_chartId,_chartTf);}
 // 거래량 히스토그램 데이터: 봉 상승/하락에 따라 색(가격패널 캔들색과 동일·반투명). bars[].volume는 서버가 이미 실어 보냄.
 function volData(bars){return (bars||[]).map(function(b){return {time:b.time,value:Number(b.volume)||0,color:(b.close>=b.open?'rgba(16,185,129,.45)':'rgba(244,63,94,.45)')};});}
 function openChart(id,tf){
@@ -937,13 +951,15 @@ function closeChart(){document.getElementById('chartModal').style.display='none'
 var _order=null; // {broker,market,symbol,ccy,side,quantity,type,price,confirmToken}
 function envBadge(env){var live=env==='live';return '<span class="envb '+(live?'live':'safe')+'">'+(live?'⚠ 실거래(LIVE)':String(env||'testnet').toUpperCase()+' 모의')+'</span>';}
 function toggleLimit(on){var w=document.getElementById('olimitwrap');if(w)w.style.display=on?'block':'none';}
+// 입력 폼 HTML(수량/지정가/미리보기 버튼). 최초 진입과 확정 실패 후 재시도 양쪽에서 재사용.
+function orderFormBody(side,qty){return '<div class="fld"><label>수량</label><input id="oqty" type="text" inputmode="decimal" autocomplete="off" placeholder="예: 0.01" value="'+(qty?esc(qty):'')+'"></div>'+
+  '<label style="display:flex;gap:7px;align-items:center;cursor:pointer;margin:6px 0;font-size:12px;color:#8a94a6"><input type="checkbox" id="olimit" onchange="toggleLimit(this.checked)"> 지정가로 주문</label>'+
+  '<div class="fld" id="olimitwrap" style="display:none"><label>지정가</label><input id="oprice" type="text" inputmode="decimal" autocomplete="off" placeholder="한 주 가격"></div>'+
+  '<button class="obig'+(side==='sell'?' danger':'')+'" onclick="submitOrder()">주문 미리보기 →</button>';}
 function openOrder(el){var side=el.dataset.side;_order={broker:el.dataset.broker,market:el.dataset.market||'spot',symbol:el.dataset.sym,ccy:el.dataset.ccy,side:side};
  var m=document.getElementById('orderModal');document.getElementById('orderMsg').textContent='';document.getElementById('orderMsg').className='setmsg';
  document.getElementById('orderTitle').innerHTML=esc(coin(_order.symbol))+' · '+(side==='buy'?'<span style="color:#10b981">매수</span>':'<span style="color:#f43f5e">매도</span>');
- document.getElementById('orderBody').innerHTML='<div class="fld"><label>수량</label><input id="oqty" type="text" inputmode="decimal" autocomplete="off" placeholder="예: 0.01"></div>'+
-  '<label style="display:flex;gap:7px;align-items:center;cursor:pointer;margin:6px 0;font-size:12px;color:#8a94a6"><input type="checkbox" id="olimit" onchange="toggleLimit(this.checked)"> 지정가로 주문</label>'+
-  '<div class="fld" id="olimitwrap" style="display:none"><label>지정가</label><input id="oprice" type="text" inputmode="decimal" autocomplete="off" placeholder="한 주 가격"></div>'+
-  '<button class="obig'+(side==='sell'?' danger':'')+'" onclick="submitOrder()">주문 미리보기 →</button>';
+ document.getElementById('orderBody').innerHTML=orderFormBody(side,'');
  m.style.display='flex';}
 function closeOrder(){document.getElementById('orderModal').style.display='none';_order=null;}
 function submitOrder(){if(!_order)return;var msg=document.getElementById('orderMsg');
@@ -969,7 +985,8 @@ function confirmOrder(){if(!_order||!_order.confirmToken)return;var msg=document
  fetch('/api/order?token='+TOKEN,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({broker:_order.broker,market:_order.market,symbol:_order.symbol,side:_order.side,type:_order.type,quantity:_order.quantity,price:_order.price,confirmToken:_order.confirmToken})})
   .then(function(r){return r.json()}).then(function(d){
    if(d.ok&&d.phase==='executed'){msg.className='setmsg ok';msg.textContent='✅ 주문 완료 ('+esc(d.env)+') · 주문번호 '+esc((d.result&&d.result.orderId)||'-');loadBalances();}
-   else{msg.className='setmsg err';msg.textContent='실패: '+(d.error||'알 수 없음')+' (토큰 만료 시 미리보기부터 다시)';_order.confirmToken=null;}
+   else{msg.className='setmsg err';msg.textContent='실패: '+(d.error||'알 수 없음')+' — 미리보기부터 다시 하세요.';_order.confirmToken=null;
+    document.getElementById('orderBody').innerHTML=orderFormBody(_order.side,_order.quantity);} // 입력 폼 복원(막다른 골목 방지)
   }).catch(function(e){msg.className='setmsg err';msg.textContent='실패: '+e.message;});}
 function card(r){var b=r.b,live=b.mode==='live',open=expanded.has(b.id),rp=r.rp;
  var wr=b.winRate!=null?', '+b.closes+'번 중 '+Math.round(b.winRate*b.closes/100)+'번 수익':'';
@@ -985,8 +1002,9 @@ function card(r){var b=r.b,live=b.mode==='live',open=expanded.has(b.id),rp=r.rp;
   '<div class="plist">'+r.body+'</div>'+earn+
   (acts?'<div class="act">'+acts+'</div>':'')+
   '<div class="cbtn" data-id="'+esc(b.id)+'" onclick="openChart(this.dataset.id)">📈 차트 보기</div>'+
-  '<div class="obar"><span class="obtn buy" data-side="buy" data-broker="'+esc(b.broker)+'" data-market="'+esc(b.market||'spot')+'" data-sym="'+esc(b.symbol)+'" data-ccy="'+esc(r.ccy)+'" onclick="openOrder(this)">매수</span>'+
-   '<span class="obtn sell" data-side="sell" data-broker="'+esc(b.broker)+'" data-market="'+esc(b.market||'spot')+'" data-sym="'+esc(b.symbol)+'" data-ccy="'+esc(r.ccy)+'" onclick="openOrder(this)">매도</span></div>'+
+  (b.isScanner?'':( // 스캐너 봇은 b.symbol이 명목 라벨(런타임 유니버스 선별)이라 수동주문 대상 아님 → 버튼 숨김
+   '<div class="obar"><span class="obtn buy" data-side="buy" data-broker="'+esc(b.broker)+'" data-market="'+esc(b.market||'spot')+'" data-sym="'+esc(b.symbol)+'" data-ccy="'+esc(r.ccy)+'" onclick="openOrder(this)">매수</span>'+
+    '<span class="obtn sell" data-side="sell" data-broker="'+esc(b.broker)+'" data-market="'+esc(b.market||'spot')+'" data-sym="'+esc(b.symbol)+'" data-ccy="'+esc(r.ccy)+'" onclick="openOrder(this)">매도</span></div>'))+
   '<div class="more" data-id="'+esc(b.id)+'" onclick="tgl(this)">'+(open?'간단히 ▴':'전략 자세히 ▾')+'</div>'+
   '<div class="strat" style="display:'+(open?'block':'none')+'">'+detailHtml(b)+'</div>';
  return el;}
