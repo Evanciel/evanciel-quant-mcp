@@ -644,7 +644,8 @@ function posRow(p,c){const px=prices.get(p.symbol)??p.entryAvg;const sign=p.side
  return {html,abs};}
 function statusPill(sum,hasPos){if(!hasPos)return '<span class="pill wait">⚪ 대기 중</span>';
  return sum>=0?'<span class="pill win">🟢 수익 중</span>':'<span class="pill lose">🔴 손실 중</span>';}
-let _chart=null,_chartId=null,_chartTf=null,_klineWs=null,_priceSeries=null,_ovSeries=[],_oscFlat=[],_markersPrim=null,_refreshing=false;
+let _chart=null,_chartId=null,_chartTf=null,_klineWs=null,_priceSeries=null,_ovSeries=[],_oscFlat=[],_markersPrim=null,_refreshing=false,_chartPoll=null;
+function clearChartPoll(){if(_chartPoll){clearInterval(_chartPoll);_chartPoll=null;}}
 function tfLabel(t){return {'1m':'1분','5m':'5분','30m':'30분','1h':'1시간','1d':'일','1w':'주','1mo':'월'}[t]||t;}
 // 실시간 차트(코인): 바이낸스 kline WS로 현재 봉 매 틱 갱신 + 봉 종료 시 지표 재계산(setData, 차트 재생성 없음=무깜빡).
 function klineIv(t){return t==='1mo'?'1M':t;} // 우리 토큰→바이낸스 kline 인터벌(월만 1M)
@@ -685,7 +686,7 @@ function openChart(id,tf){_chartId=id;var modal=document.getElementById('chartMo
   var oscGroups=d.oscGroups||[];
   var names=[].concat((d.overlays||[]).map(function(o){return o.label}),oscGroups.reduce(function(a,g){return a.concat((g.series||[]).map(function(s){return s.label}))},[]));
   document.getElementById('chartTitle').textContent=(isC?coin(d.symbol):d.symbol)+' · '+(isC?'Binance':'키움증권')+' '+tfLabel(d.interval)+(names.length?'  ·  '+names.join(' '):'');
-  document.getElementById('chartNote').textContent=(isC?'데이터: Binance 공개 시세':'데이터: 키움증권 실제 차트(모의)')+((d.priceLines||[]).length?'  ·  노랑=진입 빨강=손절 초록=익절':'')+((d.markers||[]).length?'  ·  ▲진입/매수 ▼청산':'')+(oscGroups.length?'  ·  보조지표 '+oscGroups.length+'개 패널 분리':'');
+  document.getElementById('chartNote').textContent=(isC?'데이터: Binance 공개 시세 · 실시간(WS)':'데이터: 키움증권 실제 차트(모의) · 실시간(20초 폴링)')+((d.priceLines||[]).length?'  ·  노랑=진입 빨강=손절 초록=익절':'')+((d.markers||[]).length?'  ·  ▲진입/매수 ▼청산':'')+(oscGroups.length?'  ·  보조지표 '+oscGroups.length+'개 패널 분리':'');
   body.innerHTML='';if(_chart){try{_chart.remove()}catch(e){}_chart=null;}
   if(!window.LightweightCharts||!LightweightCharts.CandlestickSeries){document.getElementById('chartTitle').textContent='차트 라이브러리 로드 실패(오프라인?)';return;}
   var nOsc=oscGroups.length;
@@ -705,9 +706,12 @@ function openChart(id,tf){_chartId=id;var modal=document.getElementById('chartMo
   (d.priceLines||[]).forEach(function(pl){s.createPriceLine({price:pl.price,color:pl.color,lineWidth:1,lineStyle:2,axisLabelVisible:true,title:pl.title});});
   _markersPrim=null;try{_markersPrim=LightweightCharts.createSeriesMarkers(s,d.markers||[])}catch(e){}
   chart.timeScale().fitContent();_chart=chart;_priceSeries=s;
-  if(isC)setupKline(d.symbol,d.interval); else closeKline(); // 코인=실시간 WS, KR=SSE/폴링(45s)이 카드 갱신
+  // 실시간: 코인=바이낸스 kline WS, KR(키움/한투)=getCandles 폴링(WS 없음). 둘 다 refreshSeries로 갱신(무깜빡).
+  closeKline();clearChartPoll();
+  if(isC)setupKline(d.symbol,d.interval);
+  else _chartPoll=setInterval(refreshSeries,20000); // KR 실시간 근사(20초마다 키움 차트 재요청). 429 회피용 간격.
  }).catch(function(){document.getElementById('chartTitle').textContent='차트 오류(네트워크)';});}
-function closeChart(){document.getElementById('chartModal').style.display='none';closeKline();_priceSeries=null;_ovSeries=[];_oscFlat=[];_markersPrim=null;if(_chart){try{_chart.remove()}catch(e){}_chart=null;}document.getElementById('chartBody').innerHTML='';}
+function closeChart(){document.getElementById('chartModal').style.display='none';closeKline();clearChartPoll();_priceSeries=null;_ovSeries=[];_oscFlat=[];_markersPrim=null;if(_chart){try{_chart.remove()}catch(e){}_chart=null;}document.getElementById('chartBody').innerHTML='';}
 function card(r){var b=r.b,live=b.mode==='live',open=expanded.has(b.id),rp=r.rp;
  var wr=b.winRate!=null?', '+b.closes+'번 중 '+Math.round(b.winRate*b.closes/100)+'번 수익':'';
  var earn=b.closes>0?'<div class="earn '+(rp>=0?'up':'dn')+'">💰 지금까지 '+signed(rp,r.ccy)+' '+(rp>=0?'벌었어요':'잃었어요')+' <span class="hint">('+b.closes+'번 거래'+wr+')</span></div>':'';
