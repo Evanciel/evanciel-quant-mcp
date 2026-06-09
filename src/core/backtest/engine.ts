@@ -14,6 +14,7 @@ import { computeRegime } from "./regime";
 // 다단계 부분익절 라더 — 라이브(bot-runner)와 "동일 호출"로 backtest≡live (Design Ref: tp-ladder §2 Option C).
 import { evaluateLadderTick, openPosition, type PositionState, type LadderLevel, type ScaleInConfig, type PyramidConfig } from "../position/ladder";
 import { floorQty } from "../position/qty";
+import { computeOrderQty } from "../risk/order-sizing"; // 변동성 타게팅 사이징(엔진·러너 공용 → backtest≡live)
 
 interface OHLCV {
   date: string;
@@ -230,9 +231,12 @@ export function runBacktest(
       }
 
       if (rule.action === "buy" && position === 0) {
-        const investAmount = balance * (rule.quantityPercent / 100);
-        // 수수료 예약 후 수량 산정(과거: floor(invest/price) 직후 cost에 수수료 가산 → cost>invest → 잔고 음수/과레버리지)
-        const qty = floorQty(investAmount / (fillPrice * (1 + config.commission / 100)));
+        // 사이징: riskSizing 있으면 변동성 타게팅, 없으면 legacy(balance*qp/100) 바이트 동일. 엔진·러너 공용함수 → backtest≡live.
+        const qty = computeOrderQty({
+          equity: balance, price: fillPrice, commissionPct: config.commission,
+          closes: prices.slice(0, i + 1), timeframe: config.timeframe ?? "1d",
+          legacyQuantityPercent: rule.quantityPercent, riskSizing: config.riskSizing ?? null,
+        }).qty;
         if (qty > 0) {
           const cost = qty * fillPrice * (1 + config.commission / 100);
           balance -= cost;
@@ -794,9 +798,12 @@ export function runCompositeBacktest(
         if (rule.action === "buy" && position === 0) {
           const slip = (config.slippage ?? 0.05) / 100;
           const buyPrice = price * (1 + slip);
-          const investAmount = balance * (rule.quantityPercent / 100);
-          // 수수료 예약 후 수량 산정(잔고 음수/과레버리지 방지)
-          const qty = floorQty(investAmount / (buyPrice * (1 + (config.commission ?? 0.1) / 100)));
+          // 사이징: riskSizing 있으면 변동성 타게팅, 없으면 legacy 바이트 동일. 러너는 want.qty로 이 결과를 그대로 라이브 반영.
+          const qty = computeOrderQty({
+            equity: balance, price: buyPrice, commissionPct: config.commission ?? 0.1,
+            closes: prices.slice(0, i + 1), timeframe: config.timeframe ?? "1d",
+            legacyQuantityPercent: rule.quantityPercent, riskSizing: config.riskSizing ?? null,
+          }).qty;
           if (qty > 0) {
             balance -= qty * buyPrice * (1 + (config.commission ?? 0.1) / 100);
             position = qty;

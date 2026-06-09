@@ -11,6 +11,8 @@ import { liveGate, type Broker } from "../brokers/safety.js";
 export function saveComposite(a: {
   name: string; tree: unknown; symbol?: string; market?: "spot" | "futures"; leverage?: number;
   stopLossPercent?: number; takeProfitPercent?: number; tpLadder?: unknown; scaleIn?: unknown; pyramid?: unknown; trailingStopPercent?: number;
+  // 변동성 타게팅 사이징(opt-in). 리스크 통제(고변동 작게/저변동 크게, 무레버리지) — 알파 아님. 미설정 시 기존 quantityPercent.
+  riskSizing?: { method: "vol_target"; targetVolAnnual: number; leverageCap?: number; lookback?: number };
 }) {
   const err = validateBotRoot(a.tree); // scanner 노드도 허용(validateScannerNode 분기)
   if (err) return { ok: false, error: `검증 실패: ${err}` };
@@ -20,6 +22,7 @@ export function saveComposite(a: {
     stop_loss_percent: a.stopLossPercent ?? null, take_profit_percent: a.takeProfitPercent ?? null,
     tp_ladder: a.tpLadder ?? null, scale_in: a.scaleIn ?? null, pyramid: a.pyramid ?? null,
     trailing_stop_percent: a.trailingStopPercent ?? null,
+    risk_sizing: a.riskSizing ?? null,
   });
   return { ok: true, compositeStrategyId: row.id, name: row.name, symbol: row.symbol };
 }

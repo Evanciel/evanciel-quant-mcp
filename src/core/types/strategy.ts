@@ -57,6 +57,7 @@ export interface BacktestConfig {
   auxSeries?: Record<string, number[]>; // 스프레드 조건용: symbolB → 종가 배열(메인 data와 동일 길이·정렬). 러너/백테스트툴이 주입.
   mtfSeries?: Record<string, number[]>; // 멀티타임프레임용: mtfKey → 상위TF 지표값(LTF 정렬·전방채움). 러너/백테스트툴이 주입.
   eventCalendars?: Record<string, number[]>; // 이벤트 조건용: 명명 캘린더 → 이벤트 epoch(ms) 배열. 러너/백테스트툴이 주입.
+  riskSizing?: import("../risk/order-sizing").RiskSizingConfig | null; // 변동성 타게팅 사이징(opt-in). 미지정=legacy quantityPercent.
 }
 
 export interface BacktestTrade {

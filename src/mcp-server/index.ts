@@ -91,7 +91,7 @@ export function buildServer(): McpServer {
   // ── v2: 봇/전략/대시보드 (로컬 스토어 + 페이퍼 러너) ──
   server.registerTool("save_strategy", {
     title: "전략(복합전략) 저장",
-    description: `에이전트가 조립한 복합 전략 트리를 검증 후 로컬 스토어에 저장. 반환 id로 봇을 만든다. ${DISCLAIMER}`,
+    description: `에이전트가 조립한 복합 전략 트리를 검증 후 로컬 스토어에 저장. 반환 id로 봇을 만든다. riskSizing(vol_target)으로 변동성 타게팅 사이징 가능(리스크 통제, 알파 아님 — 미설정 시 quantityPercent). ${DISCLAIMER}`,
     inputSchema: S.saveCompositeShape,
   }, guard((a) => B.saveComposite(a as Parameters<typeof B.saveComposite>[0])));
 

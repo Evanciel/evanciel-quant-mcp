@@ -12,6 +12,7 @@ import { collectEventCalendars, buildEventCalendars } from "../core/calendar/cal
 import { rankUniverse, decideScannerActions, type RankBar } from "../core/scanner/rank.js";
 import { planProtectiveOrders, syncProtective } from "../core/execution/protective.js";
 import { sizeFromBalance, classifyFillStatus } from "../core/execution/reconcile.js";
+import { computeOrderQty } from "../core/risk/order-sizing.js"; // 스캐너 진입 사이징(opt-in 변동성 타게팅)
 // 주: computePositionDrift(포지션 드리프트 정정)는 선물(심볼별 순포지션) 개념. 현물은 공유 잔고라 봇별 귀속 불가 → 선물 봇 도입 시 배선.
 import * as store from "../store/db.js";
 import { getAdapter } from "../brokers/index.js";
@@ -157,7 +158,7 @@ export async function tickBot(botId: string): Promise<{ action: "buy" | "sell" |
 
   // 스캐너 봇: root_node가 scanner면 멀티심볼 랭킹 경로로 분기.
   if ((comp.root_node as { type?: string })?.type === "scanner") {
-    return tickScanner(bot, comp.root_node as ScannerNode);
+    return tickScanner(bot, comp.root_node as ScannerNode, comp.risk_sizing as BacktestConfig["riskSizing"]);
   }
 
   const interval = secsToInterval(bot.interval_seconds); // 폴링 주기 → kline 타임프레임(인트라데이 자동). 시간대 조건 해금.
@@ -188,7 +189,8 @@ export async function tickBot(botId: string): Promise<{ action: "buy" | "sell" |
   const calNames = collectEventCalendars(root);
   const eventCalendars = calNames.length ? buildEventCalendars(calNames) : undefined;
 
-  const cfg: BacktestConfig = { strategyId: "runner", symbol: bot.symbol, startDate: data[0].date, endDate: data[data.length - 1].date, initialCapital: bot.capital, commission: 0.1, timeframe: interval, auxSeries, mtfSeries, eventCalendars };
+  // riskSizing(opt-in): 엔진 진입 사이징에 반영 → 백테 trade 수량 → derivePosition want.qty → 라이브 주문에 그대로(backtest≡live).
+  const cfg: BacktestConfig = { strategyId: "runner", symbol: bot.symbol, startDate: data[0].date, endDate: data[data.length - 1].date, initialCapital: bot.capital, commission: 0.1, timeframe: interval, auxSeries, mtfSeries, eventCalendars, riskSizing: comp.risk_sizing as BacktestConfig["riskSizing"] };
   const risk = {
     stopLossPercent: comp.stop_loss_percent, takeProfitPercent: comp.take_profit_percent,
     tpLadder: comp.tp_ladder as never, scaleIn: comp.scale_in as never, pyramid: comp.pyramid as never,
@@ -279,7 +281,7 @@ function inSchedule(iso: string, schedule?: { hour: number[]; tz?: string }): bo
  * 아니면 페이퍼 폴백(fail-closed). 기본(키없음/마스터OFF)은 전부 페이퍼. position_state=심볼→포지션 맵.
  * 안전: 멀티심볼 실거래는 심볼 allowlist가 통제 — allowlist에 없는 심볼은 자동 페이퍼.
  */
-async function tickScanner(bot: store.BotRow, node: ScannerNode): Promise<{ action: "buy" | "sell" | "hold"; detail: string }> {
+async function tickScanner(bot: store.BotRow, node: ScannerNode, riskSizing?: BacktestConfig["riskSizing"]): Promise<{ action: "buy" | "sell" | "hold"; detail: string }> {
   const interval = secsToInterval(bot.interval_seconds);
   const fetched = await Promise.all(node.universe.map(async (sym) => {
     try { const raw = await fetchKlines(sym, interval, 300); const bars = raw.length > 1 ? raw.slice(0, -1) : raw; return { symbol: sym, bars }; } // 형성 중 봉 제거(닫힌 봉 기준)
@@ -340,7 +342,10 @@ async function tickScanner(bot: store.BotRow, node: ScannerNode): Promise<{ acti
   for (const sym of toOpen) {
     const price = priceOf[sym];
     if (price === undefined || price <= 0) continue;
-    const qty = Math.floor(perSymCapital / price);
+    // riskSizing 있으면 변동성 타게팅(심볼별 종가로 realizedVol), 없으면 기존 floor(perSymCapital/price) 그대로(회귀 0).
+    const qty = riskSizing
+      ? computeOrderQty({ equity: perSymCapital, price, commissionPct: 0.1, closes: (barsOf[sym] ?? []).map((b) => b.close), timeframe: interval, legacyQuantityPercent: 100, riskSizing }).qty
+      : Math.floor(perSymCapital / price);
     if (qty <= 0) continue;
     const fill = await fillOrder(bot, "buy", qty, price, sym);
     const t = store.insertTrade({ bot_id: bot.id, side: "buy", price: fill.price, qty, pnl: 0, is_paper: fill.live ? 0 : 1, reason: `스캐너 진입(${sym}, ${node.rank.metric} 상위)`, idempotency_key: `${bot.id}:${sym}:${barIso(sym)}:buy` });

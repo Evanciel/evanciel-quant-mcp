@@ -79,6 +79,14 @@ export const strategyFactoryShape = {
   minDsr: z.number().default(0.95).describe("생존 DSR 임계(기본 0.95, 다중검정 보정)"),
 };
 
+// 변동성 타게팅 사이징 설정(현물: leverageCap≤1 강제, targetVol 상한 200% 새너티).
+export const riskSizingSchema = z.object({
+  method: z.literal("vol_target"),
+  targetVolAnnual: z.number().positive().max(2).describe("목표 연환산 변동성(예: 0.2=20%)"),
+  leverageCap: z.number().positive().max(1).optional().describe("레버리지 상한(현물 기본 1.0)"),
+  lookback: z.number().int().positive().optional().describe("realizedVol 계산 봉수(기본=가용분)"),
+});
+
 // ── v2: 봇/전략/대시보드 (로컬 스토어 + 페이퍼 러너) ──
 export const saveCompositeShape = {
   name: z.string().describe("전략 이름"),
@@ -92,6 +100,7 @@ export const saveCompositeShape = {
   scaleIn: z.unknown().optional(),
   pyramid: z.unknown().optional(),
   trailingStopPercent: z.number().optional(),
+  riskSizing: riskSizingSchema.optional().describe("변동성 타게팅 사이징(리스크 통제, 알파 아님). 생략 시 기존 quantityPercent"),
 };
 export const createBotShape = {
   name: z.string().describe("봇 이름"),
