@@ -127,12 +127,13 @@ export const saveCompositeShape = {
   riskSizing: riskSizingSchema.optional().describe("사이징 모드(리스크 통제, 알파 아님): vol_target=변동성 타게팅 / atr=ATR 트레이드당 리스크 고정 / kelly=fractional Kelly. 생략 시 기존 quantityPercent"),
 };
 export const createBotShape = {
-  name: z.string().describe("봇 이름"),
+  // 심층방어: 불신 입력(MCP 클라/LLM)을 입구에서 좁힘 — 대시보드는 String(s) esc()로 1차 차단하되, 스키마에서 길이·charset·enum까지 강제(저장형 XSS·DoS 표면 축소).
+  name: z.string().trim().min(1).max(120).describe("봇 이름"),
   compositeStrategyId: z.string().describe("save_composite가 반환한 전략 id"),
-  symbol: z.string().optional(),
+  symbol: z.string().trim().max(40).regex(/^[A-Za-z0-9._/-]*$/, "심볼은 영숫자·._/- 만 허용").optional(),
   capital: z.number().default(1_000_000).describe("운용 자본(페이퍼)"),
   mode: z.enum(["paper", "live"]).default("paper").describe("paper만 가능(live=v2.5, 키+게이트 필요)"),
-  broker: z.string().default("binance"),
+  broker: z.enum(["binance", "kis", "kiwoom"]).default("binance").describe("브로커(enum 고정 — 임의 문자열 거부)"),
   intervalSeconds: z.number().int().default(60).describe("평가 주기(최소 15초)"),
 };
 export const listEventsShape = {

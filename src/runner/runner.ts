@@ -72,10 +72,13 @@ async function fillOrder(bot: store.BotRow, side: "buy" | "sell", qty: number, p
   // ① 하드리밋(노셔널캡 + allowlist + 일일손실 서킷)을 '최종 제출 수량(nq)'으로 검증 — minNotional 상향분이 캡 넘으면 차단(검증==제출).
   const lim = checkLimits({ symbol, notional: price * nq, quoteCurrency });
   if (!lim.ok) { store.insertLog(bot.id, "gate", `하드리밋(${symbol} ${lim.reason})`); return blocked("리밋"); }
-  // clientOrderId ≤36자([a-zA-Z0-9-_]): botId 앞 8자 + side + base36 봉시각(~18자). 봉 기준 '결정적' cid라
+  // clientOrderId ≤36자([a-zA-Z0-9-_]): botId 앞 8자 + side + symbol태그 + base36 봉시각. 봉 기준 '결정적' cid라
   // 같은 봉의 재시도가 같은 cid를 재사용 → 모호실패 후 재시도 시 거래소측 기존 주문을 조회/입양 가능(이중주문 방지).
+  // ⚠️ symbol 태그 필수: 스캐너 봇은 한 봉에 여러 심볼을 같은 side로 진입 → symbol 없으면 cid 충돌 →
+  //    거래소가 2번째 심볼 주문을 중복 cid로 거부 → 그 심볼이 페이퍼로 폴백(심볼축 live/paper 발산). symbol 태그로 차단.
   const barMs = opts?.barIso ? Date.parse(opts.barIso) : NaN;
-  const cid = `o${bot.id.slice(0, 8)}${side[0]}${(Number.isFinite(barMs) ? Math.floor(barMs / 1000) : Date.now()).toString(36)}`;
+  const symTag = symbol.replace(/[^a-zA-Z0-9]/g, "").slice(0, 12);
+  const cid = `o${bot.id.slice(0, 8)}${side[0]}${symTag}${(Number.isFinite(barMs) ? Math.floor(barMs / 1000) : Date.now()).toString(36)}`;
   // pre-check(입양): 이전 틱의 모호 실패 주문이 실제 나가 있으면 재주문 대신 그 체결을 채택.
   if (Number.isFinite(barMs) && got.adapter.getOrderByClientId) {
     try {

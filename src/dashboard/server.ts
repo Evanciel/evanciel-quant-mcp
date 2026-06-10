@@ -959,7 +959,7 @@ function csym(c){return c==='KRW'?'₩':'$'}
 function money(n,c){return csym(c)+Math.round(Math.abs(Number(n)||0)).toLocaleString()}
 function signed(n,c){var v=Math.round(Number(n)||0);return (v>=0?'+':'-')+csym(c)+Math.abs(v).toLocaleString()}
 function plspan(n,c){var v=Math.round(Number(n)||0);return '<span class="'+(v>=0?'up':'dn')+'">'+signed(v,c)+'</span>'}
-function esc(s){return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))}
+function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))} // &<> + 따옴표("·')까지 이스케이프 — 속성 컨텍스트(data-broker 등) 브레이크아웃→저장형 XSS 차단(불신 입력은 모두 esc 경유)
 function allSyms(){return [...new Set(bots.flatMap(b=>(b.positions||[]).map(p=>p.symbol)))]}
 let subSig='';
 function subscribe(){const syms=allSyms().filter(function(s){return /[a-z]/i.test(s)}).sort();const sig=syms.join(','); // crypto만 Binance WS(KR 종목코드=숫자 제외)

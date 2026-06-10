@@ -117,7 +117,12 @@ export function upsertCredentials(updates: Record<string, string | undefined>): 
   for (const [k, v] of Object.entries(updates)) {
     if (!ALL_KEYS.has(k)) continue; // 화이트리스트 외 거부
     if (v === undefined || v === "") continue; // 빈 값=유지
-    cur[k] = String(v).trim();
+    const val = String(v).trim();
+    // fail-closed: 값에 개행·제어문자가 있으면 거부. trim()은 내부 개행을 안 지우므로, 이를 허용하면
+    // 한 키값에 "real\nLIVE_TRADING_ENABLED=true"를 실어 .env에 별도 줄로 기록→재파싱되어 다른 화이트리스트 키
+    // (라이브 마스터스위치/캡/allowlist)를 주입할 수 있다(저권한 키저장→고권한 라이브무장 권한상승, 2단계 confirm 우회).
+    if ([...val].some((ch) => ch.charCodeAt(0) < 32 || ch.charCodeAt(0) === 127)) throw new Error(`자격증명 값에 개행/제어문자 불가: ${k}`);
+    cur[k] = val;
     process.env[k] = cur[k]; // 같은 프로세스 즉시 반영(재시작 불필요)
     written.push(k);
   }

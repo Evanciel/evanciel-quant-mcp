@@ -47,6 +47,20 @@ describe("upsertCredentials", () => {
     expect(body).toContain("KIS_APPKEY=appkey-123");
     expect(body).toContain("KIS_ACCOUNT=12345678-01");
   });
+
+  it("줄바꿈/제어문자 인젝션 거부 — 키값으로 라이브 마스터스위치 무단 ON 차단(fail-closed)", async () => {
+    const C = await load();
+    // 공격: 화이트리스트 통과 키(BINANCE_API_KEY) 값에 개행을 실어 LIVE_TRADING_ENABLED=true를 별도 줄로 주입 시도.
+    expect(() => C.upsertCredentials({ BINANCE_API_KEY: "realkey\nLIVE_TRADING_ENABLED=true\nLIVE_MAX_NOTIONAL=999999" })).toThrow();
+    expect(() => C.upsertCredentials({ BINANCE_API_SECRET: "x\r\nLIVE_TRADING_ENABLED=true" })).toThrow();
+    expect(() => C.upsertCredentials({ KIS_APPKEY: "tab\there" })).toThrow(); // 제어문자(탭)도 거부
+    // 거부 후 파일에 주입 줄이 없어야 하고(또는 파일 미생성) 마스터스위치 미오염
+    expect(process.env.LIVE_TRADING_ENABLED).toBeUndefined();
+    expect(process.env.LIVE_MAX_NOTIONAL).toBeUndefined();
+    // 정상값(개행 없음)은 통과
+    const { written } = C.upsertCredentials({ BINANCE_API_KEY: "clean-key-1234" });
+    expect(written).toEqual(["BINANCE_API_KEY"]);
+  });
 });
 
 describe("parseEnvFile", () => {

@@ -28,11 +28,11 @@ export function saveComposite(a: {
   return { ok: true, compositeStrategyId: row.id, name: row.name, symbol: row.symbol };
 }
 
-export function createBot(a: { name: string; compositeStrategyId: string; symbol?: string; capital?: number; mode?: "paper" | "live"; broker?: string; intervalSeconds?: number }) {
+export function createBot(a: { name: string; compositeStrategyId: string; symbol?: string; capital?: number; mode?: "paper" | "live"; broker?: Broker; intervalSeconds?: number }) {
   const comp = store.getComposite(a.compositeStrategyId);
   if (!comp) return { ok: false, error: `복합전략 없음: ${a.compositeStrategyId}` };
   const mode = a.mode === "live" ? "live" : "paper";
-  const broker = a.broker || "binance";
+  const broker: Broker = a.broker || "binance";
   const bot = store.insertBot({
     name: a.name, symbol: a.symbol || comp.symbol, composite_strategy_id: a.compositeStrategyId,
     mode, capital: a.capital ?? 1_000_000, broker, interval_seconds: a.intervalSeconds ?? 60,
@@ -40,7 +40,7 @@ export function createBot(a: { name: string; compositeStrategyId: string; symbol
   // 라이브 모드면 현재 게이트 상태를 알려줌(실행은 가동 시 게이트가 통제 — 키없으면 페이퍼 폴백).
   let note = "mode=paper. start_bot으로 가동.";
   if (mode === "live") {
-    const g = liveGate(broker as Broker, "spot");
+    const g = liveGate(broker, "spot");
     note = g.allowed ? `mode=live — ${g.reason} start_bot 시 실주문(하드리밋 적용).` : `mode=live지만 ${g.reason} start_bot해도 게이트 통과 전엔 페이퍼 폴백. SETUP-LIVE.md로 키/스위치 설정.`;
   }
   store.insertLog(bot.id, "create", `[${mode}] 봇 생성 — ${bot.name} (${bot.symbol})`);
