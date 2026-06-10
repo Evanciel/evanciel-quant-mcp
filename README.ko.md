@@ -10,7 +10,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Node](https://img.shields.io/badge/node-%3E%3D22-green.svg)](package.json)
 [![MCP](https://img.shields.io/badge/MCP-stdio-blue.svg)](https://modelcontextprotocol.io)
-[![tests](https://img.shields.io/badge/tests-308%20passing-brightgreen.svg)](test)
+[![tests](https://img.shields.io/badge/tests-330%20passing-brightgreen.svg)](test)
 [![keys](https://img.shields.io/badge/data-keyless%20(Binance%20public)-orange.svg)](src/data/binance-public.ts)
 
 [English](README.md) · **한국어**
@@ -86,7 +86,7 @@ quant-mcp는 stdio MCP 서버입니다 — **MCP를 지원하는 어떤 에이�
 git clone https://github.com/Evanciel/evanciel-quant-mcp.git
 cd evanciel-quant-mcp
 npm install
-npm test        # 308/308 — 서버 기동 + 툴 동작 확인
+npm test        # 330/330 — 서버 기동 + 툴 동작 확인
 ```
 
 MCP 클라이언트에 등록(`ABSOLUTE_PATH`를 clone 위치로 교체):
@@ -366,7 +366,7 @@ npx quant-mcp setup     # A) 마법사: 연습(testnet)/실거래(live) → 키 
 
 ```bash
 npm run typecheck   # tsc --noEmit (클린 필수)
-npm test            # vitest (308/308)
+npm test            # vitest (330/330)
 npm run build       # esbuild 단일파일 번들 → dist/
 ```
 

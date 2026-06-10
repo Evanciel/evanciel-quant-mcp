@@ -86,6 +86,12 @@ expected returns.
 - Hardened after adversarial review: fixed a stored-XSS sink, a credentials
   newline-injection vector, and a scanner candidate-id collision; webhook SSRF gate;
   silent-live-failure-recorded-as-paper fix; normalize-then-cap order sizing.
+- Hardened after an independent cross-model (Codex) review: the OCO acknowledgement
+  parser now requires a positive `orderListId` **and exactly two legs** (a single order
+  can no longer masquerade as a ghost OCO); `audit()` is fail-loud (stderr + failure
+  counter) instead of silently swallowing write errors; the daily-loss circuit's
+  day-boundary moved to KST (env-overridable, range-clamped so a bad offset can't
+  fail-open the circuit).
 
 ### Notes
 
