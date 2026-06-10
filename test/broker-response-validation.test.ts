@@ -177,7 +177,7 @@ describe("F2 Binance 포지션 검증(빈배열/비배열 구분)", () => {
 // ─────────────────────── F4: Binance OCO 보호주문 응답(유령 OCO 차단) ───────────────────────
 // 코덱스 P0: request()는 비-2xx만 throw → HTTP 200 + 빈/형식변형 OCO 바디(orderListId 부재·orderReports 빈배열)가
 // 통과하면 placeOco가 {orderListId:"", orders:[]}를 ok로 반환 → live-handlers가 '걸린 보호주문'으로 둔갑.
-// 리스트 레벨 fail-closed(진짜 OCO 최소 증거=orderListId + 최소 1 leg)를 강제하는지 고정.
+// 리스트 레벨 fail-closed(진짜 OCO 증거=orderListId 양수 + 정확히 2 leg=익절·손절)를 강제하는지 고정.
 describe("F4 Binance OCO 응답 검증(유령 보호주문 차단)", () => {
   // placeOco: symbolFilters/normalizePrice용 exchangeInfo 콜들 + OCO POST. URL로 분기.
   function stubOco(ocoBody: unknown) {
@@ -227,6 +227,17 @@ describe("F4 Binance OCO 응답 검증(유령 보호주문 차단)", () => {
   it("(f) leg 중 미지의 status가 섞이면 → throw(leg 검증 회귀)", async () => {
     stubOco({ orderListId: 1, orderReports: [{ orderId: 1, status: "NEW", origQty: "0.5", price: "65000" }, { orderId: 2, status: "WEIRD" }] });
     await expect(binance().placeOco(oco)).rejects.toThrow(/미지의 주문 상태|fail-closed/);
+  });
+
+  // 코덱스 재검증 지적: 진짜 OCO는 정확히 2 leg(LIMIT_MAKER+STOP_LOSS_LIMIT). orderListId 양수 + 1 leg가 통과하던 구멍 차단.
+  it("(g) orderListId 양수 + leg 1개(단일주문이 OCO로 둔갑) → throw", async () => {
+    stubOco({ orderListId: 777, orderReports: [{ orderId: 1, status: "NEW", origQty: "0.5", price: "65000", transactTime: 1700000000000 }] });
+    await expect(binance().placeOco(oco)).rejects.toThrow(/형식 오류|fail-closed|유령/);
+  });
+
+  it("(h) orderListId=0(미생성) + 정상 2 leg → throw(양수 아님)", async () => {
+    stubOco({ orderListId: 0, orderReports: [{ orderId: 1, status: "NEW", origQty: "0.5", price: "65000", transactTime: 1700000000000 }, { orderId: 2, status: "NEW", origQty: "0.5", stopPrice: "58000", transactTime: 1700000000000 }] });
+    await expect(binance().placeOco(oco)).rejects.toThrow(/형식 오류|fail-closed|유령/);
   });
 });
 

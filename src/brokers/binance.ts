@@ -682,13 +682,14 @@ export class BinanceBrokerAdapter extends BaseBrokerAdapter {
     };
     if (p.listClientOrderId) params.listClientOrderId = p.listClientOrderId; // 멱등키(리스트 단위)
     const data = await this.request<{ orderListId?: number | string; orderReports?: Array<Record<string, unknown>> }>("/api/v3/order/oco", { method: "POST", signed: true, params });
-    // 리스트 레벨 fail-closed: request()는 비-2xx만 throw하므로 HTTP 200 + 빈/형식변형 바디(orderListId 부재·orderReports 빈배열)는
-    // 여기까지 통과한다. orderReports 없으면 아래 .map이 빈배열을 만들고 orderListId가 빈 문자열이 되어 '유령 OCO'가 ok로 둔갑한다
-    // (코덱스 P0). orderId 단건처럼 리스트도 '진짜 OCO의 최소 증거(orderListId + 최소 1 leg)'를 강제한다.
+    // 리스트 레벨 fail-closed: request()는 비-2xx만 throw하므로 HTTP 200 + 빈/형식변형 바디(orderListId 부재·orderReports 빈/1개)는
+    // 여기까지 통과한다. 진짜 SELL OCO = orderListId 양수 + 정확히 2 leg(LIMIT_MAKER 익절 + STOP_LOSS_LIMIT 손절).
+    // orderListId 부재/"0"/"-1"/비숫자, 또는 leg≠2(단일주문이 OCO로 둔갑 포함)면 '유령 OCO'가 ok로 둔갑 → fail-closed throw(코덱스 P0).
     const listId = data.orderListId == null ? "" : String(data.orderListId).trim();
     const reports = Array.isArray(data.orderReports) ? data.orderReports : [];
-    if (!listId || listId === "-1" || reports.length === 0) {
-      throw new Error(`Binance OCO 응답 형식 오류(체결 불명, fail-closed): orderListId/orderReports 부재 → 유령 보호주문 금지`);
+    const idNum = Number(listId);
+    if (!listId || !Number.isFinite(idNum) || idNum <= 0 || reports.length !== 2) {
+      throw new Error(`Binance OCO 응답 형식 오류(체결 불명, fail-closed): orderListId 양수 + 정확히 2 leg(익절·손절) 필요 → 유령 보호주문 금지`);
     }
     // orderReports 각 leg를 검증(에러바디/형식변형/미지 상태면 throw) → 유령 보호주문이 '걸린 것'으로 둔갑하는 것 차단.
     const orders: OrderResult[] = reports.map((d) => {

@@ -48,8 +48,9 @@ These are design guarantees, not promises about your funds:
   see your account and never trade.
 - **Paper-first, mainnet OFF** — bots are paper unless you set keys *and* the master
   switch `LIVE_TRADING_ENABLED`. Mainnet is gated behind testnet validation.
-- **Single money-path** — every real/protective order goes through one handler that
-  always enforces `liveGate` (testnet/mock only unless master-on) → server-side hard
+- **Shared money-path safety stack** — every real/protective order, whether from the
+  **manual** path (`live-handlers.ts`) or an **autonomous bot** (`runner.ts`), always
+  enforces `liveGate` (testnet/mock only unless master-on) → server-side hard
   limits (notional cap / symbol allowlist / daily-loss circuit) → audit log. On top of
   that, **manual** orders (`place_order` / `place_protective`) require a fail-closed
   **two-step confirm token** (preview → confirm, hash-bound, single-use). **Autonomous
@@ -83,8 +84,9 @@ these affect the paper default or the testnet-verified spot flow:
   places a real OCO (one-cancels-the-other) on a spot long. **Autonomous bots do not use
   OCO** — they place two independent resting orders (a STOP and a take-profit) via
   `syncProtective` / `planProtectiveOrders`. Futures and non-Binance brokers have no resting
-  protective orders yet. (The OCO acknowledgement parser is also being hardened separately so
-  a missing `orderListId` / empty `orderReports` can never read back as a successful order.)
+  protective orders yet. (The OCO acknowledgement parser is hardened: a non-positive/missing
+  `orderListId`, or an `orderReports` that is not exactly two legs, throws — a ghost OCO can
+  never read back as a successful order.)
 - **Autonomous bots have no per-order confirm token.** Manual orders are guarded by the
   fail-closed two-step token; a `mode:live` bot is pre-authorized once at `create_bot` and is
   bounded by the master switch + hard limits + idempotency instead (see the Security model

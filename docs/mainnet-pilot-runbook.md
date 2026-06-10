@@ -88,6 +88,6 @@ npx tsx scripts/verify-mainnet-readiness.ts
 - **현물 드리프트 reconcile 자동화**(공유잔고=선물 개념).
 - **한국 브로커(KIS/키움) 체결 reconcile + 거래소 상주손절**: KR은 거래소 상주 SL/TP가 없고(봇 다운 시 손절 공백) 체결확인이 약함(pending을 fill처럼 처리 가능) — 상세 [`docs/kr-broker-gap-analysis.md`](kr-broker-gap-analysis.md). 메인넷 현물(Binance) 파일럿엔 무관.
 
-> 코드 강화 별도 진행: OCO 응답 강건성(`orderListId`/`orderReports` 부재 시 성공 둔갑 차단)과 KR 체결 reconcile은 본 런북과 별개로 코드에서 다뤄지는 항목입니다(거짓 표기 제거가 목적).
+> 코드 강화 현황: OCO 응답 강건성은 **구현 완료**(`orderListId` 비양수/부재 또는 `orderReports`가 2 leg 아니면 throw → 성공 둔갑 차단). KR 체결 reconcile은 **아직 미구현**(pending을 fill처럼 처리 가능 — 위 KR 한계 참조).
 
 이 한계들은 메인넷 파일럿(현물·시장가·상주스톱)에는 영향 없습니다.

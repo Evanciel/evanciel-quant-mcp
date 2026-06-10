@@ -237,7 +237,7 @@ Deploy with `save_strategy({ tree, stopLossPercent: 5, tpLadder: [{pct:5,sellPct
 
 ## Bots & live dashboard
 
-`save_strategy` → `create_bot` → `start_bot` runs a bot that re-evaluates on each closed bar using the **same backtest engine** (so live mirrors backtest, including ladder partial fills). State lives in a local `node:sqlite` store — no account, no cloud.
+`save_strategy` → `create_bot` → `start_bot` runs a bot that re-evaluates on each closed bar using the **same backtest engine** — so **signal & sizing decisions match the backtest**. *Execution* differs, though: live sends market orders at the close, so slippage, partial fills, and latency are **not** modeled (decisions match; fills do not). State lives in a local `node:sqlite` store — no account, no cloud.
 
 `open_dashboard` serves a real-time HTML dashboard at `127.0.0.1` (one-time bootstrap token exchanged for an **HttpOnly session cookie** — the token never appears in the page or address bar after load; chart library self-hosted at `/vendor`, zero third-party scripts; Binance public WS for live unrealized PnL). It's built for **non-experts**: plain-language strategy summaries ("only buys in an uptrend when oversold"), 🟢 winning / 🔴 losing / ⚪ idle pills, realized vs unrealized PnL, and multi-symbol scanner positions — with a "details" toggle for the raw strategy DSL.
 

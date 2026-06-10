@@ -179,4 +179,17 @@ describe("dailyRealizedLoss KST 일경계", () => {
     process.env.LIVE_DAY_BOUNDARY_OFFSET_MIN = "abc";
     expect(dayBoundaryIso()).toBe("2026-06-09T15:00:00.000Z");
   });
+
+  // 코덱스 재검증 지적: 유한 거대값(1e12)이 통과하면 Date 연산이 Invalid→toISOString() throw→dailyRealizedLoss catch가
+  // 0 반환→일일손실 서킷 fail-open. 유효 TZ 오프셋 범위[-720,840] 밖은 기본 540으로 거부해 throw 자체를 막는다.
+  it("범위 밖 오프셋(1e12·-99999)은 기본 540(KST)으로 폴백 — 서킷 fail-open 차단", () => {
+    vi.setSystemTime(new Date("2026-06-10T02:00:00.000Z"));
+    process.env.LIVE_DAY_BOUNDARY_OFFSET_MIN = "1e12";
+    expect(dayBoundaryIso()).toBe("2026-06-09T15:00:00.000Z"); // throw 없이 KST 기본
+    process.env.LIVE_DAY_BOUNDARY_OFFSET_MIN = "-99999";
+    expect(dayBoundaryIso()).toBe("2026-06-09T15:00:00.000Z");
+    // 경계 안(예: -300=UTC-5h)은 정상 적용
+    process.env.LIVE_DAY_BOUNDARY_OFFSET_MIN = "-300";
+    expect(() => dayBoundaryIso()).not.toThrow();
+  });
 });

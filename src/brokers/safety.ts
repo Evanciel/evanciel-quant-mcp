@@ -216,7 +216,9 @@ export function dayBoundaryIso(nowMs: number = Date.now()): string {
   const ms = 60_000;
   const raw = trim(process.env.LIVE_DAY_BOUNDARY_OFFSET_MIN);
   const parsed = Number(raw);
-  const offsetMin = raw !== "" && Number.isFinite(parsed) ? parsed : 540; // 빈문자열/비유한수→기본 540(KST)
+  // 유효 TZ 오프셋 범위 [-720(-12h), +840(+14h)]로 클램프-거부. 범위 밖(예: 1e12)을 허용하면
+  // Date 연산이 Invalid Date→toISOString() throw→dailyRealizedLoss catch가 0 반환→일일손실 서킷 fail-open(위험).
+  const offsetMin = raw !== "" && Number.isFinite(parsed) && parsed >= -720 && parsed <= 840 ? parsed : 540; // 그 외 전부 기본 540(KST)
   const shifted = new Date(nowMs + offsetMin * ms); // now를 '로컬 시계'로 시프트
   const localMidUTC = Date.UTC(shifted.getUTCFullYear(), shifted.getUTCMonth(), shifted.getUTCDate());
   return new Date(localMidUTC - offsetMin * ms).toISOString(); // 로컬 자정을 실제 UTC 인스턴트로 되빼기
