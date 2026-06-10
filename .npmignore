@@ -1,0 +1,39 @@
+# 방어용 .npmignore — 출시 위생.
+#
+# 1차 필터는 package.json의 "files" 화이트리스트
+#   ["dist", "README.md", "SETUP-LIVE.md", ".env.example", "LICENSE"]
+# 이며, npm은 README*/LICENSE*/package.json을 항상 포함한다.
+# 따라서 이 파일은 실제 패키지 산출물을 바꾸지 않고(중복·보강), 의도를
+# 명시적으로 드러내기 위한 안전망일 뿐이다. (npm pack --dry-run = 7파일 유지)
+#
+# 주의: dist/ 는 절대 제외하지 말 것 — 패키지의 실제 페이로드다.
+# 주의: README.md / SETUP-LIVE.md / .env.example / LICENSE 는 "files"가
+#       우선하므로 여기서 다시 다루지 않는다(혼동 방지).
+
+# 소스/테스트/문서/스크립트 (배포 산출물 아님)
+src/
+test/
+docs/
+scripts/
+examples/
+.github/
+
+# TypeScript 입력 및 빌드 설정
+*.ts
+tsconfig.json
+
+# 락파일 / 의존성
+package-lock.json
+node_modules/
+
+# 비밀/런타임 산출물 (혹시 모를 누출 방어)
+.env
+.env.local
+credentials.env
+.quant-mcp/
+*.log
+
+# VCS / 에디터
+.git*
+.vscode/
+.idea/

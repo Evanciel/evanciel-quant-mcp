@@ -7,7 +7,7 @@ import type { StrategyNode, ScannerNode, BacktestConfig } from "../core/types/st
 import { runCompositeBacktest } from "../core/backtest/engine.js";
 import { fetchKlines, buildAuxSeries, type Bar } from "../data/binance-public.js";
 import { collectSpreadSymbols } from "../core/strategy/spread-symbols.js";
-import { collectMtfConditions, buildMtfSeries, type MtfBar } from "../core/strategy/mtf.js";
+import { collectMtfConditions, buildMtfSeries, collectMtfRegimeConditions, buildMtfRegimeSeries, type MtfBar } from "../core/strategy/mtf.js";
 import { collectEventCalendars, buildEventCalendars } from "../core/calendar/calendars.js";
 import { rankUniverse, decideScannerActions, type RankBar } from "../core/scanner/rank.js";
 import { planProtectiveOrders, syncProtective } from "../core/execution/protective.js";
@@ -323,12 +323,15 @@ export async function tickBot(botId: string): Promise<{ action: "buy" | "sell" |
   // 멀티타임프레임: timeframe 지정된 지표조건들의 상위TF 봉을 페치·정렬해 주입(라이브에서도 MTF 평가, backtest≡live).
   const mtfNeeds = collectMtfConditions(root);
   const mtfSeries = mtfNeeds.length ? await buildMtfSeries(data as unknown as MtfBar[], mtfNeeds, (tf, lim) => fetchKlines(bot.symbol, tf, lim) as unknown as Promise<MtfBar[]>) : undefined;
+  // 멀티타임프레임 regime: timeframe 지정된 regime 조건들의 상위TF OHLC를 페치·정렬해 주입("1h 추세 레짐 + 5m 진입", backtest≡live).
+  const mtfRegimeNeeds = collectMtfRegimeConditions(root);
+  const mtfRegimeSeries = mtfRegimeNeeds.length ? await buildMtfRegimeSeries(data as unknown as MtfBar[], mtfRegimeNeeds, (tf, lim) => fetchKlines(bot.symbol, tf, lim) as unknown as Promise<MtfBar[]>) : undefined;
   // 이벤트 조건의 명명 캘린더(FOMC 등) 주입. 인라인 times는 조건에 내장돼 주입 불필요.
   const calNames = collectEventCalendars(root);
   const eventCalendars = calNames.length ? buildEventCalendars(calNames) : undefined;
 
   // riskSizing(opt-in): 엔진 진입 사이징에 반영 → 백테 trade 수량 → derivePosition want.qty → 라이브 주문에 그대로(backtest≡live).
-  const cfg: BacktestConfig = { strategyId: "runner", symbol: bot.symbol, startDate: data[0].date, endDate: data[data.length - 1].date, initialCapital: bot.capital, commission: 0.1, timeframe: interval, auxSeries, mtfSeries, eventCalendars, riskSizing: comp.risk_sizing as BacktestConfig["riskSizing"] };
+  const cfg: BacktestConfig = { strategyId: "runner", symbol: bot.symbol, startDate: data[0].date, endDate: data[data.length - 1].date, initialCapital: bot.capital, commission: 0.1, timeframe: interval, auxSeries, mtfSeries, mtfRegimeSeries, eventCalendars, riskSizing: comp.risk_sizing as BacktestConfig["riskSizing"] };
   const risk = {
     stopLossPercent: comp.stop_loss_percent, takeProfitPercent: comp.take_profit_percent,
     tpLadder: comp.tp_ladder as never, scaleIn: comp.scale_in as never, pyramid: comp.pyramid as never,
@@ -511,6 +514,7 @@ async function tickScanner(bot: store.BotRow, node: ScannerNode, riskSizing?: Ba
   // then 전략의 표현력 조건 needs를 1회 산출(이벤트=절대캘린더라 1회 빌드, spread/MTF는 심볼별 주입) → 스캐너 then도 backtest≡live.
   const thenSpreadSyms = collectSpreadSymbols(node.then);
   const thenMtfNeeds = collectMtfConditions(node.then);
+  const thenMtfRegimeNeeds = collectMtfRegimeConditions(node.then);
   const thenCalNames = collectEventCalendars(node.then);
   const thenEvents = thenCalNames.length ? buildEventCalendars(thenCalNames) : undefined;
   for (const sym of evalSet) {
@@ -519,7 +523,8 @@ async function tickScanner(bot: store.BotRow, node: ScannerNode, riskSizing?: Ba
     priceOf[sym] = bars[bars.length - 1].close;
     const auxSeries = thenSpreadSyms.length ? await buildAuxSeries(bars, thenSpreadSyms, interval) : undefined;
     const mtfSeries = thenMtfNeeds.length ? await buildMtfSeries(bars as unknown as MtfBar[], thenMtfNeeds, (tf, lim) => fetchKlines(sym, tf, lim) as unknown as Promise<MtfBar[]>) : undefined;
-    const cfg: BacktestConfig = { strategyId: "scanner", symbol: sym, startDate: bars[0].date, endDate: bars[bars.length - 1].date, initialCapital: perSymCapital, commission: 0.1, timeframe: interval, auxSeries, mtfSeries, eventCalendars: thenEvents };
+    const mtfRegimeSeries = thenMtfRegimeNeeds.length ? await buildMtfRegimeSeries(bars as unknown as MtfBar[], thenMtfRegimeNeeds, (tf, lim) => fetchKlines(sym, tf, lim) as unknown as Promise<MtfBar[]>) : undefined;
+    const cfg: BacktestConfig = { strategyId: "scanner", symbol: sym, startDate: bars[0].date, endDate: bars[bars.length - 1].date, initialCapital: perSymCapital, commission: 0.1, timeframe: interval, auxSeries, mtfSeries, mtfRegimeSeries, eventCalendars: thenEvents };
     const res = runCompositeBacktest(node.then, bars as unknown as Parameters<typeof runCompositeBacktest>[1], cfg);
     wantHold[sym] = derivePosition(res.trades).holding;
   }

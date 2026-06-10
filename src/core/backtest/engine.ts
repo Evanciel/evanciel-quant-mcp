@@ -10,7 +10,7 @@ import type {
 } from "../types/strategy";
 import { computeIndicator } from "./indicators";
 import { calcMaxDrawdown, calcSharpeRatio, calcTradeStats } from "./metrics";
-import { computeRegime } from "./regime";
+import { computeRegime, type RegimeParams, type RegimeLabel } from "./regime";
 // 다단계 부분익절 라더 — 라이브(bot-runner)와 "동일 호출"로 backtest≡live (Design Ref: tp-ladder §2 Option C).
 import { evaluateLadderTick, openPosition, type PositionState, type LadderLevel, type ScaleInConfig, type PyramidConfig } from "../position/ladder";
 import { floorQty } from "../position/qty";
@@ -309,6 +309,8 @@ const MAX_RECURSION_DEPTH = 10;
 export interface EvalContext {
   aux?: Record<string, number[]>;
   mtf?: Record<string, number[]>;
+  // regime MTF: regimeMtfKey → 상위TF 레짐 라벨(LTF 전방채움·룩어헤드0, 닫힌 HTF 없으면 null). mtf(지표값 number[]맵)와 형태가 달라 분리.
+  mtfRegime?: Record<string, (RegimeLabel | null)[]>;
   events?: Record<string, number[]>; // 명명 캘린더 → 이벤트 epoch(ms) 배열
 }
 
@@ -316,6 +318,15 @@ export interface EvalContext {
 export function mtfKey(timeframe: string, indicator: string, params: Record<string, number>): string {
   const p = Object.keys(params).sort().map((k) => `${k}=${params[k]}`).join(",");
   return `${timeframe}|${indicator}|${p}`;
+}
+
+/**
+ * 멀티타임프레임 regime 조건의 안정 키(엔진·주입기 공유). regime|timeframe|정렬된 params.
+ * mtfKey와 별도: regime은 indicator축이 없고 OHLC 3배열을 슬라이스해 내부에서 다중지표를 산출하므로 키 형태도 분리.
+ */
+export function regimeMtfKey(timeframe: string, params?: RegimeParams): string {
+  const p = params ? Object.keys(params).sort().map((k) => `${k}=${(params as Record<string, number | undefined>)[k]}`).join(",") : "";
+  return `regime|${timeframe}|${p}`;
 }
 
 export function resolveActiveStrategy(
@@ -512,7 +523,16 @@ function evaluateNodeCondition(
     }
 
     case "regime": {
-      // 현재 봉(index)까지의 데이터로 레짐 판정 — 룩어헤드 없음(computeRegime은 배열 마지막 원소 기준).
+      // 멀티타임프레임: timeframe 지정 시 상위TF 레짐 라벨(LTF로 전방채움된 mtfRegime 시리즈)을 사용. 미주입 시 fail-closed.
+      //   라벨은 alignMtfRegimeLabels가 'HTF 봉별 진짜 HTF 시계열'로 미리 계산(전방채움 raw OHLC 재계산 시 반복값으로 ER/기울기가
+      //   붕괴하는 문제 회피). 룩어헤드0=닫힌 HTF만 노출. 단일TF 엔진 경로와 동일 의미(현재봉까지 윈도우).
+      if (condition.timeframe) {
+        const labels = ctx?.mtfRegime?.[regimeMtfKey(condition.timeframe, condition.params)];
+        if (!labels || labels.length !== prices.length) return false; // HTF 미주입/미정렬 → 무거래(indicator MTF의 가드와 동일)
+        const lab = labels[index];
+        return lab !== null && condition.in.includes(lab);
+      }
+      // 단일TF: 현재 봉(index)까지의 데이터로 레짐 판정 — 룩어헤드 없음(computeRegime은 배열 마지막 원소 기준).
       const upTo = index + 1;
       const r = computeRegime(prices.slice(0, upTo), highs.slice(0, upTo), lows.slice(0, upTo), condition.params);
       return condition.in.includes(r.label);
@@ -750,7 +770,7 @@ export function runCompositeBacktest(
 
   for (let i = 0; i < data.length; i++) {
     const price = data[i].close;
-    const activeStrategy = resolveActiveStrategy(rootNode, data, i, prices, volumes, 0, { aux: config.auxSeries, mtf: config.mtfSeries, events: config.eventCalendars });
+    const activeStrategy = resolveActiveStrategy(rootNode, data, i, prices, volumes, 0, { aux: config.auxSeries, mtf: config.mtfSeries, mtfRegime: config.mtfRegimeSeries, events: config.eventCalendars });
 
     // 손절/익절 체크: 포지션 보유 중이면 활성 leaf 존재 여부와 무관하게 평가한다.
     // 우선순위 = 활성 leaf SL/TP ?? composite 레벨 SL/TP

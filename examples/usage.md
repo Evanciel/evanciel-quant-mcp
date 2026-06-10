@@ -1,6 +1,6 @@
 # Using quant-mcp from an agent
 
-Once the server is connected (see README → "Quick start"), your agent has 22 tools
+Once the server is connected (see README → "Quick start"), your agent has 25 tools
 (analysis · screening · portfolio · events · paper bots · live BYOK). Market data is **Binance public**
 (no keys, no account) unless you opt into live trading. Honest framing: these are **risk-filter + analysis**
 tools, **not an alpha source** — most backtests will (correctly) look unimpressive, and the factory tool

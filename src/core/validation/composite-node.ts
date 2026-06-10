@@ -91,6 +91,7 @@ const RegimeConditionSchema = z.object({
   type: z.literal("regime"),
   in: z.array(z.enum(["trend_up", "trend_down", "range", "high_vol"])).min(1),
   params: z.record(z.string(), z.number().refine(Number.isFinite, { message: "params 값은 유한수여야 합니다" })).optional(),
+  timeframe: z.string().optional(), // 멀티타임프레임(상위TF 평가). 미지정 시 봇 기본 TF.
 });
 
 // 세션 앵커 조건: price를 세션 기준값×multiplier와 비교. multiplier 유한(0/음수 허용 안 함 — 가격 배수).

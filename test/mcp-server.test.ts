@@ -53,8 +53,8 @@ describe("quant-mcp server layer", () => {
         "backtest", "backtest_short", "derivatives_signal", "detect_regime", "portfolio_risk", "strategy_factory", "suggest_position_size", "validate_strategy", "scan_universe", "allocate_portfolio", "list_events",
         // v2 봇/전략/대시보드 7툴
         "create_bot", "get_bot_status", "list_bots", "open_dashboard", "save_strategy", "start_bot", "stop_bot",
-        // v2.5 라이브 4툴
-        "live_status", "get_positions", "get_balance", "place_order",
+        // v2.5 라이브 7툴
+        "live_status", "get_positions", "get_balance", "place_order", "place_protective", "get_protective", "cancel_protective",
       ].sort()
     );
 

@@ -10,7 +10,7 @@ Let any MCP agent (Claude, Cursor, …) design a trading strategy as a validated
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Node](https://img.shields.io/badge/node-%3E%3D22-green.svg)](package.json)
 [![MCP](https://img.shields.io/badge/MCP-stdio-blue.svg)](https://modelcontextprotocol.io)
-[![tests](https://img.shields.io/badge/tests-95%20passing-brightgreen.svg)](test)
+[![tests](https://img.shields.io/badge/tests-308%20passing-brightgreen.svg)](test)
 [![keys](https://img.shields.io/badge/data-keyless%20(Binance%20public)-orange.svg)](src/data/binance-public.ts)
 
 **English** · [한국어](README.ko.md)
@@ -63,7 +63,7 @@ No tool advertises expected returns. Ever.
 - [How it works](#how-it-works-3-steps)
 - [Quick start](#quick-start)
 - [What can an agent build?](#what-can-an-agent-build)
-- [Tool reference (22 tools)](#tool-reference-22-tools)
+- [Tool reference (25 tools)](#tool-reference-25-tools)
 - [Strategy expressiveness](#strategy-expressiveness)
 - [Bots & live dashboard](#bots--live-dashboard)
 - [Risk & execution layer](#risk--execution-layer)
@@ -78,7 +78,7 @@ No tool advertises expected returns. Ever.
 
 ## Quick start
 
-quant-mcp is a stdio MCP server — **any MCP-compatible agent** (Claude Desktop, Claude Code, Cursor, Continue, …) can use its 22 tools. No API keys needed (data is Binance's public REST).
+quant-mcp is a stdio MCP server — **any MCP-compatible agent** (Claude Desktop, Claude Code, Cursor, Continue, …) can use its 25 tools. No API keys needed (data is Binance's public REST).
 
 ### From source (works today)
 
@@ -86,7 +86,7 @@ quant-mcp is a stdio MCP server — **any MCP-compatible agent** (Claude Desktop
 git clone https://github.com/Evanciel/evanciel-quant-mcp.git
 cd evanciel-quant-mcp
 npm install
-npm test        # 95/95 — confirms the server boots + tools work
+npm test        # 308/308 — confirms the server boots + tools work
 ```
 
 Register it with your MCP client (replace `ABSOLUTE_PATH`):
@@ -106,7 +106,7 @@ Register it with your MCP client (replace `ABSOLUTE_PATH`):
 - **Claude Desktop:** `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) · `%APPDATA%\Claude\claude_desktop_config.json` (Windows)
 - **Cursor:** `.cursor/mcp.json`
 
-The server announces `quant-mcp server ready (stdio) — 22 tools` on stderr.
+The server announces `quant-mcp server ready (stdio) — 25 tools` on stderr.
 
 ### Via npm (after publish)
 
@@ -132,7 +132,7 @@ All of the above is expressible **today**, backtested with OOS+DSR, and runnable
 
 ---
 
-## Tool reference (22 tools)
+## Tool reference (25 tools)
 
 Every tool maps 1:1 to a verified pure function and carries the *"risk filter, not alpha source"* disclaimer.
 
@@ -167,13 +167,16 @@ Every tool maps 1:1 to a verified pure function and carries the *"risk filter, n
 | `list_bots` / `get_bot_status` | List bots / inspect positions + recent fills + logs. |
 | `open_dashboard` | Launch the local (127.0.0.1) real-time HTML dashboard. |
 
-### 🔐 Live trading — bring-your-own-keys (4)
+### 🔐 Live trading — bring-your-own-keys (7)
 
 | Tool | What it does |
 |---|---|
 | `live_status` | Which broker / env (testnet/mock/live) is configured + master switch + hard limits (no key exposure). |
 | `get_positions` / `get_balance` | Read your real exchange positions / balance (read-only, BYOK). |
 | `place_order` | Real order — **fail-CLOSED 2-step confirmation token** + server-side hard limits (notional cap / symbol allowlist / daily-loss circuit). Mainnet requires `LIVE_TRADING_ENABLED=true`. |
+| `place_protective` | Resting **OCO** (take-profit + stop-loss, one-cancels-the-other) on a spot long — same fail-closed 2-step token; server re-checks held quantity / direction / notional. Keeps the stop at the exchange even if the bot is down. |
+| `get_protective` | Inspect the resting OCO for a symbol + sellable (free) balance — for cross-session restore / dedupe. Read-only, no key exposure. |
+| `cancel_protective` | Cancel a resting OCO by `orderListId` (returned by `get_protective`), via `liveGate` + audit. |
 
 > **Default is paper.** Live trading is off unless you set keys *and* the master switch. Mainnet is gated behind testnet validation.
 
@@ -281,7 +284,7 @@ src/store/        node:sqlite local store (bots, strategies, trades, logs)
 src/runner/       paper/live bot runner (reuses the backtest engine → backtest≡live)
 src/dashboard/    127.0.0.1 real-time HTML dashboard
 src/brokers/      multi-broker adapters (Binance + 한국투자/KIS + 키움) + safety gates
-src/mcp-server/   stdio MCP server + 22 tools
+src/mcp-server/   stdio MCP server + 25 tools
 ```
 
 **Design principle:** the live runner *reuses* `runCompositeBacktest`, so adding a condition type means editing exactly three files (types + validation + engine) and live inherits it — backtest ≡ live by construction.
@@ -291,7 +294,7 @@ src/mcp-server/   stdio MCP server + 22 tools
 ## Roadmap
 
 - ✅ Portable core + keyless Binance data
-- ✅ MCP server + 22 tools (analysis, screening, portfolio, events, bots, live BYOK)
+- ✅ MCP server + 25 tools (analysis, screening, portfolio, events, bots, live BYOK)
 - ✅ Strategy expressiveness: indicator/time/regime/anchor/spread/MTF/event conditions + scanner nodes
 - ✅ Position management: SL/TP, TP ladder, scale-in, pyramid, trailing, short/futures
 - ✅ Paper bot runner + real-time dashboard
@@ -362,7 +365,7 @@ Issues and PRs welcome. Conventions:
 
 ```bash
 npm run typecheck   # tsc --noEmit (must be clean)
-npm test            # vitest (95/95)
+npm test            # vitest (308/308)
 npm run build       # esbuild single-file bundle → dist/
 ```
 

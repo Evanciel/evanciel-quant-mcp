@@ -30,7 +30,7 @@ export function buildServer(): McpServer {
 
   server.registerTool("backtest", {
     title: "백테스트 + 워크포워드 OOS",
-    description: `전략을 Binance 공개 데이터로 백테스트. 전체 통계 + 70/30 walk-forward OOS + PSR(운으로 설명될 확률). oosRobust=과적합 아님 신호. ${DISCLAIMER}`,
+    description: `전략을 Binance 공개 데이터로 백테스트. 전체 통계 + 70/30 walk-forward OOS + PSR(운으로 설명될 확률). oosRobust=과적합 아님 신호. indicator·regime 조건 모두 timeframe 지정 가능(상위TF 평가, 예: 1h 추세 레짐 게이트 + 5m 진입). ${DISCLAIMER}`,
     inputSchema: S.backtestShape,
   }, guard((a) => H.backtest(a as Parameters<typeof H.backtest>[0])));
 
@@ -148,6 +148,24 @@ export function buildServer(): McpServer {
     inputSchema: S.placeOrderShape, annotations: { destructiveHint: true, readOnlyHint: false, idempotentHint: false },
   }, guard((a) => L.placeOrder(a as Parameters<typeof L.placeOrder>[0])));
 
+  server.registerTool("place_protective", {
+    title: "보호주문 OCO 설정(BYOK, 2단계 확인)",
+    description: `현물 롱 포지션에 익절+손절 OCO(한쪽 체결 시 다른쪽 자동취소) 상주주문. **fail-CLOSED 2단계**(무토큰=프리뷰+토큰, 동일인자+토큰=실행). 서버가 실보유수량·방향·노셔널(TP·SL 각각)을 전부 재검증. 봇 다운/봉 사이에도 거래소가 손절 지킴=리스크 통제 핵심. testnet/mock 즉시, 메인넷은 LIVE_TRADING_ENABLED=true. ${DISCLAIMER}`,
+    inputSchema: S.placeProtectiveShape, annotations: { destructiveHint: true, readOnlyHint: false, idempotentHint: false },
+  }, guard((a) => L.placeProtective(a as Parameters<typeof L.placeProtective>[0])));
+
+  server.registerTool("get_protective", {
+    title: "상주 보호주문 조회(BYOK)",
+    description: `심볼의 상주 OCO 상태 + 실보유(매도가능 free) 조회. 세션 간 복원·중복등록 방지용. 읽기전용, 키 미노출. ${DISCLAIMER}`,
+    inputSchema: S.getProtectiveShape, annotations: { readOnlyHint: true },
+  }, guard((a) => L.getProtective(a as Parameters<typeof L.getProtective>[0])));
+
+  server.registerTool("cancel_protective", {
+    title: "보호주문 OCO 취소(BYOK)",
+    description: `orderListId로 상주 OCO 취소(get_protective가 반환). liveGate 경유 + audit. 취소 후 재등록 가능. ${DISCLAIMER}`,
+    inputSchema: S.cancelProtectiveShape, annotations: { destructiveHint: true, readOnlyHint: false, idempotentHint: true },
+  }, guard((a) => L.cancelProtective(a as Parameters<typeof L.cancelProtective>[0])));
+
   return server;
 }
 
@@ -163,7 +181,7 @@ async function main() {
   const shutdown = () => { runner().shutdown(); process.exit(0); };
   process.on("SIGINT", shutdown); process.on("SIGTERM", shutdown);
   // stdio 서버는 stdout=프로토콜 채널 → 로그는 stderr로.
-  process.stderr.write("quant-mcp server ready (stdio) — 22 tools (8 analysis + scan_universe + allocate_portfolio + list_events + 7 bot + 4 live). paper mode. risk filter, not alpha source.\n");
+  process.stderr.write("quant-mcp server ready (stdio) — 25 tools (8 analysis + scan_universe + allocate_portfolio + list_events + 7 bot + 7 live). paper mode. risk filter, not alpha source.\n");
 }
 
 // 직접 실행 시에만 기동(테스트 import 시엔 buildServer만 사용).

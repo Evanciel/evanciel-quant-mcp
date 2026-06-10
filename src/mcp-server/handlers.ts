@@ -16,20 +16,27 @@ import { allocatePortfolio, type AllocationMethod } from "../core/risk/allocatio
 import { summarizeDerivatives } from "../core/signals/derivatives.js";
 import { validateRootNode } from "../core/validation/composite-node.js";
 import { collectSpreadSymbols } from "../core/strategy/spread-symbols.js";
-import { collectMtfConditions, buildMtfSeries, type MtfBar } from "../core/strategy/mtf.js";
+import { collectMtfConditions, buildMtfSeries, collectMtfRegimeConditions, buildMtfRegimeSeries, type MtfBar, type MtfRegimeSeries } from "../core/strategy/mtf.js";
 import { collectEventCalendars, buildEventCalendars, BUILTIN_CALENDARS } from "../core/calendar/calendars.js";
 import { rankUniverse, computeRankMetric, type RankBar, type RankMetric } from "../core/scanner/rank.js";
 import { fetchKlines, fetchDerivatives, buildAuxSeries, type Bar } from "../data/binance-public.js";
 
-const cfg = (d: Bar[], symbol: string, interval: string, auxSeries?: Record<string, number[]>, mtfSeries?: Record<string, number[]>, eventCalendars?: Record<string, number[]>): BacktestConfig => ({
+const cfg = (d: Bar[], symbol: string, interval: string, auxSeries?: Record<string, number[]>, mtfSeries?: Record<string, number[]>, eventCalendars?: Record<string, number[]>, mtfRegimeSeries?: Record<string, MtfRegimeSeries>): BacktestConfig => ({
   strategyId: "quant-mcp", symbol, startDate: d[0].date, endDate: d[d.length - 1].date,
-  initialCapital: 1_000_000, commission: 0.1, timeframe: interval, auxSeries, mtfSeries, eventCalendars,
+  initialCapital: 1_000_000, commission: 0.1, timeframe: interval, auxSeries, mtfSeries, mtfRegimeSeries, eventCalendars,
 });
 /** auxSeries(전체 data 기준)를 [start,end) 슬라이스에 맞춰 잘라 정렬 유지. 없으면 undefined. */
 const sliceAux = (aux: Record<string, number[]> | undefined, start: number, end: number): Record<string, number[]> | undefined => {
   if (!aux) return undefined;
   const out: Record<string, number[]> = {};
   for (const k of Object.keys(aux)) out[k] = aux[k].slice(start, end);
+  return out;
+};
+/** mtfRegime(전체 data 기준 라벨 배열)을 [start,end) 슬라이스에 맞춰 잘라 정렬 유지(룩어헤드0, 경계 null은 fail-closed). 없으면 undefined. */
+const sliceMtfRegime = (reg: Record<string, MtfRegimeSeries> | undefined, start: number, end: number): Record<string, MtfRegimeSeries> | undefined => {
+  if (!reg) return undefined;
+  const out: Record<string, MtfRegimeSeries> = {};
+  for (const k of Object.keys(reg)) out[k] = reg[k].slice(start, end);
   return out;
 };
 const statOf = (r: ReturnType<typeof runCompositeBacktest>) => ({
@@ -118,16 +125,19 @@ export async function backtest(args: { tree: StrategyNode; symbol?: string; inte
   const aux = spreadSyms.length ? await buildAuxSeries(data, spreadSyms, interval) : undefined;
   const mtfNeeds = collectMtfConditions(args.tree);
   const mtf = mtfNeeds.length ? await buildMtfSeries(data as unknown as MtfBar[], mtfNeeds, (tf, lim) => fetchKlines(symbol, tf, lim) as unknown as Promise<MtfBar[]>) : undefined;
+  // MTF regime: timeframe 지정 regime 조건의 상위TF 레짐 라벨 배열(LTF 전방채움). OOS는 sliceMtfRegime로 라벨 배열 동일 분할(경계 null=fail-closed).
+  const mtfRegNeeds = collectMtfRegimeConditions(args.tree);
+  const mtfReg = mtfRegNeeds.length ? await buildMtfRegimeSeries(data as unknown as MtfBar[], mtfRegNeeds, (tf, lim) => fetchKlines(symbol, tf, lim) as unknown as Promise<MtfBar[]>) : undefined;
   // 이벤트 캘린더는 절대 epoch 타임스탬프 → 윈도우 슬라이스 불필요(엔진이 각 봉 시각을 전체 이벤트와 대조).
   const calNames = collectEventCalendars(args.tree);
   const ev = calNames.length ? buildEventCalendars(calNames) : undefined;
-  const full = runCompositeBacktest(args.tree, data, cfg(data, symbol, interval, aux, mtf, ev));
+  const full = runCompositeBacktest(args.tree, data, cfg(data, symbol, interval, aux, mtf, ev, mtfReg));
   let oos: Record<string, unknown> | null = null;
   const split = Math.floor(data.length * 0.7);
   if (split >= 30 && data.length - split >= 20) {
     const train = data.slice(0, split), test = data.slice(split);
-    const tr = runCompositeBacktest(args.tree, train, cfg(train, symbol, interval, sliceAux(aux, 0, split), sliceAux(mtf, 0, split), ev));
-    const te = runCompositeBacktest(args.tree, test, cfg(test, symbol, interval, sliceAux(aux, split, data.length), sliceAux(mtf, split, data.length), ev));
+    const tr = runCompositeBacktest(args.tree, train, cfg(train, symbol, interval, sliceAux(aux, 0, split), sliceAux(mtf, 0, split), ev, sliceMtfRegime(mtfReg, 0, split)));
+    const te = runCompositeBacktest(args.tree, test, cfg(test, symbol, interval, sliceAux(aux, split, data.length), sliceAux(mtf, split, data.length), ev, sliceMtfRegime(mtfReg, split, data.length)));
     const m = calcReturnMoments(te.equityCurve);
     const psr = probabilisticSharpe(m.perBarSharpe, m.n, m.skewness, m.kurtosis, 0);
     oos = {

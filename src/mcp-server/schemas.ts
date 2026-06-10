@@ -175,3 +175,15 @@ export const placeOrderShape = {
   price: z.number().optional().describe("지정가 시 가격(시장가는 생략)"),
   confirmToken: z.string().optional().describe("프리뷰가 반환한 토큰. 없으면 프리뷰만(실주문 안 함=fail-closed)"),
 };
+// OCO 보호주문(현물 전용 → market 미포함. 핸들러가 market="spot" 하드코딩). 핸들러가 클라값 전부 불신·재계산 → 스키마는 입구 형변환만.
+export const placeProtectiveShape = {
+  broker: brokerEnum,
+  symbol: z.string().describe("현물 심볼 (BTCUSDT 등). OCO는 현물만"),
+  quantity: z.number().positive().describe("보호할 보유 수량(서버가 실보유 free로 재검증·절사)"),
+  takeProfitPrice: z.number().positive().describe("익절가(현재가보다 높아야 — SELL OCO)"),
+  stopPrice: z.number().positive().describe("손절 트리거가(현재가보다 낮아야)"),
+  stopLimitPrice: z.number().positive().optional().describe("손절 지정가(트리거가 이하, 생략 가능)"),
+  confirmToken: z.string().optional().describe("프리뷰가 반환한 토큰. 없으면 프리뷰만(실주문 안 함=fail-closed)"),
+};
+export const getProtectiveShape = { broker: brokerEnum, symbol: z.string().describe("상주 OCO·실보유를 조회할 현물 심볼") };
+export const cancelProtectiveShape = { broker: brokerEnum, symbol: z.string().describe("현물 심볼"), orderListId: z.string().describe("취소할 OCO orderListId(get_protective가 반환)") };

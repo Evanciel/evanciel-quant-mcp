@@ -25,6 +25,7 @@
  * Security: secrets are never logged. Errors throw generic messages (no secret / signed url leak).
  */
 import { createHash } from "node:crypto";
+import { z } from "zod";
 import { BaseBrokerAdapter } from "./base.js";
 import type {
   BrokerType,
@@ -34,6 +35,18 @@ import type {
   OrderRequest,
   OrderResult,
 } from "./types.js";
+
+/**
+ * 주문 응답 안전필드 검증(fail-closed). KIS는 호출부의 rt_cd!=='0' 게이트가 1차 방어이나, rt_cd==='0'(접수 성공)인데
+ * output.ODNO(주문번호)가 없거나 비문자열이면 현재 코드가 orderId='' 폴백으로 '유령 접수'를 만든다(주문번호 없는
+ * pending = 신뢰불가). → rt_cd 게이트 '직후'에만 추가 검증(기존 rt_cd 로직 보존, 중복 게이트 회피).
+ * 키움 'ord_no missing'(P0-3)과 동형. (라이브 미배선이라 현 영향 0 — 미래 배선 대비 하드닝.)
+ */
+const KisOrderOutputSchema = z
+  .object({
+    output: z.object({ ODNO: z.string().min(1) }).passthrough(),
+  })
+  .passthrough();
 
 /** KIS environment selector. Defaults to the SAFE value (mock) when unset/unknown. */
 type KisEnv = "mock" | "live";
@@ -456,6 +469,14 @@ export class KisBrokerAdapter extends BaseBrokerAdapter {
     );
 
     const filled = data.rt_cd === "0";
+    // 접수 성공(rt_cd '0') 주장인데 주문번호(ODNO)가 없으면 유령 pending → fail-closed로 throw.
+    //   (거부 rt_cd!='0'은 ODNO 없는 게 정상 → rejected 상태로 흘려보냄. 검증은 접수 성공 케이스에만.)
+    if (filled) {
+      const p = KisOrderOutputSchema.safeParse(data);
+      if (!p.success) {
+        throw new Error(`KIS order accepted but ODNO missing (신뢰불가, fail-closed): ${p.error.issues[0]?.message ?? "schema"}`);
+      }
+    }
     return {
       orderId: data.output?.ODNO ?? "",
       symbol: pdno,

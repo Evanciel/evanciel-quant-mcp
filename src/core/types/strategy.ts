@@ -56,6 +56,7 @@ export interface BacktestConfig {
   timeframe?: string; // 봉 주기(1m~1d). Sharpe 연환산에 사용. 미지정 시 일봉(크립토 365). (mig017 연계)
   auxSeries?: Record<string, number[]>; // 스프레드 조건용: symbolB → 종가 배열(메인 data와 동일 길이·정렬). 러너/백테스트툴이 주입.
   mtfSeries?: Record<string, number[]>; // 멀티타임프레임용: mtfKey → 상위TF 지표값(LTF 정렬·전방채움). 러너/백테스트툴이 주입.
+  mtfRegimeSeries?: Record<string, (RegimeLabel | null)[]>; // 멀티타임프레임 regime용: regimeMtfKey → 상위TF 레짐 라벨(LTF 정렬·전방채움, 닫힌 HTF 없으면 null). 지표값(number[])과 형태가 달라 mtfSeries와 분리.
   eventCalendars?: Record<string, number[]>; // 이벤트 조건용: 명명 캘린더 → 이벤트 epoch(ms) 배열. 러너/백테스트툴이 주입.
   riskSizing?: import("../risk/order-sizing").RiskSizingConfig | null; // 변동성 타게팅 사이징(opt-in). 미지정=legacy quantityPercent.
 }
@@ -176,6 +177,7 @@ export interface RegimeCondition {
   type: "regime";
   in: RegimeLabel[];        // 허용 레짐: ["trend_up","high_vol"] 등 (최소 1개)
   params?: RegimeParams;    // ADX/ER/ATR 임계값 오버라이드(옵션). 미지정 시 computeRegime 기본값.
+  timeframe?: string;       // 멀티타임프레임: 지정 시 이 레짐을 상위TF(예 "1h")로 평가(LTF 봉에 전방채움). "1h 추세 레짐 게이트 + 5m 진입".
 }
 
 // 세션 앵커 조건: 현재가(또는 지표)를 '세션 기준값'(시가/전일종가/세션고저/시가기준 VWAP)과 비교.

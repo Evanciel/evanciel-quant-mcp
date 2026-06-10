@@ -449,7 +449,12 @@ export class KiwoomBrokerAdapter extends BaseBrokerAdapter {
         );
       }
 
-      const orderId = String((data.ord_no as string | undefined) ?? "");
+      // 보완(타입 가드): ord_no가 객체/배열로 오는 비정상 응답이면 String()이 '[object Object]'를 orderId로
+      //   만든다(유령 주문번호). 문자열/숫자만 허용 — 그 외 타입은 신뢰 불가로 throw. (assertOk와 중복 아닌 타입검증.)
+      if (data.ord_no != null && typeof data.ord_no !== "string" && typeof data.ord_no !== "number") {
+        throw new Error("Kiwoom order response invalid ord_no type (신뢰불가, fail-closed)");
+      }
+      const orderId = String((data.ord_no as string | number | undefined) ?? "");
       // 접수 성공 주장인데 주문번호가 없으면 신뢰 불가 → 유령 pending 금지(실패로 throw).
       if (!rejected && !orderId) {
         throw new Error("Kiwoom order accepted but ord_no missing");

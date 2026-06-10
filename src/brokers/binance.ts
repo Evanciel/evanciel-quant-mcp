@@ -14,6 +14,7 @@
  *  - 모든 네트워크 호출에 AbortSignal.timeout 적용.
  */
 import crypto from "node:crypto";
+import { z } from "zod";
 import type {
   BrokerType,
   BrokerCredentials,
@@ -24,6 +25,110 @@ import type {
   OrderResult,
 } from "./types.js";
 import { BaseBrokerAdapter } from "./base.js";
+
+// ─────────────────── 거래소 응답 런타임 검증(Zod, fail-closed) ───────────────────
+// 머니패스 임계 응답(주문/체결/잔고/포지션)만 안전필드를 safeParse 한다. 목적: Binance가 HTTP 200 +
+// 에러바디({code,msg})나 형식변형 JSON을 줘도 어댑터가 그것을 "pending + 요청수량"짜리 유령 OrderResult나
+// "잔고/포지션 0"으로 둔갑시키지 않게(silent-NaN/유령응답 차단). 키움 P0-3(assertOk)와 동형의 방어를
+// binance(유일하게 라이브 머니패스에 배선된 어댑터)에도 적용한다.
+//
+// 설계원칙(과설계 회피):
+//  - 안전임계 필드만 검증(주문=orderId+status / 잔고=총자산·현금·balances / 포지션=수량·평단·마크). 전 필드 강제 금지.
+//  - Binance는 숫자를 문자열로 주므로 numLike=string|number 로 관용. .passthrough()로 미지 필드 무시(거래소 필드 추가에 강건).
+//  - 빈 배열(balances:[], positionRisk:[])은 '정상 0'으로 통과(throw 아님).
+//  - 검증 실패는 throw → 상류(runner fillOrder catch→reconcile→동결 / live-handlers try→ok:false)가 안전하게 흡수.
+
+/** Binance 숫자 필드 관용 타입(문자열 숫자 허용). */
+const numLike = z.union([z.string(), z.number()]);
+
+/**
+ * 알려진 Binance 주문 상태 집합. 이 밖의 값(또는 부재)은 '유령 pending'으로 둔갑할 수 있으므로 거부한다.
+ * 출처: Binance order status (spot/futures 공통). NEW/PARTIALLY_FILLED/FILLED/CANCELED/PENDING_CANCEL/
+ *       REJECTED/EXPIRED/EXPIRED_IN_MATCH. (신규 상태가 추가되면 여기에 더해야 통과 — 모르는 값은 보수적 throw.)
+ */
+const KNOWN_ORDER_STATUSES = new Set([
+  "NEW",
+  "PARTIALLY_FILLED",
+  "FILLED",
+  "CANCELED",
+  "PENDING_CANCEL",
+  "REJECTED",
+  "EXPIRED",
+  "EXPIRED_IN_MATCH",
+]);
+
+/**
+ * 주문 ACK/조회 응답 스키마. **orderId·status 둘 다 필수**(진짜 주문 응답의 최소 증거) — 하나라도 없으면
+ * (=에러바디 {code,msg}나 형식변형) safeParse 실패. 체결가/수량 등은 optional(시장가/지정가 모두 관용).
+ */
+const OrderAckSchema = z
+  .object({
+    orderId: numLike,
+    status: z.string(),
+    executedQty: numLike.optional(),
+    origQty: numLike.optional(),
+    price: numLike.optional(),
+    avgPrice: numLike.optional(),
+    cummulativeQuoteQty: numLike.optional(),
+    cumQuote: numLike.optional(),
+    side: z.string().optional(),
+    transactTime: numLike.optional(),
+    updateTime: numLike.optional(),
+    time: numLike.optional(),
+  })
+  .passthrough();
+
+/** 주문 응답을 검증해 통과시키되, 미지의 status(유령 pending 후보)는 거부한다. 실패 시 throw(fail-closed). */
+function parseOrderAck(raw: unknown, ctx: string): Record<string, unknown> {
+  const p = OrderAckSchema.safeParse(raw);
+  if (!p.success) {
+    // 거래소 에러바디/형식변형 → 체결 불명. orderId/status 부재가 대표 케이스.
+    throw new Error(`Binance ${ctx} 응답 형식 오류(체결 불명, fail-closed): ${p.error.issues[0]?.message ?? "schema"}`);
+  }
+  const status = String(p.data.status).toUpperCase();
+  if (!KNOWN_ORDER_STATUSES.has(status)) {
+    // 미지의 상태를 'pending'으로 둔갑시키지 않는다(키움 P0-3 유령 pending과 동형 방어).
+    throw new Error(`Binance ${ctx} 미지의 주문 상태(${status}) → 유령 pending 금지(fail-closed)`);
+  }
+  return p.data as Record<string, unknown>;
+}
+
+/** 선물 잔고(/fapi/v2/account) 안전필드. 셋 다 부재면 형식변형 → throw(잔고 '0' 둔갑 차단). */
+const FuturesBalanceSchema = z
+  .object({
+    totalWalletBalance: numLike.optional(),
+    totalUnrealizedProfit: numLike.optional(),
+    availableBalance: numLike.optional(),
+  })
+  .passthrough()
+  .refine(
+    (d) => d.totalWalletBalance != null || d.totalUnrealizedProfit != null || d.availableBalance != null,
+    { message: "선물 잔고 필드 전무(형식변형 의심)" },
+  );
+
+/** 현물 계정(/api/v3/account) 안전필드. balances 배열 존재 필수(빈 배열=정상 잔고0은 허용, 부재=형식변형). */
+const SpotAccountSchema = z
+  .object({
+    balances: z.array(
+      z
+        .object({ asset: z.string(), free: numLike.optional(), locked: numLike.optional() })
+        .passthrough(),
+    ),
+  })
+  .passthrough();
+
+/** 선물 포지션(/fapi/v2/positionRisk) — 배열. 행마다 symbol+수량/평단/마크 안전필드. 비배열=형식변형 → throw. */
+const FuturesPositionsSchema = z.array(
+  z
+    .object({
+      symbol: z.string(),
+      positionAmt: numLike.optional(),
+      entryPrice: numLike.optional(),
+      markPrice: numLike.optional(),
+      unRealizedProfit: numLike.optional(),
+    })
+    .passthrough(),
+);
 
 /** 시장 구분. credentials.market 으로 주입(기본 spot). */
 type Market = "spot" | "futures";
@@ -259,32 +364,37 @@ export class BinanceBrokerAdapter extends BaseBrokerAdapter {
   // ───────────────────────── 잔고 ─────────────────────────
   async getBalance(): Promise<AccountBalance> {
     if (this.market === "futures") {
-      const data = await this.request<{
-        totalWalletBalance?: string;
-        totalUnrealizedProfit?: string;
-        availableBalance?: string;
-      }>(this.paths.account, { signed: true });
+      const raw = await this.request<Record<string, unknown>>(this.paths.account, { signed: true });
+      // fail-closed: 형식변형 잔고를 '0'으로 삼키지 않음(세 안전필드 전무면 throw → 상류가 ok:false/거절).
+      const fb = FuturesBalanceSchema.safeParse(raw);
+      if (!fb.success) {
+        throw new Error(`Binance 선물 잔고 응답 형식 오류(fail-closed): ${fb.error.issues[0]?.message ?? "schema"}`);
+      }
+      const data = fb.data;
       return {
         totalAsset:
-          parseFloat(data.totalWalletBalance || "0") +
-          parseFloat(data.totalUnrealizedProfit || "0"),
-        cashBalance: parseFloat(data.availableBalance || "0"),
+          parseFloat(String(data.totalWalletBalance ?? "0")) +
+          parseFloat(String(data.totalUnrealizedProfit ?? "0")),
+        cashBalance: parseFloat(String(data.availableBalance ?? "0")),
         currency: "USDT",
       };
     }
 
-    const data = await this.request<{
-      balances?: Array<{ asset: string; free: string; locked: string }>;
-    }>(this.paths.account, { signed: true });
-    const balances = data.balances || [];
+    const raw = await this.request<Record<string, unknown>>(this.paths.account, { signed: true });
+    // fail-closed: balances 배열 부재면 throw(빈 잔고 둔갑 차단). balances:[] 빈배열은 정상(잔고0)으로 통과.
+    const sp = SpotAccountSchema.safeParse(raw);
+    if (!sp.success) {
+      throw new Error(`Binance 현물 계정 응답 형식 오류(fail-closed): ${sp.error.issues[0]?.message ?? "schema"}`);
+    }
+    const balances = sp.data.balances;
     const usdt = balances.find((b) => b.asset === "USDT");
     const totalAsset = balances.reduce(
-      (sum, b) => sum + parseFloat(b.free) + parseFloat(b.locked),
+      (sum, b) => sum + parseFloat(String(b.free ?? "0")) + parseFloat(String(b.locked ?? "0")),
       0,
     );
     return {
       totalAsset,
-      cashBalance: parseFloat(usdt?.free || "0"),
+      cashBalance: parseFloat(String(usdt?.free ?? "0")),
       currency: "USDT",
     };
   }
@@ -312,17 +422,18 @@ export class BinanceBrokerAdapter extends BaseBrokerAdapter {
     if (this.market === "futures") {
       // /fapi/v2/positionRisk — positionAmt 부호=방향(음수=숏). liquidationPrice/unRealizedProfit 신뢰원.
       // (선물 전용 엔드포인트 → 유니온 타입의 this.paths 대신 PATHS.futures 직접 참조)
-      const data = await this.request<Array<Record<string, string>>>(
-        PATHS.futures.positionRisk,
-        { signed: true },
-      );
-      const rows = Array.isArray(data) ? data : [];
-      return rows
-        .filter((p) => Math.abs(parseFloat(p.positionAmt || "0")) > 0)
+      const raw = await this.request<unknown>(PATHS.futures.positionRisk, { signed: true });
+      // fail-closed: 비배열 응답(형식변형)을 '무포지션 []'으로 조용히 둔갑시키지 않음 → throw. 빈배열 []은 정상(무포지션).
+      const fp = FuturesPositionsSchema.safeParse(raw);
+      if (!fp.success) {
+        throw new Error(`Binance 선물 포지션 응답 형식 오류(fail-closed): ${fp.error.issues[0]?.message ?? "schema"}`);
+      }
+      return fp.data
+        .filter((p) => Math.abs(parseFloat(String(p.positionAmt ?? "0"))) > 0)
         .map((p) => {
-          const amt = parseFloat(p.positionAmt || "0");
-          const entry = parseFloat(p.entryPrice || "0");
-          const mark = parseFloat(p.markPrice || "0");
+          const amt = parseFloat(String(p.positionAmt ?? "0"));
+          const entry = parseFloat(String(p.entryPrice ?? "0"));
+          const mark = parseFloat(String(p.markPrice ?? "0"));
           const dir = amt < 0 ? -1 : 1;
           return {
             symbol: p.symbol,
@@ -331,7 +442,7 @@ export class BinanceBrokerAdapter extends BaseBrokerAdapter {
             quantity: Math.abs(amt),
             avgPrice: entry,
             currentPrice: mark,
-            pnl: parseFloat(p.unRealizedProfit || "0"),
+            pnl: parseFloat(String(p.unRealizedProfit ?? "0")),
             pnlPercent:
               entry > 0 ? ((mark - entry) / entry) * 100 * dir : 0,
           };
@@ -339,16 +450,20 @@ export class BinanceBrokerAdapter extends BaseBrokerAdapter {
     }
 
     // 현물: 잔고에서 보유 자산을 포지션으로 유도(평단/현재가는 미상→0).
-    const data = await this.request<{
-      balances?: Array<{ asset: string; free: string; locked: string }>;
-    }>(this.paths.account, { signed: true });
-    return (data.balances || [])
-      .filter((b) => parseFloat(b.free) + parseFloat(b.locked) > 0)
+    const raw = await this.request<Record<string, unknown>>(this.paths.account, { signed: true });
+    // fail-closed: balances 배열 부재면 throw(빈 보유 둔갑 차단). balances:[]는 정상(무보유)으로 통과.
+    const sp = SpotAccountSchema.safeParse(raw);
+    if (!sp.success) {
+      throw new Error(`Binance 현물 계정 응답 형식 오류(fail-closed): ${sp.error.issues[0]?.message ?? "schema"}`);
+    }
+    return sp.data.balances
+      .map((b) => ({ asset: b.asset, free: parseFloat(String(b.free ?? "0")), locked: parseFloat(String(b.locked ?? "0")) }))
+      .filter((b) => b.free + b.locked > 0)
       .map((b) => ({
         symbol: b.asset,
         name: b.asset,
-        quantity: parseFloat(b.free) + parseFloat(b.locked),
-        free: parseFloat(b.free), // ③ 매도가능(locked 제외) — 보호주문 수량 상한용(잠긴 OCO 제외)
+        quantity: b.free + b.locked,
+        free: b.free, // ③ 매도가능(locked 제외) — 보호주문 수량 상한용(잠긴 OCO 제외)
         avgPrice: 0,
         currentPrice: 0,
         pnl: 0,
@@ -438,11 +553,13 @@ export class BinanceBrokerAdapter extends BaseBrokerAdapter {
       params.newOrderRespType = "RESULT";
     }
 
-    const data = await this.request<Record<string, unknown>>(this.paths.order, {
+    const raw = await this.request<Record<string, unknown>>(this.paths.order, {
       method: "POST",
       signed: true,
       params,
     });
+    // fail-closed: 에러바디/형식변형/미지 상태는 여기서 throw → runner가 reconcile/동결(유령 pending 기록 차단).
+    const data = parseOrderAck(raw, "주문");
 
     return {
       orderId: String(data.orderId ?? ""),
@@ -478,15 +595,18 @@ export class BinanceBrokerAdapter extends BaseBrokerAdapter {
       throw e;
     }
 
-    if (!data || data.orderId == null) return null;
+    if (!data || data.orderId == null) return null; // 주문 없음(does-not-exist 외 빈 응답도 보수적 null)
+    // orderId가 있으면 진짜 주문 응답이어야 한다 → 안전필드 검증(미지 상태/형식변형이면 throw).
+    //   reconcile은 throw를 'unknown'(모호)으로 보수 처리 → 잘못된 '입양'(안 나간 주문을 live 보유로 인정) 방지.
+    const ack = parseOrderAck(data, "주문조회");
     return {
-      orderId: String(data.orderId),
+      orderId: String(ack.orderId),
       symbol,
-      side: String(data.side ?? "").toUpperCase() === "SELL" ? "sell" : "buy",
-      quantity: parseFloat(String(data.executedQty ?? data.origQty ?? "0")),
-      price: this.fillPriceFrom(data),
-      status: this.mapStatus(String(data.status ?? "")),
-      timestamp: new Date(Number(data.updateTime ?? data.time ?? Date.now())),
+      side: String(ack.side ?? "").toUpperCase() === "SELL" ? "sell" : "buy",
+      quantity: parseFloat(String(ack.executedQty ?? ack.origQty ?? "0")),
+      price: this.fillPriceFrom(ack),
+      status: this.mapStatus(String(ack.status ?? "")),
+      timestamp: new Date(Number(ack.updateTime ?? ack.time ?? Date.now())),
     };
   }
 
@@ -562,13 +682,17 @@ export class BinanceBrokerAdapter extends BaseBrokerAdapter {
     };
     if (p.listClientOrderId) params.listClientOrderId = p.listClientOrderId; // 멱등키(리스트 단위)
     const data = await this.request<{ orderListId?: number | string; orderReports?: Array<Record<string, unknown>> }>("/api/v3/order/oco", { method: "POST", signed: true, params });
-    const orders: OrderResult[] = (data.orderReports || []).map((d) => ({
-      orderId: String(d.orderId ?? ""), symbol: p.symbol,
-      side: "sell", quantity: parseFloat(String(d.origQty ?? qty)),
-      price: parseFloat(String(d.price ?? d.stopPrice ?? "0")),
-      status: this.mapStatus(String(d.status ?? "")),
-      timestamp: new Date(Number(d.transactTime ?? Date.now())),
-    }));
+    // orderReports 각 leg를 검증(에러바디/형식변형/미지 상태면 throw) → 유령 보호주문이 '걸린 것'으로 둔갑하는 것 차단.
+    const orders: OrderResult[] = (data.orderReports || []).map((d) => {
+      const ack = parseOrderAck(d, "OCO leg");
+      return {
+        orderId: String(ack.orderId ?? ""), symbol: p.symbol,
+        side: "sell" as const, quantity: parseFloat(String(ack.origQty ?? qty)),
+        price: parseFloat(String(ack.price ?? ack.stopPrice ?? "0")),
+        status: this.mapStatus(String(ack.status ?? "")),
+        timestamp: new Date(Number(ack.transactTime ?? Date.now())),
+      };
+    });
     return { orderListId: String(data.orderListId ?? ""), orders };
   }
 
