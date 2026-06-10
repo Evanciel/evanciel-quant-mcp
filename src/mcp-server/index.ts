@@ -29,8 +29,8 @@ export function buildServer(): McpServer {
   }, guard((a) => H.validateStrategy(a as { tree: unknown })));
 
   server.registerTool("backtest", {
-    title: "백테스트 + 워크포워드 OOS",
-    description: `전략을 Binance 공개 데이터로 백테스트. 전체 통계 + 70/30 walk-forward OOS + PSR(운으로 설명될 확률). oosRobust=과적합 아님 신호. indicator·regime 조건 모두 timeframe 지정 가능(상위TF 평가, 예: 1h 추세 레짐 게이트 + 5m 진입). ${DISCLAIMER}`,
+    title: "백테스트 + 홀드아웃 OOS",
+    description: `전략을 Binance 공개 데이터로 백테스트. 전체 통계 + 70/30 hold-out OOS + PSR(운으로 설명될 확률). oosRobust=과적합 아님 신호. indicator·regime 조건 모두 timeframe 지정 가능(상위TF 평가, 예: 1h 추세 레짐 게이트 + 5m 진입). ${DISCLAIMER}`,
     inputSchema: S.backtestShape,
   }, guard((a) => H.backtest(a as Parameters<typeof H.backtest>[0])));
 
@@ -97,7 +97,7 @@ export function buildServer(): McpServer {
 
   server.registerTool("create_bot", {
     title: "로컬 봇 생성",
-    description: `저장한 전략으로 로컬 봇 생성(기본 paper). 라이브 실행은 v2.5(브로커 키 + 2단계 확인토큰 + 하드게이트). ${DISCLAIMER}`,
+    description: `저장한 전략으로 로컬 봇 생성(기본 paper). mode:live도 가능하나 브로커 키 + 마스터스위치(LIVE_TRADING_ENABLED) 게이트를 통과해야 실주문이고, 미통과면 페이퍼 폴백. 봇 라이브는 생성 시 사전승인 모델(게이트+하드리밋+멱등) — 주문별 2단계 확인토큰은 수동 place_order/place_protective 전용(봇엔 없음). ${DISCLAIMER}`,
     inputSchema: S.createBotShape,
   }, guard((a) => B.createBot(a as Parameters<typeof B.createBot>[0])));
 
@@ -110,7 +110,7 @@ export function buildServer(): McpServer {
   }, guard((a) => B.getBotStatus(a as { botId: string })));
 
   server.registerTool("start_bot", {
-    title: "봇 가동", description: `봇을 페이퍼로 가동(interval마다 평가, core 엔진 재사용=backtest≡live). ${DISCLAIMER}`, inputSchema: S.botIdShape,
+    title: "봇 가동", description: `봇을 mode에 따라 가동(paper=가짜돈, live=게이트 통과 시 실주문·미통과 시 페이퍼 폴백). interval마다 평가, core 엔진 재사용=backtest≡live. ${DISCLAIMER}`, inputSchema: S.botIdShape,
   }, guard((a) => B.startBot(a as { botId: string })));
 
   server.registerTool("stop_bot", {

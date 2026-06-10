@@ -1,6 +1,6 @@
 /**
  * bot-handlers.ts — v2 봇/전략 MCP 툴 핸들러(로컬 스토어 + 페이퍼 러너).
- * 에이전트가 전략 조립 → 로컬 봇 생성 → 페이퍼 실행 → 대시보드. 라이브 실행은 v2.5(키+게이트).
+ * 에이전트가 전략 조립 → 로컬 봇 생성 → 페이퍼/라이브 실행 → 대시보드. mode=live는 브로커 키 + 마스터스위치 게이트 통과 시 실주문(미통과 시 페이퍼 폴백). 봇 라이브=생성 시 사전승인(주문별 토큰 없음), 라이브 주문 통제는 러너의 게이트/하드리밋/멱등.
  */
 import { validateBotRoot } from "../core/validation/composite-node.js";
 import * as store from "../store/db.js";
@@ -65,14 +65,17 @@ export function startBot(a: { botId: string }) {
   const b = store.getBot(a.botId);
   if (!b) return { ok: false, error: `봇 없음: ${a.botId}` };
   runner().start(a.botId);
-  store.insertLog(a.botId, "start", "[페이퍼] 봇 가동");
-  return { ok: true, botId: a.botId, status: "running", note: `${Math.max(15, b.interval_seconds)}초마다 평가(페이퍼). open_dashboard로 실시간 확인.` };
+  // 표시 라벨은 봇 mode를 그대로 반영(라이브 봇을 '페이퍼'로 거짓 표기하지 않음). 실제 실주문 여부는 러너의 게이트가 통제.
+  const modeLabel = b.mode === "live" ? "라이브(게이트 통과 시 실주문·미통과 시 페이퍼 폴백)" : "페이퍼";
+  store.insertLog(a.botId, "start", `[${b.mode}] 봇 가동`);
+  return { ok: true, botId: a.botId, status: "running", note: `${Math.max(15, b.interval_seconds)}초마다 평가(${modeLabel}). open_dashboard로 실시간 확인.` };
 }
 
 export function stopBot(a: { botId: string }) {
-  if (!store.getBot(a.botId)) return { ok: false, error: `봇 없음: ${a.botId}` };
+  const b = store.getBot(a.botId);
+  if (!b) return { ok: false, error: `봇 없음: ${a.botId}` };
   runner().stop(a.botId);
-  store.insertLog(a.botId, "stop", "[페이퍼] 봇 중지");
+  store.insertLog(a.botId, "stop", `[${b.mode}] 봇 중지`);
   return { ok: true, botId: a.botId, status: "stopped" };
 }
 

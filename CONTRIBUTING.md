@@ -15,12 +15,19 @@ These hold for every change:
   only (a signal that behaves differently live vs. backtest) is a divergence bug — don't.
   (Order *execution* legitimately differs: live sends real market orders, so slippage
   and fees won't match the simulation. That's expected; the *decisions* must not diverge.)
-- **Single money-path.** All real orders and protective orders go through
-  `src/mcp-server/live-handlers.ts` only. Those handlers enforce, in order:
+- **Shared money-path primitives.** Every real/protective order — whichever of the
+  *two* entry points it comes from — enforces the same safety stack, in order:
   `liveGate` (testnet/mock only unless the mainnet master switch is on) →
-  `checkLimits` (notional cap / symbol allowlist / daily-loss circuit) →
-  two-step `confirmToken` (preview → confirm, hash-bound, single-use) → audit log.
-  Never re-implement or bypass this path.
+  `checkLimits` (notional cap / symbol allowlist / daily-loss circuit) → audit log.
+  The two entry points are: (1) **manual** orders via `src/mcp-server/live-handlers.ts`
+  (`place_order` / `place_protective`), and (2) **autonomous bot + resting-protective**
+  orders via `src/runner/runner.ts` (`fillOrder` → `adapter.placeOrder`, and
+  `syncProtective` / `planProtectiveOrders`). The two-step `confirmToken`
+  (preview → confirm, hash-bound, single-use) applies **only** to the manual
+  live-handlers path; **autonomous bots have no per-order token** — they are
+  pre-authorized once at `create_bot(mode:live)` and bounded by the master switch +
+  hard limits + idempotency instead. Never re-implement or bypass either path's
+  `liveGate` / `checkLimits` / audit. (This mirrors `SECURITY.md`'s "Security model".)
 - **Paper-first, mainnet OFF.** No change may flip the default behavior to live.
   Bots are paper unless the user sets exchange keys *and* `LIVE_TRADING_ENABLED`.
 - **Core stays pure.** Functions under `src/core/**` have no I/O (no network, no disk).

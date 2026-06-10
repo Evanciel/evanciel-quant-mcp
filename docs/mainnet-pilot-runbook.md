@@ -30,9 +30,9 @@
 
 ## 2. 설정 입력 (3가지 중 택1 — 키는 채팅 미경유)
 
-> 💸 **A·B는 "키만 넣으면 바로 매매"** — 실거래(live)를 고르면 **마스터 스위치 + 안전 기본값(주문당 50 USDT·일일손실 서킷 50)을 자동**으로 켜줍니다. 환경변수 5개를 손으로 만질 필요 없음.
+> 💸 **A·B는 "키만 넣으면 바로 매매"** — 실거래(live)를 고르면 **마스터 스위치 + 안전 기본값(주문당 100 USDT·일일손실 서킷 50)을 자동**으로 켜줍니다. 환경변수 5개를 손으로 만질 필요 없음.
 
-**A. CLI 마법사 (추천)** — `npx quant-mcp setup` → binance → **실거래(live) 선택** → 키 입력 → "출금 권한 껐죠?" 확인 → 한도 입력(Enter=기본 50) → 끝. 자동으로 실거래 ON.
+**A. CLI 마법사 (추천)** — `npx quant-mcp setup` → binance → **실거래(live) 선택** → 키 입력 → "출금 권한 껐죠?" 확인 → 한도 입력(Enter=기본 100 USDT) → 끝. 자동으로 실거래 ON.
 **B. 대시보드** — `open_dashboard` → ⚙️ API 키 설정 → 키 입력 → **💸 실거래 모드**에서 한도+출금OFF 체크 → **실거래 켜기**.
 **C. `.env.local` 직접 (고급)** — 수동으로 변수 작성(gitignore, `chmod 600`):
 
@@ -46,7 +46,7 @@ LIVE_SYMBOL_ALLOWLIST=BTCUSDT      # 한 종목으로 시작 권장(비우면 �
 LIVE_DAILY_LOSS_LIMIT=50           # 일일 손실 서킷
 ```
 
-> 마스터 ON인데 `LIVE_MAX_NOTIONAL`을 안 정했어도 **기본 안전 캡(50 USDT)** 이 자동 적용됩니다(무제한 금지). A/B로 넣은 키·설정은 `~/.quant-mcp/credentials.env`(chmod 600)에 저장되고 서버 기동 시 자동 로드. MCP 설정 env가 이 파일보다 우선(운영 오버라이드).
+> 마스터 ON인데 `LIVE_MAX_NOTIONAL`을 안 정했어도 **기본 안전 캡(USDT 100 / KRW 150,000)** 이 자동 적용됩니다(무제한 금지). A/B로 넣은 키·설정은 `~/.quant-mcp/credentials.env`(chmod 600)에 저장되고 서버 기동 시 자동 로드. MCP 설정 env가 이 파일보다 우선(운영 오버라이드).
 
 ## 3. 사전점검 (GO/NO-GO — 주문 0건)
 
@@ -84,7 +84,10 @@ npx tsx scripts/verify-mainnet-readiness.ts
 ## 의도적 미지원(정직 — 반쯤 만든 위험코드 안 넣음)
 
 - **지정가 라이브**(현재 시장가 체결). 미체결 추적 상태머신은 v2.
-- **선물 보호주문**(현물만 상주 SL/TP 지원).
+- **선물 보호주문**(현물만 상주 SL/TP 지원). 봇의 상주 보호주문은 OCO가 아니라 독립 STOP+익절 2개(`syncProtective`/`planProtectiveOrders`)이며, OCO는 수동 `place_protective`(현물)만.
 - **현물 드리프트 reconcile 자동화**(공유잔고=선물 개념).
+- **한국 브로커(KIS/키움) 체결 reconcile + 거래소 상주손절**: KR은 거래소 상주 SL/TP가 없고(봇 다운 시 손절 공백) 체결확인이 약함(pending을 fill처럼 처리 가능) — 상세 [`docs/kr-broker-gap-analysis.md`](kr-broker-gap-analysis.md). 메인넷 현물(Binance) 파일럿엔 무관.
+
+> 코드 강화 별도 진행: OCO 응답 강건성(`orderListId`/`orderReports` 부재 시 성공 둔갑 차단)과 KR 체결 reconcile은 본 런북과 별개로 코드에서 다뤄지는 항목입니다(거짓 표기 제거가 목적).
 
 이 한계들은 메인넷 파일럿(현물·시장가·상주스톱)에는 영향 없습니다.

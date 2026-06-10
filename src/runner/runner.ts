@@ -1,7 +1,8 @@
 /**
- * runner/runner.ts — 로컬 페이퍼 봇 러너. bot-runner route.ts 평가루프를 standalone으로 이식.
- * core 엔진(runCompositeBacktest) 재사용 → backtest≡live. 페이퍼 가상체결을 스토어에 기록.
- * 라이브 실행은 v2.5(브로커 어댑터 + 2단계 토큰 + 하드게이트)에서. 현재는 paper만.
+ * runner/runner.ts — 로컬 페이퍼/라이브 봇 러너. bot-runner route.ts 평가루프를 standalone으로 이식.
+ * core 엔진(runCompositeBacktest) 재사용 → backtest≡live(신호·사이징). 페이퍼는 가상체결을 스토어에 기록.
+ * mode=live는 fillOrder가 liveGate 통과 시 어댑터로 실주문(미통과 시 페이퍼 폴백). 봇 라이브는 주문별 2단계 토큰이 아니라
+ * 게이트 + 하드리밋 + 멱등으로 통제(2단계 토큰은 수동 place_order/place_protective 전용). 메인넷은 마스터스위치 전까지 OFF.
  */
 import type { StrategyNode, ScannerNode, BacktestConfig } from "../core/types/strategy.js";
 import { runCompositeBacktest } from "../core/backtest/engine.js";

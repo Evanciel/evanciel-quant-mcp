@@ -49,10 +49,13 @@ These are design guarantees, not promises about your funds:
 - **Paper-first, mainnet OFF** — bots are paper unless you set keys *and* the master
   switch `LIVE_TRADING_ENABLED`. Mainnet is gated behind testnet validation.
 - **Single money-path** — every real/protective order goes through one handler that
-  enforces `liveGate` (testnet/mock only unless master-on) → server-side hard limits
-  (notional cap / symbol allowlist / daily-loss circuit) → a fail-closed **two-step
-  confirm token** (preview → confirm, hash-bound, single-use) → audit log. The LLM
-  cannot bypass these.
+  always enforces `liveGate` (testnet/mock only unless master-on) → server-side hard
+  limits (notional cap / symbol allowlist / daily-loss circuit) → audit log. On top of
+  that, **manual** orders (`place_order` / `place_protective`) require a fail-closed
+  **two-step confirm token** (preview → confirm, hash-bound, single-use). **Autonomous
+  bots have no per-order token** — they are pre-authorized once at `create_bot(mode:live)`;
+  what bounds them is the gate, the hard limits, and idempotency, not a token per order.
+  The LLM cannot bypass the gate or the limits.
 - **Dashboard** binds to `127.0.0.1` only; a one-time bootstrap token is exchanged
   for an HttpOnly session cookie (the token isn't exposed in the page or URL
   afterwards), with Host + Origin checks and a self-hosted chart library (no
@@ -63,6 +66,33 @@ These are design guarantees, not promises about your funds:
 - **Mainnet pre-flight** — `npx tsx scripts/verify-mainnet-readiness.ts` runs a
   read-only GO/NO-GO check (withdrawal-permission OFF, IP restriction, hard-limit
   self-test) and places **zero orders**.
+
+## Known limitations before mainnet (be honest about these)
+
+The Binance **testnet** money-path is verified, and the defaults are paper / mainnet-OFF.
+But before trading **real funds** you should understand what is *not* yet covered. None of
+these affect the paper default or the testnet-verified spot flow:
+
+- **Korean brokers (KIS / 키움) have no exchange-resting stop, and fill confirmation is
+  weak.** Resting SL/TP at the exchange is Binance-only; a KR live order can be sent, but
+  there is no exchange-side stop, so a bot crash leaves the position unprotected. KR fill
+  reporting can also surface a *pending* order as if it had filled (ledger drift possible).
+  See [`docs/kr-broker-gap-analysis.md`](docs/kr-broker-gap-analysis.md) (resting-stop gap,
+  fill-cycle not yet confirmed).
+- **Protective orders are spot-Binance OCO only.** The *manual* `place_protective` tool
+  places a real OCO (one-cancels-the-other) on a spot long. **Autonomous bots do not use
+  OCO** — they place two independent resting orders (a STOP and a take-profit) via
+  `syncProtective` / `planProtectiveOrders`. Futures and non-Binance brokers have no resting
+  protective orders yet. (The OCO acknowledgement parser is also being hardened separately so
+  a missing `orderListId` / empty `orderReports` can never read back as a successful order.)
+- **Autonomous bots have no per-order confirm token.** Manual orders are guarded by the
+  fail-closed two-step token; a `mode:live` bot is pre-authorized once at `create_bot` and is
+  bounded by the master switch + hard limits + idempotency instead (see the Security model
+  above). That is a deliberate design, not a per-order approval.
+
+These are tracked, not hidden — the project's value (the shared backtest≡live code structure
+and the risk controls) stands regardless. Trade real funds only after testnet validation, in
+small size, with the master switch and hard limits set.
 
 > Not financial advice — for research and education. You are responsible for any
 > keys you add and any live trading you enable.

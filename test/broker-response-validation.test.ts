@@ -174,6 +174,62 @@ describe("F2 Binance 포지션 검증(빈배열/비배열 구분)", () => {
   });
 });
 
+// ─────────────────────── F4: Binance OCO 보호주문 응답(유령 OCO 차단) ───────────────────────
+// 코덱스 P0: request()는 비-2xx만 throw → HTTP 200 + 빈/형식변형 OCO 바디(orderListId 부재·orderReports 빈배열)가
+// 통과하면 placeOco가 {orderListId:"", orders:[]}를 ok로 반환 → live-handlers가 '걸린 보호주문'으로 둔갑.
+// 리스트 레벨 fail-closed(진짜 OCO 최소 증거=orderListId + 최소 1 leg)를 강제하는지 고정.
+describe("F4 Binance OCO 응답 검증(유령 보호주문 차단)", () => {
+  // placeOco: symbolFilters/normalizePrice용 exchangeInfo 콜들 + OCO POST. URL로 분기.
+  function stubOco(ocoBody: unknown) {
+    const fetchMock = vi.fn(async (url: string) =>
+      String(url).includes("exchangeInfo")
+        ? ok({ symbols: [{ symbol: "BTCUSDT", filters: [{ filterType: "PRICE_FILTER", tickSize: "0.01" }, { filterType: "LOT_SIZE", stepSize: "0.00001" }] }] })
+        : ok(ocoBody));
+    vi.stubGlobal("fetch", fetchMock);
+    return fetchMock;
+  }
+  const oco = { symbol: "BTCUSDT", quantity: 0.5, takeProfitPrice: 65000, stopPrice: 58000 };
+
+  it("(a) 정상 OCO 응답(orderListId + 2 leg) → orderListId + orders 정상", async () => {
+    stubOco({
+      orderListId: 12345,
+      orderReports: [
+        { orderId: 1, status: "NEW", origQty: "0.5", price: "65000", transactTime: 1700000000000 },
+        { orderId: 2, status: "NEW", origQty: "0.5", stopPrice: "58000", transactTime: 1700000000000 },
+      ],
+    });
+    const r = await binance().placeOco(oco);
+    expect(r.orderListId).toBe("12345");
+    expect(r.orders).toHaveLength(2);
+    expect(r.orders[0].orderId).toBe("1");
+  });
+
+  it("(b) 에러바디 {code,msg}(orderListId/orderReports 없음) → throw(유령 OCO 금지)", async () => {
+    stubOco({ code: -2010, msg: "Order would trigger immediately." });
+    await expect(binance().placeOco(oco)).rejects.toThrow(/형식 오류|fail-closed|유령/);
+  });
+
+  it("(c) orderListId 있으나 orderReports 빈배열 → throw(leg 없는 유령 OCO 금지)", async () => {
+    stubOco({ orderListId: 999, orderReports: [] });
+    await expect(binance().placeOco(oco)).rejects.toThrow(/형식 오류|fail-closed|유령/);
+  });
+
+  it("(d) orderReports 있으나 orderListId 부재 → throw", async () => {
+    stubOco({ orderReports: [{ orderId: 1, status: "NEW", origQty: "0.5", price: "65000" }] });
+    await expect(binance().placeOco(oco)).rejects.toThrow(/형식 오류|fail-closed|유령/);
+  });
+
+  it("(e) orderListId=-1(미생성 표식) → throw", async () => {
+    stubOco({ orderListId: -1, orderReports: [{ orderId: 1, status: "NEW", origQty: "0.5", price: "65000" }] });
+    await expect(binance().placeOco(oco)).rejects.toThrow(/형식 오류|fail-closed|유령/);
+  });
+
+  it("(f) leg 중 미지의 status가 섞이면 → throw(leg 검증 회귀)", async () => {
+    stubOco({ orderListId: 1, orderReports: [{ orderId: 1, status: "NEW", origQty: "0.5", price: "65000" }, { orderId: 2, status: "WEIRD" }] });
+    await expect(binance().placeOco(oco)).rejects.toThrow(/미지의 주문 상태|fail-closed/);
+  });
+});
+
 // ───────────────────────────── F3: KIS 주문 응답 ─────────────────────────────
 describe("F3 KIS 주문 응답 검증(유령 접수 차단)", () => {
   /** 토큰 + hashkey + 주문 경로를 순서대로 모킹. 주문 바디만 가변(orderBody). */

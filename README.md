@@ -50,7 +50,7 @@ The **same engine** powers all three steps: signal evaluation and position sizin
 quant-mcp does **not** claim to find alpha. Deep research on this kind of retail infra concluded directional alpha ≈ 0 (243 out-of-sample optimizations → robust alpha of 0; overfitting confirmed). What it gives you that is *genuinely* valuable:
 
 - 🛡️ **Risk control** — position sizing (EWMA vol-target / ATR / fractional Kelly), MDD circuit breakers, portfolio heat, exchange-resting stop/trailing math.
-- 🔬 **False-discovery filtering** — Deflated / Probabilistic Sharpe (DSR/PSR), walk-forward OOS gating. *The factory rejects most candidates by design — that's correct, not a bug.*
+- 🔬 **False-discovery filtering** — Deflated / Probabilistic Sharpe (DSR/PSR), 70/30 hold-out OOS gating. *The factory rejects most candidates by design — that's correct, not a bug.*
 - 🧩 **Expressiveness** — a composable strategy tree (indicators × regime × session × pairs × multi-timeframe × calendar events × screeners) with **one validated schema** and **backtest ≡ live signal parity** (the same pure functions decide signals and sizing in backtest, paper, and live — order *execution* differs: see above).
 
 No tool advertises expected returns. Ever.
@@ -141,7 +141,7 @@ Every tool maps 1:1 to a verified pure function and carries the *"risk filter, n
 | Tool | What it does |
 |---|---|
 | `validate_strategy` | Validate a composite strategy tree (recursion / weighted / time / scanner bounds). Upstream gate for everything. |
-| `backtest` | Backtest + walk-forward 70/30 OOS + PSR (overfit detection). |
+| `backtest` | Backtest + 70/30 hold-out OOS + PSR (overfit detection). |
 | `backtest_short` | Short backtest (sell = open, buy = cover); same signal eval as long → backtest≡live. |
 | `detect_regime` | ADX / Kaufman ER / ATR% → trend_up / trend_down / range / high_vol. |
 | `derivatives_signal` | Funding (annualized) / OI quadrant / long-short tilt / taker flow (Binance fapi). |
@@ -162,7 +162,7 @@ Every tool maps 1:1 to a verified pure function and carries the *"risk filter, n
 | Tool | What it does |
 |---|---|
 | `save_strategy` | Validate + persist a composite strategy (or a scanner) to the local store. |
-| `create_bot` | Create a paper bot from a saved strategy. |
+| `create_bot` | Create a bot from a saved strategy (paper by default; `mode:live` trades live only after the key + master-switch gate, otherwise paper-fallback — pre-approved at creation, no per-order token). |
 | `start_bot` / `stop_bot` | Run / stop a bot (evaluated every interval, reusing the backtest engine → backtest≡live). |
 | `list_bots` / `get_bot_status` | List bots / inspect positions + recent fills + logs. |
 | `open_dashboard` | Launch the local (127.0.0.1) real-time HTML dashboard. |
@@ -243,7 +243,7 @@ Deploy with `save_strategy({ tree, stopLossPercent: 5, tpLadder: [{pct:5,sellPct
 
 **Pro charting (TradingView-grade, no paid library):** built on `lightweight-charts` v5 — 1m–1M timeframes, **18 toggleable indicators with editable parameters** (Bollinger σ, Supertrend multiplier, MACD fast/slow/signal, Stochastic K/D, …), **separate oscillator panes**, on-chart **drawing tools** (trend lines / horizontal lines, persisted per bot in `localStorage`), the bot's own strategy indicators + entry/SL/TP markers, **live ticking** (crypto via Binance kline WS, KR stocks via polling), and **KST-unified time axis**.
 
-**Manual trading & protective orders (BYOK, testnet-gated):** place market/limit **buy/sell** straight from a bot card, and set **take-profit / stop-loss by dragging lines on the chart** → a real Binance-spot **OCO** order (one-cancels-the-other: if TP fills, the SL auto-cancels, and vice-versa). Every order goes through the *same* safety pipeline as the bots — `liveGate` (testnet/mock only unless the master switch is on) → held-quantity & direction re-check on the server (client values are never trusted) → notional caps → **two-step confirm token** (preview → confirm, hash-bound, single-use, 5-min TTL) → audit log. The dashboard is the *only* place these run, and they're **off by default** on mainnet.
+**Manual trading & protective orders (BYOK, testnet-gated):** place market/limit **buy/sell** straight from a bot card, and set **take-profit / stop-loss by dragging lines on the chart** → a real Binance-spot **OCO** order (one-cancels-the-other: if TP fills, the SL auto-cancels, and vice-versa). These manual orders go through the *same* money-path as the bots — `liveGate` (testnet/mock only unless the master switch is on) → held-quantity & direction re-check on the server (client values are never trusted) → notional caps → audit log — and, on top of that, manual orders add a **two-step confirm token** (preview → confirm, hash-bound, single-use, 5-min TTL). (Autonomous bots have no per-order token; they're bounded by the gate, hard limits, and idempotency instead.) The dashboard is the *only* place these manual orders run, and they're **off by default** on mainnet.
 
 **Exchange account sync (read-only):** each broker shows a **real-account panel** — actual exchange balance, real holdings, and any **resting OCO** orders (with a one-click cancel through the same safe path) — next to a **paper-vs-exchange drift badge** that quantifies how far your paper bots' ledger has diverged from real holdings. Keys are never returned to the browser; the panel polls `getAccount` every 60s and never places orders.
 
@@ -260,7 +260,7 @@ Deploy with `save_strategy({ tree, stopLossPercent: 5, tpLadder: [{pct:5,sellPct
 ## Risk & execution layer
 
 - **Sizing & portfolio:** `suggest_position_size`, `portfolio_risk`, `allocate_portfolio` — vol-targeting, ATR, Kelly, heat, MDD circuit breakers, correlation adjustment.
-- **False-discovery gates:** walk-forward OOS, PSR/DSR (deflated Sharpe), `strategy_factory`.
+- **False-discovery gates:** 70/30 hold-out OOS, PSR/DSR (deflated Sharpe), `strategy_factory`.
 - **Execution core (key-free, tested):** exchange-resting stop / take-profit / trailing planning (`planProtectiveOrders`), position-drift reconciliation vs the exchange, balance-based sizing, and fill-status classification — so a stop is protected even if the bot process is down. (Live wiring is testnet-gated; see `docs/p0-execution-layer.md`.)
 - **Manual protective orders (testnet-verified):** drag TP/SL on the chart → a real Binance-spot **OCO** so the exchange holds your stop *and* target as a linked pair, independent of any bot process. Routed through the same `liveGate` + held-quantity re-check + caps + two-step confirm-token pipeline; mainnet stays off until the master switch.
 
@@ -315,7 +315,8 @@ src/mcp-server/   stdio MCP server + 25 tools
 - **Keyless by default** — analysis tools read only *public* market data; they never see your account and never trade.
 - **Paper-first** — bots are paper unless you set exchange keys *and* the master switch (`LIVE_TRADING_ENABLED`).
 - **Server-side hard limits** — notional cap, symbol allowlist, daily-loss circuit breaker (LLM cannot bypass).
-- **2-step order confirmation** — `place_order` is fail-closed: preview returns a token; execution requires the same args + token.
+- **2-step order confirmation (manual orders)** — `place_order` / `place_protective` are fail-closed: preview returns a token; execution requires the same args + token.
+- **Autonomous bots vs manual orders** — a `mode:live` bot has **no per-order token**: it is pre-authorized once at `create_bot` and bounded by the master switch + hard limits + idempotency (the same single money-path). The per-order two-step token guards only the manual dashboard/MCP order tools.
 - **Dashboard** — binds to `127.0.0.1` only; one-time bootstrap token → HttpOnly session cookie (token not exposed in page/URL afterwards), Host + Origin checks, chart library self-hosted (no third-party scripts), and **enabling live mode is a two-step preview→confirm** (turning it off stays one click).
 - **Keys never via chat** — store keys with the CLI wizard (`npx quant-mcp setup`), the dashboard's ⚙️ settings form, or env vars. They live in `~/.quant-mcp/credentials.env` (chmod 600, gitignored), are shown masked only, and can't be read back. Never paste keys into the agent conversation.
 - **Mainnet pre-flight** — before real-money trading, `npx tsx scripts/verify-mainnet-readiness.ts` runs a read-only GO/NO-GO check (env=live, master switch, key validity, **withdrawal permission OFF**, IP restriction, hard-limit self-test) — **places zero orders**. See the [mainnet pilot runbook](docs/mainnet-pilot-runbook.md).

@@ -33,7 +33,7 @@ expected returns.
 - **Position management** — `stopLoss`, `takeProfit`, **TP ladder** (partial
   take-profit), **scale-in** (averaging down), **pyramid** (adding to winners),
   **trailing stop**, and **short / futures** (testnet-validated).
-- **False-discovery filtering** — walk-forward 70/30 OOS gating, PSR/DSR (deflated
+- **False-discovery filtering** — 70/30 hold-out OOS gating, PSR/DSR (deflated
   Sharpe), and a `strategy_factory` that bulk-screens candidates and rejects most by
   design.
 - **Risk sizing** — EWMA vol-target / ATR / fractional Kelly position sizing, MDD
@@ -72,9 +72,12 @@ expected returns.
 
 ### Security
 
-- Fail-closed **two-step confirm token** on all real orders (preview → confirm,
-  hash-bound, single-use, short TTL) with server-side hard limits (notional cap,
-  symbol allowlist, daily-loss circuit) the LLM cannot bypass.
+- Fail-closed **two-step confirm token** on *manual* orders (`place_order` /
+  `place_protective`: preview → confirm, hash-bound, single-use, short TTL).
+  Autonomous bots have **no per-order token** — they are pre-approved at
+  `create_bot(mode:live)` and bounded by the master switch + server-side hard limits
+  (notional cap, symbol allowlist, daily-loss circuit) + idempotency. The LLM cannot
+  bypass the gate or the limits.
 - Keys stored masked in `~/.quant-mcp/credentials.env` (`chmod 600`, gitignored),
   never echoed, never returned to the browser; never to be pasted into chat.
 - Dashboard binds to `127.0.0.1` only; one-time bootstrap token → HttpOnly session

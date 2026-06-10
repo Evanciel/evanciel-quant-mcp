@@ -1436,8 +1436,8 @@ function renderLive(live){const box=document.getElementById('setlive');if(!box)r
   h+='<div class="ld">자비스에게 "실거래 봇 돌려줘"라고 하면 바로 실매매가 나갑니다. 위 한도가 안전장치예요.</div>';
   h+='<button class="livebtn stop" id="livestop">🛑 실거래 끄기(긴급 — 페이퍼로 전환)</button>';
  }else{
-  h+='<div class="ld">키를 넣었다면, 아래에서 실거래를 켜면 바로 매매가 시작됩니다. 안전을 위해 한도를 정하세요(비우면 기본 50 USDT).</div>';
-  h+='<div class="fld"><label>주문당 최대(USDT)</label><input id="livecap" type="text" inputmode="numeric" autocomplete="off" placeholder="50"></div>';
+  h+='<div class="ld">키를 넣었다면, 아래에서 실거래를 켜면 바로 매매가 시작됩니다. 안전을 위해 한도를 정하세요(비우면 기본 100 USDT; 첫 파일럿은 20~50 권장).</div>';
+  h+='<div class="fld"><label>주문당 최대(USDT)</label><input id="livecap" type="text" inputmode="numeric" autocomplete="off" placeholder="100"></div>';
   h+='<div class="fld"><label>허용 종목</label><input id="liveallow" type="text" autocomplete="off" placeholder="비우면 전체 / 예: BTCUSDT,ETHUSDT"></div>';
   h+='<label class="ld" style="display:flex;gap:7px;align-items:center;cursor:pointer"><input type="checkbox" id="livewd"> 거래소에서 이 키의 <b style="color:#c9d2e3">출금 권한을 껐습니다</b>(거래 권한만). 키 유출 시 자금 보호.</label>';
   h+='<button class="livebtn go" id="livego">💸 실거래 켜기</button>';

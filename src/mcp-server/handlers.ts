@@ -113,7 +113,7 @@ export async function scanUniverse(args: { universe: string[]; metric?: RankMetr
   };
 }
 
-// ── 2. backtest (walk-forward OOS 70/30 + PSR) ──
+// ── 2. backtest (70/30 hold-out OOS + PSR) ── 단일 홀드아웃 분할(롤링/확장 워크포워드 아님: split=floor(len*0.7), train=앞 70%, test=뒤 30%).
 export async function backtest(args: { tree: StrategyNode; symbol?: string; interval?: string; days?: number }) {
   const err = validateRootNode(args.tree);
   if (err) return { ok: false, error: `검증 실패: ${err}` };

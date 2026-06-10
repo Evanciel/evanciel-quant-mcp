@@ -33,7 +33,7 @@ A strategy "tree" is the input for validate/backtest. Minimal leaf example:
 // → { "ok": true, "valid": true, "error": null }
 ```
 
-## 2. backtest — run + walk-forward OOS + PSR
+## 2. backtest — run + 70/30 hold-out OOS + PSR
 > "Backtest this RSI strategy on BTCUSDT 1d over 300 bars."
 
 `backtest` `{ tree, symbol: "BTCUSDT", interval: "1d", days: 300 }`
@@ -86,7 +86,7 @@ A strategy "tree" is the input for validate/backtest. Minimal leaf example:
 ```jsonc
 // → { ok: true, heat: 0.09, effectiveRisk: ..., ddPct: 0.05, state: "...", allowNewEntry: true, sizeMultiplier: 1, reasons: [...] }
 ```
-> Note: v1 has **no account access** — you pass positions in. (Fetching *your live* positions is v2, bring-your-own-keys.)
+> Note: `portfolio_risk` itself takes **no account access** — you pass positions in (pure function). To read your *real* exchange positions/balance, use the `get_positions` / `get_balance` tools (BYOK — keys required).
 
 ## 8. strategy_factory — bulk OOS + Deflated Sharpe survivor filter
 > "Screen these 5 candidate strategies; keep only DSR-survivors."
@@ -100,6 +100,6 @@ A strategy "tree" is the input for validate/backtest. Minimal leaf example:
 ---
 
 ### What this is NOT
-- ❌ It does **not** show your real portfolio/positions (no login, no DB). That live dashboard is a separate app.
-- ❌ It does **not** place trades. v1 is analysis/backtest only.
-- ✅ It **is** a portable quant engine any MCP agent can call for backtesting, risk sizing, regime, and false-discovery filtering on public market data.
+- ❌ **By default (zero keys) it does not trade and does not touch your account** — the analysis tools read only public Binance data.
+- ⚠️ It *can* trade **only if you opt in**: the live BYOK tools (`place_order` / `place_protective`) place real orders **only** after you set exchange keys *and* the master switch (`LIVE_TRADING_ENABLED`), and manual orders still require the fail-closed two-step confirm token. A `mode:live` bot trades live once its key + master-switch gate passes (pre-approved at creation; otherwise it paper-falls-back).
+- ✅ At its core it **is** a portable quant engine any MCP agent can call for backtesting, risk sizing, regime, and false-discovery filtering on public market data — with the live trading surface gated and off by default.

@@ -132,7 +132,7 @@ export const createBotShape = {
   compositeStrategyId: z.string().describe("save_composite가 반환한 전략 id"),
   symbol: z.string().trim().max(40).regex(/^[A-Za-z0-9._/-]*$/, "심볼은 영숫자·._/- 만 허용").optional(),
   capital: z.number().default(1_000_000).describe("운용 자본(페이퍼)"),
-  mode: z.enum(["paper", "live"]).default("paper").describe("paper만 가능(live=v2.5, 키+게이트 필요)"),
+  mode: z.enum(["paper", "live"]).default("paper").describe("paper(기본) 또는 live. live는 브로커 키 + 마스터스위치 게이트 통과 시에만 실주문, 미통과 시 페이퍼 폴백(봇은 생성 시 사전승인 — 주문별 토큰 없음)"),
   broker: z.enum(["binance", "kis", "kiwoom"]).default("binance").describe("브로커(enum 고정 — 임의 문자열 거부)"),
   intervalSeconds: z.number().int().default(60).describe("평가 주기(최소 15초)"),
 };

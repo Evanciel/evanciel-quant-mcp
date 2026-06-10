@@ -179,14 +179,52 @@ export function consumeToken(tok: string, hash: string): boolean {
 
 // ── 감사로그(append-only JSONL) + 일일 실현손익(서킷용) ──
 const auditPath = () => join(dataDir(), "audit.jsonl");
+// 감사 무결성 가시화: 쓰기 실패를 침묵시키지 않고 카운터+마지막 에러를 인메모리로 노출(프로세스 재시작 시 0 리셋).
+let _auditFailures = 0;
+let _lastAuditError = "";
+/**
+ * 머니패스 감사로그(주문 시도/결과/에러, OCO, 봇 주문)를 append-only로 기록.
+ * 트레이드오프(명시 결정): 쓰기 실패(디스크 풀/권한/경로부재) 시 **throw로 거래를 끊지 않는다**(가용성 우선 —
+ * 단일 로그쓰기 실패가 전체 머니패스를 마비시키면 안 됨). 대신 **침묵(noop)은 금지** — stderr 경고 + 실패 카운터로
+ * 크게 알린다(감사 무결성). 따라서 '감사로그 100% 보장'은 아니며, 규제·사후추적이 절대적이면 호출부에서 차단을
+ * 검토해야 한다(본 스코프 밖). stdout 금지: MCP는 StdioServerTransport(stdout=JSON-RPC 전용)라 stderr만 사용.
+ */
 export function audit(entry: Record<string, unknown>): void {
-  try { appendFileSync(auditPath(), JSON.stringify({ ts: new Date().toISOString(), ...entry }) + "\n"); } catch { /* noop */ }
-}
-function dailyRealizedLoss(): number {
-  // 스토어의 오늘 실거래(is_paper=0) pnl 합. 음수=손실.
   try {
-    const today = new Date().toISOString().slice(0, 10);
-    const r = db().prepare(`SELECT COALESCE(SUM(pnl),0) s FROM trades WHERE is_paper=0 AND ts >= ?`).get(today + "T00:00:00.000Z") as { s: number } | undefined;
+    appendFileSync(auditPath(), JSON.stringify({ ts: new Date().toISOString(), ...entry }) + "\n");
+  } catch (e) {
+    _auditFailures++;
+    _lastAuditError = e instanceof Error ? e.message : String(e);
+    try {
+      process.stderr.write(`[quant-mcp][AUDIT-FAIL] 머니패스 감사로그 기록 실패(#${_auditFailures}): ${_lastAuditError} — 거래는 계속되나 감사 무결성 손상. 즉시 디스크/권한 점검 요망.\n`);
+    } catch { /* stderr 마저 실패해도 거래는 끊지 않음(가용성) */ }
+  }
+}
+/** 누적 감사로그 기록 실패 횟수(인메모리, 운영 가시성·테스트용). 프로세스 재시작 시 0. */
+export function auditFailureCount(): number { return _auditFailures; }
+/** 마지막 감사로그 기록 실패 메시지(없으면 ""). */
+export function lastAuditError(): string { return _lastAuditError; }
+
+/**
+ * 일일손실 서킷용 '오늘'의 시작 인스턴트(UTC ISO-Z 문자열). KST(+09:00) 자정 기준이 기본(한국 브로커 KRW 정합).
+ * env LIVE_DAY_BOUNDARY_OFFSET_MIN(분 단위)로 override 가능(기본 540=+09:00). 0이면 UTC 자정, 음수=서쪽 TZ.
+ * 한계: 단일 글로벌 서킷이라 Binance(UTC 운영)엔 9h 의미차 존재(다중통화 통합 서킷의 구조적 한계). 오프셋-시프트
+ * 방식이라 DST 있는 TZ로 override하면 부정확 — 현재 타깃 KRW(KST, DST 없음)엔 정확. trades.ts ts는 UTC-Z 저장이라
+ * 사전식 비교를 위해 경계도 UTC-Z로 환산(KST면 전날 15:00:00.000Z).
+ */
+export function dayBoundaryIso(nowMs: number = Date.now()): string {
+  const ms = 60_000;
+  const raw = trim(process.env.LIVE_DAY_BOUNDARY_OFFSET_MIN);
+  const parsed = Number(raw);
+  const offsetMin = raw !== "" && Number.isFinite(parsed) ? parsed : 540; // 빈문자열/비유한수→기본 540(KST)
+  const shifted = new Date(nowMs + offsetMin * ms); // now를 '로컬 시계'로 시프트
+  const localMidUTC = Date.UTC(shifted.getUTCFullYear(), shifted.getUTCMonth(), shifted.getUTCDate());
+  return new Date(localMidUTC - offsetMin * ms).toISOString(); // 로컬 자정을 실제 UTC 인스턴트로 되빼기
+}
+/** 스토어의 '오늘'(일경계=KST 기본, dayBoundaryIso) 실거래(is_paper=0) pnl 합. 음수=손실. export=단위테스트용(머니패스 무변경). */
+export function dailyRealizedLoss(): number {
+  try {
+    const r = db().prepare(`SELECT COALESCE(SUM(pnl),0) s FROM trades WHERE is_paper=0 AND ts >= ?`).get(dayBoundaryIso()) as { s: number } | undefined;
     return r?.s ?? 0;
   } catch { return 0; }
 }
