@@ -231,10 +231,12 @@ export function runBacktest(
       }
 
       if (rule.action === "buy" && position === 0) {
-        // 사이징: riskSizing 있으면 변동성 타게팅, 없으면 legacy(balance*qp/100) 바이트 동일. 엔진·러너 공용함수 → backtest≡live.
+        // 사이징: riskSizing 있으면 변동성 타게팅/ATR/Kelly, 없으면 legacy(balance*qp/100) 바이트 동일. 엔진·러너 공용함수 → backtest≡live.
+        // highs/lows는 ATR 모드만 사용(legacy/vol_target/kelly은 무시) → 추가 전달이 기존 모드 결과를 바꾸지 않음(회귀 0).
         const qty = computeOrderQty({
           equity: balance, price: fillPrice, commissionPct: config.commission,
-          closes: prices.slice(0, i + 1), timeframe: config.timeframe ?? "1d",
+          closes: prices.slice(0, i + 1), highs: highs.slice(0, i + 1), lows: lows.slice(0, i + 1),
+          timeframe: config.timeframe ?? "1d",
           legacyQuantityPercent: rule.quantityPercent, riskSizing: config.riskSizing ?? null,
         }).qty;
         if (qty > 0) {
@@ -798,10 +800,12 @@ export function runCompositeBacktest(
         if (rule.action === "buy" && position === 0) {
           const slip = (config.slippage ?? 0.05) / 100;
           const buyPrice = price * (1 + slip);
-          // 사이징: riskSizing 있으면 변동성 타게팅, 없으면 legacy 바이트 동일. 러너는 want.qty로 이 결과를 그대로 라이브 반영.
+          // 사이징: riskSizing 있으면 변동성 타게팅/ATR/Kelly, 없으면 legacy 바이트 동일. 러너는 want.qty로 이 결과를 그대로 라이브 반영.
+          // highs/lows는 ATR 모드만 사용(legacy/vol_target/kelly은 무시) → 기존 모드 결과 불변(회귀 0).
           const qty = computeOrderQty({
             equity: balance, price: buyPrice, commissionPct: config.commission ?? 0.1,
-            closes: prices.slice(0, i + 1), timeframe: config.timeframe ?? "1d",
+            closes: prices.slice(0, i + 1), highs: highs.slice(0, i + 1), lows: lows.slice(0, i + 1),
+            timeframe: config.timeframe ?? "1d",
             legacyQuantityPercent: rule.quantityPercent, riskSizing: config.riskSizing ?? null,
           }).qty;
           if (qty > 0) {

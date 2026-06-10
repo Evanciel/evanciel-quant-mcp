@@ -16,7 +16,9 @@ import { computeOrderQty } from "../core/risk/order-sizing.js"; // 스캐너 진
 // 주: computePositionDrift(포지션 드리프트 정정)는 선물(심볼별 순포지션) 개념. 현물은 공유 잔고라 봇별 귀속 불가 → 선물 봇 도입 시 배선.
 import * as store from "../store/db.js";
 import { getAdapter } from "../brokers/index.js";
-import { liveGate, checkLimits, audit, type Broker } from "../brokers/safety.js";
+import { liveGate, checkLimits, audit, loadPortfolioGateConfig, portfolioGate, type Broker } from "../brokers/safety.js";
+import { floorQty } from "../core/position/qty.js";
+import type { PortfolioPosition } from "../core/risk/portfolio.js";
 
 /**
  * 봇 체결: mode=live + 게이트 통과면 실주문(어댑터), 아니면 페이퍼. 자율봇이라 2단계토큰 없음
@@ -149,6 +151,75 @@ function derivePosition(trades: { action: string; price: number; quantity: numbe
   return { holding: qty > 1e-9, entryAvg: qty > 0 ? cost / qty : 0, qty };
 }
 
+// ── 포트폴리오 레벨 캡(opt-in) — 러너측 스냅샷 + 진입 게이트 적용 ──
+// 러너가 position_state 모양(단일 PaperPosition / 스캐너 심볼맵)을 알므로 노출 추출은 여기서 한다.
+// 게이트 자체는 safety.portfolioGate(순수). env 미설정이면 buildPortfolioSnapshot도 호출 안 됨 → 오버헤드/거동 변화 0.
+
+/** 한 봇의 position_state에서 오픈 포지션 노출(=진입평단×수량)들을 추출. 단일/스캐너맵 양형 지원. 라이브 마크 불요(보수적 진입노셔널). */
+function exposuresOf(positionState: unknown, symbol: string): { symbol: string; notional: number }[] {
+  if (!positionState || typeof positionState !== "object") return [];
+  const ps = positionState as Record<string, unknown>;
+  // 단일 포지션: { status:"open", entryAvg, qty }
+  if (ps.status === "open" && typeof ps.qty === "number" && typeof ps.entryAvg === "number") {
+    const n = ps.entryAvg * ps.qty;
+    return n > 0 ? [{ symbol, notional: n }] : [];
+  }
+  // 스캐너 심볼맵: { [sym]: { status:"open", entryAvg, qty } }
+  const out: { symbol: string; notional: number }[] = [];
+  for (const [sym, v] of Object.entries(ps)) {
+    if (v && typeof v === "object") {
+      const p = v as Record<string, unknown>;
+      if (p.status === "open" && typeof p.qty === "number" && typeof p.entryAvg === "number") {
+        const n = p.entryAvg * p.qty;
+        if (n > 0) out.push({ symbol: sym, notional: n });
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * 포트폴리오 스냅샷(읽기전용). 가동 봇 전체의 오픈 노출 + 실현손익 곡선으로 equity/peakEquity·positions 구성.
+ *  - equity   = Σ(가동 봇 capital) + 실현손익(보수적: 미실현 제외)
+ *  - peakEquity = Σ capital + 실현손익 곡선 고점(고수위)
+ *  - positions = 각 오픈 포지션의 { symbol, riskFraction=노셔널/equity }
+ * pendingNotional(이번에 낼 진입 노셔널)을 heat에 선반영 — 새 진입 후 총노출로 캡 판정(과노출 사전 차단).
+ * 진입 봇의 기존 포지션은 가동봇 순회에 포함되고 pending이 그 위에 더해지므로, 합산이 곧 '진입 후' 상태.
+ */
+function buildPortfolioSnapshot(pendingSymbol: string, pendingNotional: number): { positions: PortfolioPosition[]; equity: number; peakEquity: number } {
+  const running = store.listRunningBots();
+  const baseCapital = running.reduce((a, b) => a + (Number.isFinite(b.capital) ? b.capital : 0), 0);
+  const { realized, peakCum } = store.realizedEquityCurve();
+  const equity = Math.max(1e-9, baseCapital + realized); // 0 division 가드
+  const peakEquity = Math.max(equity, baseCapital + peakCum);
+  const exps: { symbol: string; notional: number }[] = [];
+  for (const b of running) for (const e of exposuresOf(b.position_state, b.symbol)) exps.push(e);
+  if (pendingNotional > 0) exps.push({ symbol: pendingSymbol, notional: pendingNotional }); // 진입 예정분 선반영
+  const positions: PortfolioPosition[] = exps.map((e) => ({ symbol: e.symbol, riskFraction: e.notional / equity }));
+  return { positions, equity, peakEquity };
+}
+
+/**
+ * 신규진입 게이트 적용(opt-in). config.enabled=false면 { qty 그대로, blocked:false } — 거동 변화 0(legacy 바이트 동일).
+ * 활성 시: 진입 예정 노셔널을 포함한 스냅샷으로 portfolioGate 호출 →
+ *   - allow=false: blocked=true(진입 스킵)
+ *   - sizeMultiplier<1: qty를 배수로 **축소만**(floorQty). 0으로 떨어지면 blocked.
+ * 절대 증액 안 함(정규화-후-캡). reasons는 로깅용.
+ */
+function applyPortfolioGate(symbol: string, qty: number, price: number): { qty: number; blocked: boolean; reasons: string[] } {
+  const cfg = loadPortfolioGateConfig();
+  if (!cfg.enabled || !(qty > 0) || !(price > 0)) return { qty, blocked: false, reasons: [] };
+  const snap = buildPortfolioSnapshot(symbol, qty * price);
+  const g = portfolioGate(cfg, snap);
+  if (!g.allow) return { qty: 0, blocked: true, reasons: g.reasons };
+  if (g.sizeMultiplier < 1) {
+    const scaled = floorQty(qty * g.sizeMultiplier);
+    if (!(scaled > 0)) return { qty: 0, blocked: true, reasons: [...g.reasons, `MDD 디리스킹 ×${g.sizeMultiplier} → 수량 0`] };
+    return { qty: scaled, blocked: false, reasons: g.reasons };
+  }
+  return { qty, blocked: false, reasons: g.reasons };
+}
+
 /** 봇 1회 평가(틱). 신호 전이 시 페이퍼 체결 기록 + position_state 갱신. */
 export async function tickBot(botId: string): Promise<{ action: "buy" | "sell" | "hold"; detail: string }> {
   const bot = store.getBot(botId);
@@ -217,18 +288,33 @@ export async function tickBot(botId: string): Promise<{ action: "buy" | "sell" |
   const plan = planPositionDelta(curQty, want, price, bot.capital);
 
   if (plan.side === "buy") {
+    // 포트폴리오 레벨 캡(opt-in): 진입 델타에만 적용(매도/청산 무관). 미설정이면 gate.qty===plan.qty(거동 변화 0).
+    //  - blocked: 과노출/MDD halt → 진입 스킵(보유 유지). - 축소: MDD 디리스킹 배수로 델타 감소(증액 없음).
+    const gate = applyPortfolioGate(bot.symbol, plan.qty, price);
+    if (gate.blocked) {
+      store.insertLog(botId, "gate", `포트폴리오 캡: 진입 차단(${gate.reasons.join("; ") || "한도 초과"}) → 보유 유지`);
+      store.setBotPositionState(botId, cur);
+      return { action: "hold", detail: `포트폴리오 캡 진입 차단(${gate.reasons.join("; ") || "한도"})` };
+    }
+    const buyQty = gate.qty;                          // 캡 적용 후 실제 매수 델타(미설정=plan.qty 그대로)
+    const scaled = buyQty < plan.qty;                 // MDD 디리스킹으로 축소됐는가
+    const actualWantQty = scaled ? curQty + buyQty : plan.wantQty; // 축소 시 실제 도달 넷(엔진 목표 아님 → 다음 틱 재매수 폭주 방지)
     // 신규 진입 또는 추가매수(스케일인/피라미딩). entryAvg는 엔진 가중평단(want.entryAvg)으로 갱신.
-    const fill = await fillOrder(bot, "buy", plan.qty, price);
+    const fill = await fillOrder(bot, "buy", buyQty, price);
     const reason = plan.partial ? "추가매수(스케일인/피라미딩)" : "전략 진입";
-    const t = store.insertTrade({ bot_id: botId, side: "buy", price: fill.price, qty: plan.qty, pnl: 0, is_paper: fill.live ? 0 : 1, reason, idempotency_key: idem("buy") });
+    const t = store.insertTrade({ bot_id: botId, side: "buy", price: fill.price, qty: buyQty, pnl: 0, is_paper: fill.live ? 0 : 1, reason, idempotency_key: idem("buy") });
     if (t) {
-      const entryAvg = want.entryAvg > 0 ? want.entryAvg : fill.price;
+      // 평단: 미축소면 엔진 가중평단 그대로(기존 동작 동일). 축소면 기존보유+부분추가의 가중평균(엔진 목표 미도달이라 직접 산출).
+      const entryAvg = scaled
+        ? (curQty + buyQty > 0 ? (curQty * (cur?.entryAvg ?? fill.price) + buyQty * fill.price) / (curQty + buyQty) : fill.price)
+        : (want.entryAvg > 0 ? want.entryAvg : fill.price);
       const peakPrice = Math.max(cur?.peakPrice ?? entryAvg, price);
       // 라이브: 거래소 상주 보호주문(SL/TP/트레일링) 배치/갱신. 페이퍼: no-op(엔진이 시뮬레이트).
-      const protectiveIds = await syncBotProtective(bot, bot.symbol, plan.wantQty, entryAvg, peakPrice, risk, cur?.protectiveIds ?? []);
-      store.setBotPositionState(botId, { status: "open", entryAvg, qty: plan.wantQty, openedAt: cur?.openedAt ?? new Date().toISOString(), peakPrice, protectiveIds } satisfies PaperPosition, true, true);
-      store.insertLog(botId, "buy", `[${fill.live ? "실거래" : "페이퍼"}] ${reason} +${plan.qty} → 보유 ${plan.wantQty} @ ${fill.price}(평단 ${entryAvg.toFixed(2)})`);
-      return { action: "buy", detail: `${reason} +${plan.qty} (보유 ${plan.wantQty}, ${fill.note})` };
+      const protectiveIds = await syncBotProtective(bot, bot.symbol, actualWantQty, entryAvg, peakPrice, risk, cur?.protectiveIds ?? []);
+      store.setBotPositionState(botId, { status: "open", entryAvg, qty: actualWantQty, openedAt: cur?.openedAt ?? new Date().toISOString(), peakPrice, protectiveIds } satisfies PaperPosition, true, true);
+      const capNote = scaled ? ` [포트폴리오 캡 ×축소 ${plan.qty}→${buyQty}]` : "";
+      store.insertLog(botId, "buy", `[${fill.live ? "실거래" : "페이퍼"}] ${reason} +${buyQty} → 보유 ${actualWantQty} @ ${fill.price}(평단 ${entryAvg.toFixed(2)})${capNote}`);
+      return { action: "buy", detail: `${reason} +${buyQty} (보유 ${actualWantQty}, ${fill.note})${capNote}` };
     }
     return { action: "hold", detail: "매수 중복 스킵" };
   }
@@ -342,14 +428,19 @@ async function tickScanner(bot: store.BotRow, node: ScannerNode, riskSizing?: Ba
   for (const sym of toOpen) {
     const price = priceOf[sym];
     if (price === undefined || price <= 0) continue;
-    // riskSizing 있으면 변동성 타게팅(심볼별 종가로 realizedVol), 없으면 기존 floor(perSymCapital/price) 그대로(회귀 0).
+    // riskSizing 있으면 변동성 타게팅/ATR/Kelly(심볼별 종가·고저로 산출), 없으면 기존 floor(perSymCapital/price) 그대로(회귀 0).
+    const symBars = barsOf[sym] ?? [];
     const qty = riskSizing
-      ? computeOrderQty({ equity: perSymCapital, price, commissionPct: 0.1, closes: (barsOf[sym] ?? []).map((b) => b.close), timeframe: interval, legacyQuantityPercent: 100, riskSizing }).qty
+      ? computeOrderQty({ equity: perSymCapital, price, commissionPct: 0.1, closes: symBars.map((b) => b.close), highs: symBars.map((b) => b.high), lows: symBars.map((b) => b.low), timeframe: interval, legacyQuantityPercent: 100, riskSizing }).qty
       : Math.floor(perSymCapital / price);
     if (qty <= 0) continue;
-    const fill = await fillOrder(bot, "buy", qty, price, sym);
-    const t = store.insertTrade({ bot_id: bot.id, side: "buy", price: fill.price, qty, pnl: 0, is_paper: fill.live ? 0 : 1, reason: `스캐너 진입(${sym}, ${node.rank.metric} 상위)`, idempotency_key: `${bot.id}:${sym}:${barIso(sym)}:buy` });
-    if (t) { positions[sym] = { status: "open", entryAvg: fill.price, qty, openedAt: new Date().toISOString() }; opens++; store.insertLog(bot.id, "buy", `[${fill.live ? "실거래" : "페이퍼"}] ${sym} 진입 qty=${qty} @ ${fill.price}`); }
+    // 포트폴리오 레벨 캡(opt-in): 심볼별 진입에 적용. 미설정이면 gate.qty===qty(거동 변화 0). blocked면 이 심볼 진입 스킵.
+    const gate = applyPortfolioGate(sym, qty, price);
+    if (gate.blocked) { store.insertLog(bot.id, "gate", `포트폴리오 캡: ${sym} 진입 차단(${gate.reasons.join("; ") || "한도"})`); continue; }
+    const buyQty = gate.qty;
+    const fill = await fillOrder(bot, "buy", buyQty, price, sym);
+    const t = store.insertTrade({ bot_id: bot.id, side: "buy", price: fill.price, qty: buyQty, pnl: 0, is_paper: fill.live ? 0 : 1, reason: `스캐너 진입(${sym}, ${node.rank.metric} 상위)`, idempotency_key: `${bot.id}:${sym}:${barIso(sym)}:buy` });
+    if (t) { positions[sym] = { status: "open", entryAvg: fill.price, qty: buyQty, openedAt: new Date().toISOString() }; opens++; store.insertLog(bot.id, "buy", `[${fill.live ? "실거래" : "페이퍼"}] ${sym} 진입 qty=${buyQty} @ ${fill.price}${buyQty < qty ? ` [포트폴리오 캡 ×축소 ${qty}→${buyQty}]` : ""}`); }
   }
 
   store.setBotPositionState(bot.id, positions, true, opens + closes > 0);

@@ -15,12 +15,18 @@ interface OHLCV { date: string; open: number; high: number; low: number; close: 
 import { calcMaxDrawdown, calcSharpeRatio } from "./metrics";
 import { openShort, evaluateShortTick, computeShortPnl, type ShortPosition } from "../position/short";
 import { floorQty } from "../position/qty";
+import { computeOrderQty } from "../risk/order-sizing";
 
 export interface ShortRisk {
   stopLossPercent?: number | null;
   takeProfitPercent?: number | null;
   trailingStopPercent?: number | null;
   fundingRatePerInterval?: number | null; // 봉당 펀딩(숏 수취 모델). 미지정 시 0(펀딩 무시).
+  // ── 선물 레버리지 opt-in. 미지정/≤1이면 기존 노레버 사이징(notional=capital) **바이트 동일**(회귀 0). ──
+  // >1이면 진입 명목=capital×leverage(computeOrderQty 선물 경로 공용 → 라이브 선물 어댑터 도입 시 backtest≡live).
+  // 청산가/펀딩/트레일링은 short.ts(openShort+evaluateShortTick)가 leverage로 이미 처리(엔진 변경 0).
+  leverage?: number | null;
+  maxLeverage?: number | null; // 레버리지 새너티 상한(기본 20, computeFuturesSize 클램프 기준).
 }
 
 /**
@@ -46,6 +52,8 @@ export function runShortBacktest(
   const comm = (config.commission ?? 0.1) / 100;
   const slip = (config.slippage ?? 0.05) / 100;
   const fundingRate = typeof risk?.fundingRatePerInterval === "number" ? risk.fundingRatePerInterval : null;
+  // 레버리지: >1일 때만 선물 사이징 활성(아니면 노레버=현물 환산, 기존 동작 바이트 동일). short.ts 청산가/펀딩이 이 leverage 사용.
+  const leverage = typeof risk?.leverage === "number" && risk.leverage > 1 ? risk.leverage : 1;
 
   for (let i = 0; i < data.length; i++) {
     const price = data[i].close;
@@ -74,14 +82,22 @@ export function runShortBacktest(
     }
 
     if (!pos && sig.sell && !sig.buyRule) {
-      // 약세 신호 → 숏 진입(노레버: notional=capital)
+      // 약세 신호 → 숏 진입. 노레버(기본): notional=capital → floorQty(capital/entryPrice) **바이트 동일**.
+      //   레버리지>1(opt-in): computeOrderQty 선물 경로(notional=capital×leverage, 캡 capital×leverage). 공용 함수 → 라이브 선물 도입 시 backtest≡live.
       const entryPrice = price * (1 - slip); // 숏 매도 = 슬리피지 불리(가격↓ 체결)
-      const qty = floorQty(config.initialCapital / entryPrice);
+      const qty = leverage > 1
+        ? computeOrderQty({
+            equity: config.initialCapital, price: entryPrice, commissionPct: config.commission ?? 0.1,
+            closes: prices.slice(0, i + 1), timeframe: config.timeframe ?? "1d",
+            legacyQuantityPercent: 100, riskSizing: null,
+            market: "futures", leverage, maxLeverage: typeof risk?.maxLeverage === "number" ? risk.maxLeverage : undefined,
+          }).qty
+        : floorQty(config.initialCapital / entryPrice);
       if (qty > 0) {
         pos = openShort({
           entryPrice, qty,
           stopLossPercent: risk?.stopLossPercent, takeProfitPercent: risk?.takeProfitPercent,
-          trailingStopPercent: risk?.trailingStopPercent, openedAt: data[i].date,
+          trailingStopPercent: risk?.trailingStopPercent, leverage, openedAt: data[i].date,
         });
         trades.push({ date: data[i].date, action: "sell", price: entryPrice, quantity: qty, pnl: 0, balance });
       }

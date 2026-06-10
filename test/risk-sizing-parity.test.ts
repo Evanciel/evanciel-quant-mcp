@@ -71,3 +71,41 @@ describe("리스크 사이징 패리티 — vol_target 효과 + 함수 동치(SC
     expect(sized.quantity).toBeLessThanOrEqual(legacy.quantity);
   });
 });
+
+describe("리스크 사이징 패리티 — atr 진입 qty == computeOrderQty(엔진과 동일 입력)", () => {
+  const atrCfg: RiskSizingConfig = { method: "atr", riskPct: 0.01, atrMult: 2, atrPeriod: 14 };
+
+  it("엔진 ATR 진입 수량이 동일 슬라이스(closes/highs/lows) computeOrderQty와 일치 → backtest≡live", () => {
+    const res = run(atrCfg);
+    const entry = res.trades.find((t) => t.action === "buy")!;
+    expect(entry).toBeTruthy();
+    const idx = bars.findIndex((b) => b.date === entry.date);
+    expect(idx).toBeGreaterThanOrEqual(0);
+    // 엔진은 진입 봉 i에서 closes/highs/lows = slice(0, i+1)로 ATR 사이징. 동일 입력으로 직접 호출 → 동일 qty.
+    const closes = bars.map((b) => b.close), highs = bars.map((b) => b.high), lows = bars.map((b) => b.low);
+    const direct = computeOrderQty({
+      equity: 100_000, price: entry.price, commissionPct: 0.1,
+      closes: closes.slice(0, idx + 1), highs: highs.slice(0, idx + 1), lows: lows.slice(0, idx + 1),
+      timeframe: "1h", legacyQuantityPercent: 100, riskSizing: atrCfg,
+    }).qty;
+    expect(direct).toBeGreaterThan(0);
+    expect(entry.quantity).toBe(direct);
+  });
+});
+
+describe("리스크 사이징 패리티 — kelly 진입 qty == computeOrderQty(엔진과 동일 입력)", () => {
+  // 정적 통계(에이전트 선언) → 엔진·러너 동일 config → 발산원 없음. fraction-of-equity 사이징.
+  const kCfg: RiskSizingConfig = { method: "kelly", winRate: 0.6, avgWin: 2, avgLoss: 1, fraction: 0.5, sampleSize: 200 };
+
+  it("엔진 Kelly 진입 수량이 동일 입력 computeOrderQty와 일치 → backtest≡live", () => {
+    const res = run(kCfg);
+    const entry = res.trades.find((t) => t.action === "buy")!;
+    expect(entry).toBeTruthy();
+    const direct = computeOrderQty({
+      equity: 100_000, price: entry.price, commissionPct: 0.1,
+      closes: bars.map((b) => b.close), timeframe: "1h", legacyQuantityPercent: 100, riskSizing: kCfg,
+    }).qty;
+    expect(direct).toBeGreaterThan(0);
+    expect(entry.quantity).toBe(direct);
+  });
+});

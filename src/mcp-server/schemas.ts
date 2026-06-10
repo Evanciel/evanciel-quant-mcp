@@ -79,13 +79,37 @@ export const strategyFactoryShape = {
   minDsr: z.number().default(0.95).describe("생존 DSR 임계(기본 0.95, 다중검정 보정)"),
 };
 
-// 변동성 타게팅 사이징 설정(현물: leverageCap≤1 강제, targetVol 상한 200% 새너티).
-export const riskSizingSchema = z.object({
+// 사이징 설정(opt-in). 3모드 디스크리미네이티드 유니언 — 전부 "리스크 통제"이지 알파원이 아님(정직 포지셔닝).
+// 미지정 시 기존 quantityPercent(legacy) 그대로. computeOrderQty가 엔진·러너 공용 → backtest≡live.
+// vol_target: 현물 leverageCap≤1 강제, targetVol 상한 200% 새너티.
+const volTargetSizingSchema = z.object({
   method: z.literal("vol_target"),
   targetVolAnnual: z.number().positive().max(2).describe("목표 연환산 변동성(예: 0.2=20%)"),
   leverageCap: z.number().positive().max(1).optional().describe("레버리지 상한(현물 기본 1.0)"),
   lookback: z.number().int().positive().optional().describe("realizedVol 계산 봉수(기본=가용분)"),
 });
+// atr: 트레이드당 리스크를 equity의 riskPct로 고정(notional≤equity 캡). 자산/변동성 무관 손실 일정 → 다심볼 혼합 적합.
+const atrSizingSchema = z.object({
+  method: z.literal("atr"),
+  riskPct: z.number().positive().max(0.5).describe("트레이드당 리스크 비중(예: 0.01=1%). 새너티 상한 50%"),
+  atrMult: z.number().positive().max(20).optional().describe("스톱거리=ATR×atrMult(기본 2.0)"),
+  atrPeriod: z.number().int().positive().max(500).optional().describe("ATR 계산 기간(기본 14)"),
+  lookback: z.number().int().positive().optional().describe("ATR 계산용 최근 봉수(기본=가용분)"),
+});
+// kelly: fractional Kelly. 통계(winRate/avgWin/avgLoss)는 에이전트 선언(정적) — 표본<minSample이면 fallback. capFraction 25% 내부 상한.
+const kellySizingSchema = z.object({
+  method: z.literal("kelly"),
+  winRate: z.number().min(0).max(1).describe("승률(0~1)"),
+  avgWin: z.number().positive().describe("평균 이익 크기(양수)"),
+  avgLoss: z.number().positive().describe("평균 손실 크기(양수)"),
+  fraction: z.number().positive().max(1).optional().describe("켈리 분율(기본 0.5=Half-Kelly)"),
+  sampleSize: z.number().int().nonnegative().optional().describe("통계 표본수(기본 0 → 100 미만이면 보수적 fallback)"),
+});
+export const riskSizingSchema = z.discriminatedUnion("method", [
+  volTargetSizingSchema,
+  atrSizingSchema,
+  kellySizingSchema,
+]);
 
 // ── v2: 봇/전략/대시보드 (로컬 스토어 + 페이퍼 러너) ──
 export const saveCompositeShape = {
@@ -100,7 +124,7 @@ export const saveCompositeShape = {
   scaleIn: z.unknown().optional(),
   pyramid: z.unknown().optional(),
   trailingStopPercent: z.number().optional(),
-  riskSizing: riskSizingSchema.optional().describe("변동성 타게팅 사이징(리스크 통제, 알파 아님). 생략 시 기존 quantityPercent"),
+  riskSizing: riskSizingSchema.optional().describe("사이징 모드(리스크 통제, 알파 아님): vol_target=변동성 타게팅 / atr=ATR 트레이드당 리스크 고정 / kelly=fractional Kelly. 생략 시 기존 quantityPercent"),
 };
 export const createBotShape = {
   name: z.string().describe("봇 이름"),

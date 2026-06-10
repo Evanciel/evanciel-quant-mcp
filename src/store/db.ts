@@ -155,3 +155,20 @@ export function recentTrades(bot_id: string, limit = 50): TradeRow[] {
 export function recentLogs(bot_id: string, limit = 50): LogRow[] {
   return db().prepare(`SELECT * FROM bot_logs WHERE bot_id=? ORDER BY ts DESC LIMIT ?`).all(bot_id, limit) as unknown as LogRow[];
 }
+
+/**
+ * 포트폴리오 실현손익 곡선 요약(전 봇 합산, 시간순). 포트폴리오 레벨 캡(MDD 디리스킹)의 peak 자기자본 도출용.
+ *  - realized = Σpnl(전 거래, 청산 시 기록) → 현재까지 실현손익.
+ *  - peakCum  = 실현손익 누적곡선의 고점(prefix-sum 최댓값, 음수면 0). base+peakCum = peak equity.
+ * 영속 peak 컬럼 없이 거래이력에서 결정적으로 도출(스키마 변경 0). 미실현은 포함 안 함(라이브 마크 신뢰원 부재 → 보수적).
+ */
+export function realizedEquityCurve(): { realized: number; peakCum: number } {
+  try {
+    const total = db().prepare(`SELECT COALESCE(SUM(pnl),0) s FROM trades`).get() as { s: number } | undefined;
+    // 누적합의 최댓값(고점). 거래 0건이면 peak 0.
+    const peak = db().prepare(
+      `SELECT COALESCE(MAX(cum),0) p FROM (SELECT SUM(pnl) OVER (ORDER BY ts, id) AS cum FROM trades)`
+    ).get() as { p: number } | undefined;
+    return { realized: total?.s ?? 0, peakCum: Math.max(0, peak?.p ?? 0) };
+  } catch { return { realized: 0, peakCum: 0 }; }
+}

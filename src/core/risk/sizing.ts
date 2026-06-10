@@ -145,3 +145,46 @@ export function computePositionSize(opts: {
       return wrap(equity * (opts.riskPct ?? 0.01), { riskPct: opts.riskPct ?? 0.01 });
   }
 }
+
+/**
+ * 롱 청산가(레버리지) ≈ 진입 × (1 − 1/leverage + mmr). 진입 '아래'(하락 시 강제청산). leverage=1이면 ~0(현물 무청산).
+ * short.ts shortLiquidationPrice(숏=진입 위)의 부호 미러. ⚠️ 근사치 — 라이브는 거래소 positionRisk.liquidationPrice를 신뢰원으로.
+ */
+export function longLiquidationPrice(entry: number, leverage: number, mmr = 0.005): number {
+  if (!(leverage > 1)) return 0; // 현물/무레버리지는 강제청산 없음 → 0(없음 표시)
+  return Math.max(0, entry * (1 - 1 / leverage + mmr));
+}
+
+/**
+ * 선물(레버리지) 사이징(순수, I/O 0) → 라이브·백테 공용(backtest≡live).
+ *
+ * notional = baseNotional × leverage. baseNotional은 호출자가 산출한 '현물 환산 노출'(equity 대비 ≤1, 예: legacy/vol_target/atr/kelly 결과).
+ *   → 선물은 그 노출을 레버리지배로 확대. legacy(quantityPercent=100, baseNotional=equity)면 notional=equity×leverage(=capital×leverage, 요구사항 직역).
+ * margin = notional / leverage (= 투입 증거금, 명목이 아닌 실제 묶이는 자본).
+ * 안전(정규화-후-캡): notional은 equity×maxLeverage를 넘지 않음. leverage는 [1, maxLeverage] 클램프(과도 레버리지 차단).
+ *   margin이 equity를 초과하지 않음(notional≤equity×leverage ⇒ margin=notional/leverage≤equity).
+ * liqPrice: 롱 청산가 근사(longLiquidationPrice). side="short"면 shortLiquidationPrice 의미(여기선 가격만, 호출자가 사용).
+ *
+ * 정직: 레버리지는 '알파'가 아니라 노출 배율 — 손실도 배가된다. 이 함수는 사이징 수학만 제공(리스크 통제는 SL/청산가 상주주문이 담당).
+ */
+export function computeFuturesSize(opts: {
+  equity: number; price: number; leverage: number;
+  baseNotional?: number;   // 레버리지 적용 전 현물 환산 노출(미지정 시 equity = 1배 풀노출)
+  maxLeverage?: number;    // 레버리지 새너티 상한(기본 20). 클램프 상한 + notional 캡 기준.
+  mmr?: number;            // 유지증거금률(청산가 근사용, 기본 0.005)
+}): { units: number; notional: number; margin: number; leverage: number; liqPrice: number } {
+  const { equity, price, mmr = 0.005 } = opts;
+  const maxLeverage = opts.maxLeverage && opts.maxLeverage > 0 ? opts.maxLeverage : 20;
+  // 레버리지 클램프: [1, maxLeverage]. ≤0/NaN → 1(현물 동치, 안전).
+  const lev = Number.isFinite(opts.leverage) && opts.leverage > 1 ? Math.min(opts.leverage, maxLeverage) : 1;
+  if (!(equity > 0) || !(price > 0)) return { units: 0, notional: 0, margin: 0, leverage: lev, liqPrice: 0 };
+  // baseNotional: 미지정/비정상 → equity(1배 풀노출). 음수 가드. equity 초과분은 의미상 그대로 두되(현물 환산 노출은 캡 호출자 책임),
+  //   최종 notional 단계에서 equity×leverage로 정규화-후-캡 → margin≤equity 보장.
+  const base = Number.isFinite(opts.baseNotional) && (opts.baseNotional as number) > 0 ? (opts.baseNotional as number) : equity;
+  const rawNotional = base * lev;
+  const notional = Math.max(0, Math.min(rawNotional, equity * lev)); // 캡: 명목 ≤ equity×leverage
+  const units = notional / price;
+  const margin = notional / lev; // 묶이는 증거금(≤ equity)
+  const liqPrice = longLiquidationPrice(price, lev, mmr);
+  return { units, notional, margin, leverage: lev, liqPrice };
+}

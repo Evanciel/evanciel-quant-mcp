@@ -8,6 +8,7 @@ import { appendFileSync } from "node:fs";
 import { join } from "node:path";
 import { dataDir, db } from "../store/db.js";
 import type { BrokerCredentials } from "./types.js";
+import { evaluatePortfolioRisk, type PortfolioPosition, type CircuitState } from "../core/risk/portfolio.js";
 
 export type Broker = "binance" | "kis" | "kiwoom";
 export type Env = "testnet" | "mock" | "live";
@@ -87,6 +88,73 @@ export function checkLimits(order: { symbol: string; notional: number; quoteCurr
   const circuit = explicitCircuit || (liveActive ? def.dailyLoss : 0);
   if (circuit > 0 && dl <= -Math.abs(circuit)) return { ok: false, reason: `일일 손실 ${dl} ≤ 서킷 -${circuit}(LIVE_DAILY_LOSS_LIMIT${explicitCircuit ? "" : " 기본값"}) → 거래중단` };
   return { ok: true, reason: "ok" };
+}
+
+// ── 포트폴리오 레벨 캡(opt-in, 신규진입 게이트). 과노출/MDD 차단 — 봇별 사이징과 별개의 '교차봇 throttle'. ──
+//
+// 왜 게이트인가(불변식 보존): backtest≡live는 "엔진이 단일 사이징 소스 → 러너가 want.qty 상속"으로 보장된다.
+// 포트폴리오 캡은 본질적으로 **다른 봇들의 오픈 포지션 + 계좌 자기자본**에 의존하므로 봇별 백테스트 엔진이 알 수 없다
+// (엔진에 넣으면 오히려 backtest≡live를 깬다). 따라서 엔진이 want.qty를 정한 **뒤** 라이브 주문에만 적용되는
+// 신규진입 throttle로 배선한다: ① allowNewEntry=false면 진입 스킵 ② MDD 디리스킹이면 qty를 sizeMultiplier로 **축소만**
+// (정규화-후-캡, 절대 증액 안 함). 백테스트는 포트폴리오 컨텍스트가 없어 영향 0 → 미설정 시 legacy 바이트 동일(회귀 0).
+//
+// 정직: 알파가 아니라 '파산위험/과노출 통제'(리서치 결론). 미설정(env 없음)=완전 OFF.
+
+/** 포트폴리오 캡 설정(env opt-in). 하나라도 설정되면 enabled. 전부 미설정이면 enabled=false(no-op). */
+export interface PortfolioGateConfig {
+  enabled: boolean;
+  maxHeat?: number;     // 총노출(heat) 상한(자기자본 대비 비율). QUANT_MCP_PORTFOLIO_MAX_HEAT
+  riskBudget?: number;  // 상관보정 실효리스크 상한. QUANT_MCP_PORTFOLIO_RISK_BUDGET
+  avgCorr: number;      // 가정 평균상관(기본 0.7). QUANT_MCP_PORTFOLIO_AVG_CORR
+  mdd: boolean;         // MDD 단계적 디리스킹 활성. QUANT_MCP_PORTFOLIO_MDD=true
+}
+
+/** env에서 포트폴리오 캡 설정 로드(순수). 캡/리스크버짓/MDD 중 하나라도 있으면 enabled. */
+export function loadPortfolioGateConfig(): PortfolioGateConfig {
+  const num = (v?: string) => { const n = Number(trim(v)); return Number.isFinite(n) && n > 0 ? n : undefined; };
+  const maxHeat = num(process.env.QUANT_MCP_PORTFOLIO_MAX_HEAT);
+  const riskBudget = num(process.env.QUANT_MCP_PORTFOLIO_RISK_BUDGET);
+  const mdd = trim(process.env.QUANT_MCP_PORTFOLIO_MDD) === "true";
+  // avgCorr 기본 0.7. 빈문자열(미설정)은 Number("")=0이라 명시 0과 구분 — 미설정이면 기본값, 명시 [0,1]만 채택.
+  const avgCorrStr = trim(process.env.QUANT_MCP_PORTFOLIO_AVG_CORR);
+  const avgCorrRaw = Number(avgCorrStr);
+  const avgCorr = avgCorrStr !== "" && Number.isFinite(avgCorrRaw) && avgCorrRaw >= 0 && avgCorrRaw <= 1 ? avgCorrRaw : 0.7;
+  const enabled = maxHeat !== undefined || riskBudget !== undefined || mdd;
+  return { enabled, maxHeat, riskBudget, avgCorr, mdd };
+}
+
+export interface PortfolioGateResult {
+  enabled: boolean;          // 게이트 활성 여부(미설정이면 false=완전 통과)
+  allow: boolean;            // 신규진입 허용(false면 진입 스킵)
+  sizeMultiplier: number;    // 진입 수량 배수(MDD 디리스킹 시 <1, 그 외 1). 절대 >1 아님(축소만).
+  heat: number; effectiveRisk: number; ddPct: number; state: CircuitState;
+  reasons: string[];
+}
+
+/**
+ * 포트폴리오 레벨 신규진입 게이트(순수, 부수효과 0). config.enabled=false면 즉시 통과(allow=true, mult=1).
+ * positions=현재 오픈 포지션의 자기자본 대비 리스크(노출/equity 등), equity/peakEquity=계좌 곡선.
+ * evaluatePortfolioRisk로 heat>maxHeat / effectiveRisk>riskBudget / MDD halt 시 allow=false,
+ * MDD reduced 시 sizeMultiplier<1(축소). 설정 안 한 항목(maxHeat/riskBudget undefined)은 검사 제외(무한대 취급).
+ */
+export function portfolioGate(config: PortfolioGateConfig, snapshot: { positions: PortfolioPosition[]; equity: number; peakEquity: number }): PortfolioGateResult {
+  if (!config.enabled) {
+    return { enabled: false, allow: true, sizeMultiplier: 1, heat: 0, effectiveRisk: 0, ddPct: 0, state: "normal", reasons: [] };
+  }
+  const r = evaluatePortfolioRisk({
+    positions: snapshot.positions, equity: snapshot.equity, peakEquity: snapshot.peakEquity,
+    avgCorr: config.avgCorr,
+    // 미설정 항목은 사실상 무한대(검사 제외) — 명시한 캡만 적용. MDD 미설정이면 단계 없음(항상 normal).
+    maxHeat: config.maxHeat ?? Number.POSITIVE_INFINITY,
+    riskBudget: config.riskBudget ?? Number.POSITIVE_INFINITY,
+    tiers: config.mdd ? undefined : [], // tiers=[] → MDD 단계 없음(sizeMultiplier 1, allowNewEntry true)
+  });
+  // MDD halt(mult<=0)는 evaluatePortfolioRisk가 이미 allowNewEntry=false로 처리. reduced는 mult<1로 축소(진입 허용).
+  const sizeMultiplier = r.allowNewEntry ? Math.max(0, Math.min(1, r.sizeMultiplier)) : 0;
+  return {
+    enabled: true, allow: r.allowNewEntry, sizeMultiplier,
+    heat: r.heat, effectiveRisk: r.effectiveRisk, ddPct: r.ddPct, state: r.state, reasons: r.reasons,
+  };
 }
 
 // ── 2단계 확인 토큰(fail-CLOSED): place_order 수동툴용. 토큰=주문해시 바인딩, 단일사용, TTL. ──
