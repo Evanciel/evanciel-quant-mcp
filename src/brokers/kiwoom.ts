@@ -238,11 +238,16 @@ export class KiwoomBrokerAdapter extends BaseBrokerAdapter {
     };
   }
 
-  /** 바디 레벨 성공 판정(return_code===0). 실패 시 일반 메시지로 throw(시크릿/원문 누출 없음). */
-  private assertOk(data: KiwoomResponse, op: string): void {
+  /**
+   * 바디 레벨 성공 판정(return_code===0). 실패 시 일반 메시지로 throw(시크릿/원문 누출 없음).
+   * P0: return_code 부재를 무조건 성공으로 간주하지 않는다 — 만료토큰/게이트웨이 오류 같은 비정형 응답이
+   * '성공'이 되어 빈 데이터·유령 주문으로 이어지던 구멍. 시세류 등 정말 return_code가 없을 수 있는 응답만
+   * 호출측이 데이터 존재 증거(okWithoutCode)를 제공해 통과시킨다.
+   */
+  private assertOk(data: KiwoomResponse, op: string, okWithoutCode?: (d: KiwoomResponse) => boolean): void {
     if (data.return_code == null) {
-      // 일부 시세 응답은 return_code 미포함 → 데이터 존재로 성공 간주(여기선 통과).
-      return;
+      if (okWithoutCode?.(data)) return;
+      throw new Error(`Kiwoom ${op} failed (missing return_code)`);
     }
     if (Number(data.return_code) !== 0) {
       const code = Number(data.return_code);
@@ -261,7 +266,8 @@ export class KiwoomBrokerAdapter extends BaseBrokerAdapter {
         qry_tp: "1",
         dmst_stex_tp: "KRX",
       });
-      this.assertOk(data, "getBalance");
+      // return_code 부재 시 잔고 필드 존재를 성공 증거로(빈/비정형 응답이 '잔고 0'으로 둔갑하는 것 차단).
+      this.assertOk(data, "getBalance", (d) => d.tot_evlt_amt != null || d.tot_evlu_amt != null || d.entr != null || d.prsm_dpst_aset_amt != null || Array.isArray(d.acnt_evlt_remn_indv_tot));
 
       // 총평가금액(예수금+평가) / 예수금(D+2 또는 추정예수금) 후보.
       const total =
@@ -299,7 +305,8 @@ export class KiwoomBrokerAdapter extends BaseBrokerAdapter {
         API_ID.balance,
         { qry_tp: "1", dmst_stex_tp: "KRX" },
       );
-      this.assertOk(data, "getPositions");
+      // return_code 부재 시 보유배열 존재를 성공 증거로(비정형 응답이 '보유 0종목'으로 둔갑하는 것 차단).
+      this.assertOk(data, "getPositions", (d) => Array.isArray(d.acnt_evlt_remn_indv_tot));
 
       const rows = Array.isArray(data.acnt_evlt_remn_indv_tot)
         ? (data.acnt_evlt_remn_indv_tot as Record<string, unknown>[])
@@ -337,7 +344,8 @@ export class KiwoomBrokerAdapter extends BaseBrokerAdapter {
       const { data } = await this.post("/api/dostk/mrkcond", API_ID.quote, {
         stk_cd: stk,
       });
-      this.assertOk(data, "getPrice");
+      // 호가 응답은 return_code가 빠질 수 있음 → 호가 필드 존재를 성공 증거로.
+      this.assertOk(data, "getPrice", (d) => d.buy_fpr_bid != null || d.sel_fpr_bid != null);
 
       const bestBid = Math.abs(toNum(data.buy_fpr_bid));
       const bestAsk = Math.abs(toNum(data.sel_fpr_bid));
@@ -381,18 +389,22 @@ export class KiwoomBrokerAdapter extends BaseBrokerAdapter {
     else if (iv === "1mo" || iv === "1month" || iv === "1M".toLowerCase()) { apiId = "ka10083"; arrKey = "stk_mth_pole_chart_qry"; body = { stk_cd: stk, base_dt: today, upd_stkpc_tp: "1" }; }
     else { apiId = "ka10081"; arrKey = "stk_dt_pole_chart_qry"; body = { stk_cd: stk, base_dt: today, upd_stkpc_tp: "1" }; }
     const { data } = await this.post("/api/dostk/chart", apiId, body);
-    this.assertOk(data, "getCandles");
+    // 차트 응답도 return_code 누락 가능성 → 차트 배열 존재를 성공 증거로.
+    this.assertOk(data, "getCandles", (d) => Array.isArray((d as Record<string, unknown>)[arrKey]));
     const rows = Array.isArray((data as Record<string, unknown>)[arrKey]) ? ((data as Record<string, unknown>)[arrKey] as Record<string, unknown>[]) : [];
     const bars = rows
       .map((r) => {
         let date: string, datetime: string;
+        // P0: 키움 시각은 KST 로컬 — 'Z'(UTC)로 라벨하면 epoch가 9시간 어긋나 시간대 조건·스케줄·MTF 정렬이
+        // 전부 틀어진다 → '+09:00' 오프셋으로 명시(Date.parse가 올바른 epoch 산출).
+        // ⚠️ 이 수정으로 기존 가동 KR 봇의 멱등키 문자열이 바뀌어 전환 직후 같은 봉 1회 재기록 가능(1회성).
         if (isMinute) {
-          const t = String(r.cntr_tm ?? ""); // YYYYMMDDHHMMSS
+          const t = String(r.cntr_tm ?? ""); // YYYYMMDDHHMMSS (KST)
           date = t.replace(/^(\d{4})(\d{2})(\d{2}).*/, "$1-$2-$3");
-          datetime = t.length >= 14 ? `${t.slice(0, 4)}-${t.slice(4, 6)}-${t.slice(6, 8)}T${t.slice(8, 10)}:${t.slice(10, 12)}:${t.slice(12, 14)}Z` : date + "T00:00:00Z";
+          datetime = t.length >= 14 ? `${t.slice(0, 4)}-${t.slice(4, 6)}-${t.slice(6, 8)}T${t.slice(8, 10)}:${t.slice(10, 12)}:${t.slice(12, 14)}+09:00` : date + "T00:00:00+09:00";
         } else {
           date = String(r.dt ?? "").replace(/^(\d{4})(\d{2})(\d{2}).*/, "$1-$2-$3");
-          datetime = date + "T00:00:00Z";
+          datetime = date + "T00:00:00+09:00"; // KR 거래일 경계=KST 자정
         }
         return { date, datetime, open: Math.abs(toNum(r.open_pric)), high: Math.abs(toNum(r.high_pric)), low: Math.abs(toNum(r.low_pric)), close: Math.abs(toNum(r.cur_prc)), volume: toNum(r.trde_qty) };
       })
@@ -424,6 +436,11 @@ export class KiwoomBrokerAdapter extends BaseBrokerAdapter {
 
       const { data } = await this.post("/api/dostk/ordr", apiId, body);
 
+      // P0: 응답 신뢰성 검증 — return_code도 ord_no도 없는 응답(만료토큰/게이트웨이 오류 등)을
+      // '접수(pending)'로 취급하면 유령 주문이 장부에 박힌다 → 실패로 throw.
+      if (data.return_code == null && data.ord_no == null) {
+        throw new Error("Kiwoom order response unrecognized (no return_code/ord_no)");
+      }
       const rejected = data.return_code != null && Number(data.return_code) !== 0;
       if (rejected) {
         // 사유는 콘솔에만(시크릿 미포함). 호출측엔 rejected 상태로 정상 반환.
@@ -433,11 +450,16 @@ export class KiwoomBrokerAdapter extends BaseBrokerAdapter {
       }
 
       const orderId = String((data.ord_no as string | undefined) ?? "");
+      // 접수 성공 주장인데 주문번호가 없으면 신뢰 불가 → 유령 pending 금지(실패로 throw).
+      if (!rejected && !orderId) {
+        throw new Error("Kiwoom order accepted but ord_no missing");
+      }
       return {
         orderId,
         symbol: stk,
         side: order.side,
         quantity: order.quantity,
+        // 키움 접수 응답엔 체결가가 없다(시장가=0). 호출측(runner)이 '체결가 미확인'을 명시 기록/감사한다.
         price: isMarket ? 0 : order.price ?? 0,
         // 키움 주문 접수=비동기(체결 별도). 접수 성공이면 pending, 실패면 rejected.
         status: rejected ? "rejected" : "pending",

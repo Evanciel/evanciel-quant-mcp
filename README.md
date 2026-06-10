@@ -41,7 +41,7 @@ It's deliberately honest: **it never promises profit.** Its real value is keepin
 2. **Backtest** — it runs the strategy over real historical prices, then re-checks on data it never saw ("out-of-sample") so you aren't fooled by overfitting.
 3. **Run & watch** — deploy a paper bot that trades on each new candle, and open a dashboard that explains everything in plain language.
 
-The **same engine** powers all three steps, so what you backtest is exactly what runs — no surprises.
+The **same engine** powers all three steps: signal evaluation and position sizing are literally the same code in backtest and live. **Execution still differs** — live sends market orders on closed bars at real exchange prices, so slippage, partial fills, and fees won't match the simulation exactly.
 
 ---
 
@@ -51,7 +51,7 @@ quant-mcp does **not** claim to find alpha. Deep research on this kind of retail
 
 - 🛡️ **Risk control** — position sizing (EWMA vol-target / ATR / fractional Kelly), MDD circuit breakers, portfolio heat, exchange-resting stop/trailing math.
 - 🔬 **False-discovery filtering** — Deflated / Probabilistic Sharpe (DSR/PSR), walk-forward OOS gating. *The factory rejects most candidates by design — that's correct, not a bug.*
-- 🧩 **Expressiveness** — a composable strategy tree (indicators × regime × session × pairs × multi-timeframe × calendar events × screeners) with **one validated schema** and **backtest ≡ live parity** (the same pure functions drive backtest, paper, and live).
+- 🧩 **Expressiveness** — a composable strategy tree (indicators × regime × session × pairs × multi-timeframe × calendar events × screeners) with **one validated schema** and **backtest ≡ live signal parity** (the same pure functions decide signals and sizing in backtest, paper, and live — order *execution* differs: see above).
 
 No tool advertises expected returns. Ever.
 
@@ -350,7 +350,7 @@ The tables above use some trading jargon. Here's what it all means, in plain wor
 | **Regime / anchor / MTF / event conditions** | Trade only in an uptrend · vs the day's open (gap plays) · confirm on a higher timeframe · avoid/trade around FOMC. |
 | **Scanner** | Auto-pick the top N coins from a list (e.g. biggest movers) and trade them. |
 | **Paper trading** | Practice mode with fake money — same logic, zero risk. |
-| **Live / backtest parity** | What you tested is exactly what runs — no hidden differences. |
+| **Live / backtest parity** | The *decisions* (signals, sizing) are the same code in backtest and live. Fills are not identical: live uses real market orders, so slippage and fees differ from the simulation. |
 | **MCP (Model Context Protocol)** | The open standard that lets AI agents (Claude, Cursor…) use external tools like this. |
 | **BYOK** | "Bring your own keys" — you supply exchange API keys for real trading (off by default). |
 

@@ -1,0 +1,213 @@
+/**
+ * live-fail-safety.test.ts — 코덱스 P0 3건 회귀 방지(실거래 켜는 순간 터지는 구멍들).
+ *  P0-1 채널 고정: 라이브 주문 실패가 조용히 페이퍼로 기록되어 실/로컬 포지션이 발산하던 구멍.
+ *   - 라이브 채널 포지션의 매도 실패 → 동결(기록·상태 무변경, 다음 틱 재시도)
+ *   - 페이퍼 채널 포지션 → 실주문 자체를 안 냄(실계좌 오버셀 방지)
+ *   - 거부(rejected)는 체결이 아님 / 모호 실패(결과불명)는 페이퍼 기록 금지(동결)
+ *  P0-2 보호주문 에스컬레이션: 배치 실패 swallow → 손절 없는 나체 포지션 방치 금지(연속 실패 → 비상 청산).
+ *  P0-3 키움: return_code 없는 응답=성공 처리 / ord_no 없는 유령 pending / 분봉 KST를 Z(UTC)로 라벨.
+ */
+import { describe, it, expect, vi, beforeAll, afterAll } from "vitest";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+process.env.QUANT_MCP_DATA_DIR = join(tmpdir(), `quant-mcp-failsafe-${process.pid}`);
+// 라이브 게이트 통과용(testnet 가짜 키 — 실거래소 호출 없음, 어댑터는 모킹).
+process.env.BINANCE_ENV = "testnet";
+process.env.BINANCE_API_KEY = "x".repeat(64);
+process.env.BINANCE_API_SECRET = "y".repeat(64);
+
+const calls = vi.hoisted(() => ({
+  placed: [] as Array<Record<string, unknown>>,
+  // ok=전부 체결 / throwAll=전 주문 throw / rejectAll=시장가 rejected 반환 / throwProtective=보호주문만 throw
+  mode: "ok" as "ok" | "throwAll" | "rejectAll" | "throwProtective",
+  getOrderThrows: false,            // true → getOrderByClientId throw → verdict unknown(모호)
+  getOrderResult: null as unknown,  // null=not_placed(주문 안 나감 확정)
+}));
+const klinesMock = vi.hoisted(() => vi.fn());
+
+vi.mock("../src/data/binance-public.js", async (orig) => {
+  const actual = await (orig() as Promise<Record<string, unknown>>);
+  return { ...actual, fetchKlines: klinesMock };
+});
+vi.mock("../src/brokers/index.js", () => ({
+  getAdapter: () => ({
+    adapter: {
+      async placeOrder(o: Record<string, unknown>) {
+        calls.placed.push(o);
+        const prot = o.type === "stop_market" || o.type === "take_profit_market";
+        if (calls.mode === "throwAll") throw new Error("network boom(mock)");
+        if (calls.mode === "throwProtective" && prot) throw new Error("prot-fail(mock)");
+        if (calls.mode === "rejectAll" && !prot) {
+          return { orderId: "", symbol: o.symbol, side: o.side, quantity: o.quantity, price: 0, status: "rejected" as const, timestamp: new Date() };
+        }
+        return { orderId: "oid-" + calls.placed.length, symbol: o.symbol, side: o.side, quantity: o.quantity, price: 100, status: "filled" as const, timestamp: new Date() };
+      },
+      async getOrderByClientId() {
+        if (calls.getOrderThrows) throw new Error("inquiry unsupported(mock)");
+        return calls.getOrderResult;
+      },
+      async cancelOrderByClientId() { return true; },
+      async cancelOrder() { return true; },
+      async getBalance() { return { totalAsset: 100000, cashBalance: 100000, currency: "USDT" }; },
+      async getPositions() { return []; },
+    },
+  }),
+}));
+
+import * as store from "../src/store/db.js";
+import { tickBot, type PaperPosition } from "../src/runner/runner.js";
+import type { StrategyNode } from "../src/core/types/strategy.js";
+
+const bar = (i: number, c: number) => { const iso = new Date(Date.UTC(2025, 0, 1) + i * 3600000).toISOString(); return { date: iso.slice(0, 10), datetime: iso, open: c, high: c + 0.5, low: c - 0.5, close: c, volume: 1000 }; };
+const barsAt = (n: number, prices: (i: number) => number) => Array.from({ length: n }, (_, i) => bar(i, prices(i)));
+
+// buy: sma(1)<95(=가격<95) / sell: sma(1)>105 — 깔끔한 진입/청산.
+const buyLowSellHigh: StrategyNode = { id: "l", type: "leaf", name: "bls", strategy: { id: "s", userId: "u", name: "s", description: "", symbol: "BTCUSDT",
+  rules: [
+    { id: "b", action: "buy", conditions: [{ id: "c", indicator: "sma", params: { period: 1 }, operator: "lt", value: 95 }], quantityPercent: 100 },
+    { id: "se", action: "sell", conditions: [{ id: "c2", indicator: "sma", params: { period: 1 }, operator: "gt", value: 105 }], quantityPercent: 100 },
+  ], isActive: true, createdAt: new Date(), updatedAt: new Date() } };
+
+function mkLiveBot(name: string, stopLossPercent: number | null = 5) {
+  const comp = store.insertComposite({ name, root_node: buyLowSellHigh, symbol: "BTCUSDT", market: "spot", leverage: 1, stop_loss_percent: stopLossPercent, take_profit_percent: null, tp_ladder: null, scale_in: null, pyramid: null, trailing_stop_percent: null });
+  return store.insertBot({ name, symbol: "BTCUSDT", composite_strategy_id: comp.id, mode: "live", capital: 1000, broker: "binance", interval_seconds: 3600 }).id;
+}
+const reset = () => { calls.placed.length = 0; calls.mode = "ok"; calls.getOrderThrows = false; calls.getOrderResult = null; };
+
+describe("P0-1 채널 고정: 라이브 실패의 조용한 페이퍼 기록 금지", () => {
+  it("라이브 채널 포지션 매도 실패(not_placed 확정) → 동결: 기록 0 + 포지션 유지", async () => {
+    reset(); calls.mode = "throwAll"; // 주문 throw + 조회 null(not_placed)
+    const id = mkLiveBot("p01-freeze");
+    // 라이브 채널 포지션 주입(엔진이 진입→청산 신호를 내도록 가격 90→110 시나리오).
+    store.setBotPositionState(id, { status: "open", entryAvg: 90, qty: 5, openedAt: new Date().toISOString(), live: true } satisfies PaperPosition);
+    klinesMock.mockResolvedValue(barsAt(50, (i) => (i < 30 ? 90 : 110))); // 엔진 want=flat → 매도 시도
+    const r = await tickBot(id);
+    expect(r.action).toBe("hold");
+    expect(r.detail).toContain("동결");
+    expect(store.recentTrades(id, 10).filter((t) => t.side === "sell")).toHaveLength(0); // 페이퍼 위장 기록 없음
+    const st = store.getBot(id)?.position_state as PaperPosition | null;
+    expect(st?.qty).toBe(5); // 포지션 그대로(다음 틱 재시도)
+  });
+
+  it("페이퍼 채널 포지션 청산 → 실주문 0건, 페이퍼로만 기록", async () => {
+    reset();
+    const id = mkLiveBot("p01-paperchan");
+    store.setBotPositionState(id, { status: "open", entryAvg: 90, qty: 5, openedAt: new Date().toISOString(), live: false } satisfies PaperPosition);
+    klinesMock.mockResolvedValue(barsAt(50, (i) => (i < 30 ? 90 : 110)));
+    const r = await tickBot(id);
+    expect(r.action).toBe("sell");
+    expect(calls.placed).toHaveLength(0); // 실계좌에 주문 안 나감(오버셀 방지)
+    const sells = store.recentTrades(id, 10).filter((t) => t.side === "sell");
+    expect(sells).toHaveLength(1);
+    expect(sells[0].is_paper).toBe(1); // 페이퍼로 정직 기록
+    expect(store.getBot(id)?.position_state).toBeNull();
+  });
+
+  it("주문 거부(rejected 반환) → 신규 진입은 페이퍼 폴백(유령 live 기록 없음)", async () => {
+    reset(); calls.mode = "rejectAll";
+    const id = mkLiveBot("p01-rejected", null); // 보호주문 없이(시장가 거부 검증에 집중)
+    klinesMock.mockResolvedValue(barsAt(50, () => 90)); // 진입 신호
+    const r = await tickBot(id);
+    expect(r.action).toBe("buy");
+    const buys = store.recentTrades(id, 10).filter((t) => t.side === "buy");
+    expect(buys).toHaveLength(1);
+    expect(buys[0].is_paper).toBe(1); // 거부=체결 아님 → live 기록 금지
+    expect((store.getBot(id)?.position_state as PaperPosition).live).toBe(false); // 채널=페이퍼로 시작
+  });
+
+  it("모호 실패(주문 throw + 조회 불가) 신규 진입 → 기록 없이 동결(이중 장부 방지)", async () => {
+    reset(); calls.mode = "throwAll"; calls.getOrderThrows = true; // verdict unknown
+    const id = mkLiveBot("p01-unknown", null);
+    klinesMock.mockResolvedValue(barsAt(50, () => 90));
+    const r = await tickBot(id);
+    expect(r.action).toBe("hold");
+    expect(r.detail).toContain("동결");
+    expect(store.recentTrades(id, 10)).toHaveLength(0); // 주문이 나갔을 수도 → 페이퍼 기록 금지
+    expect(store.getBot(id)?.position_state).toBeNull();
+  });
+});
+
+describe("P0-2 보호주문 연속 실패 → 비상 청산(fail-closed)", () => {
+  it("보호주문 배치가 계속 실패하면 protFails 누적 → 3회 도달 후 비상 청산", async () => {
+    reset(); calls.mode = "throwProtective"; // 시장가는 체결, 보호주문만 실패
+    const id = mkLiveBot("p02-escalate", 5); // 손절 5% 설정(보호를 원한 포지션)
+    klinesMock.mockResolvedValue(barsAt(50, () => 90)); // 진입 후 계속 보유
+    const r1 = await tickBot(id); // 진입 + 보호주문 실패(1회)
+    expect(r1.action).toBe("buy");
+    expect((store.getBot(id)?.position_state as PaperPosition).protFails).toBe(1);
+    const r2 = await tickBot(id); // 보유 재동기화 실패(2회)
+    expect(r2.action).toBe("hold");
+    expect((store.getBot(id)?.position_state as PaperPosition).protFails).toBe(2);
+    await tickBot(id); // 3회 — 한도 도달
+    expect((store.getBot(id)?.position_state as PaperPosition).protFails).toBe(3);
+    const r4 = await tickBot(id); // 비상 청산 발동
+    expect(r4.action).toBe("sell");
+    expect(r4.detail).toContain("비상 청산");
+    expect(store.getBot(id)?.position_state).toBeNull(); // 나체 포지션 해소
+    const sells = store.recentTrades(id, 10).filter((t) => t.side === "sell");
+    expect(sells).toHaveLength(1);
+    expect(sells[0].reason).toContain("비상 청산");
+    expect(sells[0].is_paper).toBe(0); // 라이브 채널이므로 실청산
+    // 보호주문 배치가 실제로 여러 번 시도(swallow 아님 — 매 틱 재시도 후 에스컬레이션)됐는지
+    expect(calls.placed.filter((o) => o.type === "stop_market").length).toBeGreaterThanOrEqual(3);
+  });
+});
+
+describe("P0-3 키움: 응답 신뢰성 + KST 타임스탬프", () => {
+  // 전역 fetch 스텁(토큰 + API). 이 describe 안에서만.
+  const fetchMock = vi.fn();
+  let apiBody: Record<string, unknown> = {};
+  const jsonRes = (body: unknown) => ({ ok: true, status: 200, json: async () => body, headers: new Headers() });
+  beforeAll(() => {
+    vi.stubGlobal("fetch", fetchMock);
+    fetchMock.mockImplementation(async (url: string) =>
+      String(url).includes("/oauth2/token") ? jsonRes({ token: "tkn", expires_in: 3600 }) : jsonRes(apiBody));
+  });
+  afterAll(() => { vi.unstubAllGlobals(); });
+
+  async function adapter() {
+    const { KiwoomBrokerAdapter } = await import("../src/brokers/kiwoom.js");
+    return new KiwoomBrokerAdapter({ appkey: "ak", secretkey: "sk", env: "mock" });
+  }
+
+  it("return_code 없는 빈 응답 → getBalance가 성공(잔고 0)으로 둔갑하지 않고 throw", async () => {
+    apiBody = {}; // 만료토큰/게이트웨이 비정형 응답 시뮬레이션
+    await expect((await adapter()).getBalance()).rejects.toThrow(/missing return_code/);
+  });
+
+  it("placeOrder: return_code도 ord_no도 없는 응답 → 유령 pending 금지(throw)", async () => {
+    apiBody = {};
+    await expect((await adapter()).placeOrder({ symbol: "005930", side: "buy", type: "market", quantity: 1 })).rejects.toThrow(/no return_code\/ord_no/);
+  });
+
+  it("placeOrder: 접수 성공 주장인데 ord_no 없음 → throw", async () => {
+    apiBody = { return_code: 0 };
+    await expect((await adapter()).placeOrder({ symbol: "005930", side: "buy", type: "market", quantity: 1 })).rejects.toThrow(/ord_no missing/);
+  });
+
+  it("placeOrder: 정상 접수(return_code 0 + ord_no) → pending + 주문번호", async () => {
+    apiBody = { return_code: 0, ord_no: "12345" };
+    const r = await (await adapter()).placeOrder({ symbol: "005930", side: "buy", type: "market", quantity: 1 });
+    expect(r.status).toBe("pending");
+    expect(r.orderId).toBe("12345");
+    expect(r.price).toBe(0); // 체결가 미확인 — 러너가 명시 기록/감사
+  });
+
+  it("분봉 cntr_tm은 KST → '+09:00' 라벨(이전 'Z' 라벨=9시간 어긋남 버그)", async () => {
+    apiBody = { return_code: 0, stk_min_pole_chart_qry: [{ cntr_tm: "20260610103000", open_pric: "100", high_pric: "110", low_pric: "90", cur_prc: "105", trde_qty: "1000" }] };
+    const bars = await (await adapter()).getCandles("005930", "5m", 10);
+    expect(bars).toHaveLength(1);
+    expect(bars[0].datetime).toBe("2026-06-10T10:30:00+09:00");
+    // epoch 검증: KST 10:30 == UTC 01:30 (Z로 라벨했다면 9시간 어긋났을 것)
+    expect(Date.parse(bars[0].datetime)).toBe(Date.UTC(2026, 5, 10, 1, 30, 0));
+  });
+
+  it("일봉 dt도 KST 자정 기준 '+09:00'", async () => {
+    apiBody = { return_code: 0, stk_dt_pole_chart_qry: [{ dt: "20260610", open_pric: "100", high_pric: "110", low_pric: "90", cur_prc: "105", trde_qty: "1000" }] };
+    const bars = await (await adapter()).getCandles("005930", "1d", 10);
+    expect(bars).toHaveLength(1);
+    expect(bars[0].datetime).toBe("2026-06-10T00:00:00+09:00");
+    expect(Date.parse(bars[0].datetime)).toBe(Date.UTC(2026, 5, 9, 15, 0, 0)); // KST 자정 = 전일 15:00 UTC
+  });
+});
