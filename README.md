@@ -236,7 +236,7 @@ Deploy with `save_strategy({ tree, stopLossPercent: 5, tpLadder: [{pct:5,sellPct
 
 `save_strategy` → `create_bot` → `start_bot` runs a bot that re-evaluates on each closed bar using the **same backtest engine** (so live mirrors backtest, including ladder partial fills). State lives in a local `node:sqlite` store — no account, no cloud.
 
-`open_dashboard` serves a real-time HTML dashboard at `127.0.0.1` (random per-launch token, Binance public WS for live unrealized PnL). It's built for **non-experts**: plain-language strategy summaries ("only buys in an uptrend when oversold"), 🟢 winning / 🔴 losing / ⚪ idle pills, realized vs unrealized PnL, and multi-symbol scanner positions — with a "details" toggle for the raw strategy DSL.
+`open_dashboard` serves a real-time HTML dashboard at `127.0.0.1` (one-time bootstrap token exchanged for an **HttpOnly session cookie** — the token never appears in the page or address bar after load; chart library self-hosted at `/vendor`, zero third-party scripts; Binance public WS for live unrealized PnL). It's built for **non-experts**: plain-language strategy summaries ("only buys in an uptrend when oversold"), 🟢 winning / 🔴 losing / ⚪ idle pills, realized vs unrealized PnL, and multi-symbol scanner positions — with a "details" toggle for the raw strategy DSL.
 
 **Pro charting (TradingView-grade, no paid library):** built on `lightweight-charts` v5 — 1m–1M timeframes, **18 toggleable indicators with editable parameters** (Bollinger σ, Supertrend multiplier, MACD fast/slow/signal, Stochastic K/D, …), **separate oscillator panes**, on-chart **drawing tools** (trend lines / horizontal lines, persisted per bot in `localStorage`), the bot's own strategy indicators + entry/SL/TP markers, **live ticking** (crypto via Binance kline WS, KR stocks via polling), and **KST-unified time axis**.
 
@@ -313,7 +313,7 @@ src/mcp-server/   stdio MCP server + 22 tools
 - **Paper-first** — bots are paper unless you set exchange keys *and* the master switch (`LIVE_TRADING_ENABLED`).
 - **Server-side hard limits** — notional cap, symbol allowlist, daily-loss circuit breaker (LLM cannot bypass).
 - **2-step order confirmation** — `place_order` is fail-closed: preview returns a token; execution requires the same args + token.
-- **Dashboard** — binds to `127.0.0.1` only, random per-launch token, read-only positions/plans.
+- **Dashboard** — binds to `127.0.0.1` only; one-time bootstrap token → HttpOnly session cookie (token not exposed in page/URL afterwards), Host + Origin checks, chart library self-hosted (no third-party scripts), and **enabling live mode is a two-step preview→confirm** (turning it off stays one click).
 - **Keys never via chat** — store keys with the CLI wizard (`npx quant-mcp setup`), the dashboard's ⚙️ settings form, or env vars. They live in `~/.quant-mcp/credentials.env` (chmod 600, gitignored), are shown masked only, and can't be read back. Never paste keys into the agent conversation.
 - **Mainnet pre-flight** — before real-money trading, `npx tsx scripts/verify-mainnet-readiness.ts` runs a read-only GO/NO-GO check (env=live, master switch, key validity, **withdrawal permission OFF**, IP restriction, hard-limit self-test) — **places zero orders**. See the [mainnet pilot runbook](docs/mainnet-pilot-runbook.md).
 

@@ -29,10 +29,23 @@ describe("computeFuturesSize — 명목/마진/청산가", () => {
     expect(r.units).toBe(500);             // 50000 / 100
   });
 
-  it("baseNotional 미지정 → equity 풀노출(1배 base) → notional=equity×leverage", () => {
+  it("baseNotional 비유한/≤0 → 전부 0(fail-closed) — '무거래'가 풀노출로 둔갑 금지", () => {
+    // 과거엔 미지정/0/NaN → equity 풀노출 폴백(footgun)이었음. 회귀 가드.
+    for (const bad of [0, -5, NaN, Infinity]) {
+      const r = computeFuturesSize({ equity: 10000, price: 100, leverage: 3, baseNotional: bad });
+      expect(r.units).toBe(0);
+      expect(r.notional).toBe(0);
+      expect(r.margin).toBe(0);
+      expect(r.liqPrice).toBe(0);
+      expect(r.leverage).toBe(3); // 클램프된 레버리지는 정보로 보고하되 노출은 0
+    }
+  });
+
+  it("baseNotional 누락(타입 우회) → 런타임도 0 — 과거 'equity 풀노출' 폴백 제거 회귀 가드", () => {
+    // @ts-expect-error baseNotional은 필수(생략 = 컴파일 에러; tsc가 test/ 포함 검사)
     const r = computeFuturesSize({ equity: 10000, price: 100, leverage: 3 });
-    expect(r.notional).toBe(30000);
-    expect(r.margin).toBe(10000);
+    expect(r.notional).toBe(0);
+    expect(r.units).toBe(0);
   });
 
   it("margin은 항상 equity를 넘지 않음(baseNotional≤equity ⇒ margin≤equity)", () => {
@@ -51,29 +64,29 @@ describe("computeFuturesSize — 명목/마진/청산가", () => {
   });
 
   it("레버리지 클램프: maxLeverage 상한 적용(20배 기본)", () => {
-    const r = computeFuturesSize({ equity: 10000, price: 100, leverage: 999 });
+    const r = computeFuturesSize({ equity: 10000, price: 100, leverage: 999, baseNotional: 10000 });
     expect(r.leverage).toBe(20);           // 기본 maxLeverage=20으로 클램프
     expect(r.notional).toBe(200000);       // 10000 × 20
   });
 
   it("maxLeverage 커스텀 상한", () => {
-    const r = computeFuturesSize({ equity: 10000, price: 100, leverage: 50, maxLeverage: 10 });
+    const r = computeFuturesSize({ equity: 10000, price: 100, leverage: 50, maxLeverage: 10, baseNotional: 10000 });
     expect(r.leverage).toBe(10);
     expect(r.notional).toBe(100000);
   });
 
   it("leverage≤1/NaN → 현물 동치(leverage=1, notional≤equity)", () => {
-    expect(computeFuturesSize({ equity: 10000, price: 100, leverage: 1 }).leverage).toBe(1);
-    expect(computeFuturesSize({ equity: 10000, price: 100, leverage: 0 }).leverage).toBe(1);
-    expect(computeFuturesSize({ equity: 10000, price: 100, leverage: NaN }).leverage).toBe(1);
+    expect(computeFuturesSize({ equity: 10000, price: 100, leverage: 1, baseNotional: 10000 }).leverage).toBe(1);
+    expect(computeFuturesSize({ equity: 10000, price: 100, leverage: 0, baseNotional: 10000 }).leverage).toBe(1);
+    expect(computeFuturesSize({ equity: 10000, price: 100, leverage: NaN, baseNotional: 10000 }).leverage).toBe(1);
     const r = computeFuturesSize({ equity: 10000, price: 100, leverage: 1, baseNotional: 10000 });
     expect(r.notional).toBe(10000);        // 1배 → 명목=base
     expect(r.margin).toBe(10000);
   });
 
   it("equity/price≤0 → 전부 0(예외 없음)", () => {
-    expect(computeFuturesSize({ equity: 0, price: 100, leverage: 5 }).notional).toBe(0);
-    expect(computeFuturesSize({ equity: 10000, price: 0, leverage: 5 }).units).toBe(0);
+    expect(computeFuturesSize({ equity: 0, price: 100, leverage: 5, baseNotional: 10000 }).notional).toBe(0);
+    expect(computeFuturesSize({ equity: 10000, price: 0, leverage: 5, baseNotional: 10000 }).units).toBe(0);
   });
 
   it("롱 청산가: entry×(1−1/lev+mmr), 진입 '아래'(하락 시 청산). lev=1이면 0(현물 무청산)", () => {
@@ -82,7 +95,7 @@ describe("computeFuturesSize — 명목/마진/청산가", () => {
     expect(liq).toBeLessThan(100);            // 롱 청산은 진입 아래
     expect(longLiquidationPrice(100, 1)).toBe(0); // 무레버리지 = 청산 없음
     // computeFuturesSize.liqPrice가 longLiquidationPrice와 일치
-    expect(computeFuturesSize({ equity: 10000, price: 100, leverage: 5 }).liqPrice).toBeCloseTo(80.5, 6);
+    expect(computeFuturesSize({ equity: 10000, price: 100, leverage: 5, baseNotional: 10000 }).liqPrice).toBeCloseTo(80.5, 6);
   });
 
   it("롱/숏 청산가 부호 미러(short.ts shortLiquidationPrice와 대칭)", () => {

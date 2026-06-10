@@ -1,6 +1,9 @@
 /**
  * verify-dashboard-credentials.ts — 대시보드 자격증명 엔드포인트 라이브 E2E(임시 데이터디렉터리).
- * 검증: 토큰 없으면 401 / 잘못된 Host 403 / GET=마스킹 상태 / POST=upsert + 원문 미반환 / 파일 저장.
+ * 검증: 토큰 없으면 401 / 잘못된 Host 403 / 부트스트랩 302+HttpOnly 세션쿠키 / `/` 무인증 401(토큰 비공개) /
+ *       벤더링(/vendor, unpkg 제거) / GET=마스킹 상태 / POST=upsert + 원문 미반환 / 파일 저장 /
+ *       /api/live 켜기=2단계 confirmToken(enable 명시 필수, 프리뷰 무부작용) · 끄기=1샷.
+ * 주: API 호출은 쿼리토큰 경로 — 스크립트 호환 듀얼 억셉트의 살아있는 검증.
  */
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -29,6 +32,20 @@ async function main() {
   const { url, port } = await startDashboard(7799);
   const token = new URL(url).searchParams.get("token")!;
   const base = `http://127.0.0.1:${port}`;
+
+  // 0) 부트스트랩 → 302 + HttpOnly/Lax 포트별 세션쿠키(값≠토큰) / `/`는 쿠키 전용 / HTML 토큰 미포함 / 벤더링
+  const boot = await fetch(`${base}/?token=${token}`, { redirect: "manual" });
+  const setc = boot.headers.get("set-cookie") || "";
+  ok(boot.status === 302 && (boot.headers.get("location") || "") === "/", `부트스트랩 → 302 Location:/ (got ${boot.status})`);
+  ok(setc.includes(`qm_sid_${port}=`) && /HttpOnly/i.test(setc) && /SameSite=Lax/i.test(setc), "부트스트랩 → HttpOnly+Lax 포트별 세션쿠키 발급");
+  ok(!setc.includes(token), "쿠키값 ≠ 부트스트랩 토큰(세션 분리)");
+  const sid = setc.split(";")[0];
+  ok((await fetch(`${base}/`)).status === 401, "무인증 GET / → 401(토큰 무단공개 구멍 폐쇄)");
+  const page = await (await fetch(`${base}/`, { headers: { cookie: sid } })).text();
+  ok(!page.includes(token), "HTML에 토큰 미포함(const TOKEN 전역 제거)");
+  ok(!page.includes("unpkg.com") && page.includes("/vendor/lightweight-charts.standalone.js"), "외부 CDN 제거 + /vendor 셀프호스팅");
+  const vend = await fetch(`${base}/vendor/lightweight-charts.standalone.js`);
+  ok(vend.status === 200 && (vend.headers.get("content-type") || "").includes("javascript"), "GET /vendor → 200 JS(무인증 공개 정적)");
 
   // 1) 토큰 없이 GET → 401
   const r401 = await fetch(`${base}/api/credentials`);
@@ -59,11 +76,25 @@ async function main() {
   ok(existsSync(path), `credentials.env 파일 생성: ${path}`);
   ok(readFileSync(path, "utf8").includes(`BINANCE_API_KEY=${secret}`), "파일에 키 저장됨(소유자 전용 파일)");
 
-  // 6) 라이브 모드 토글: 켜기(마스터 ON + 안전 기본값) → 끄기(긴급 페이퍼)
-  const en = await (await fetch(`${base}/api/live?token=${token}`, {
-    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ maxNotional: "30", allowlist: "BTCUSDT" }),
+  // 6) 라이브 모드 토글: enable 미명시 400(과거 fail-open 제거) → 프리뷰(무부작용) → 가짜토큰 거절 → 확정 → 끄기 1샷
+  const implicit = await fetch(`${base}/api/live?token=${token}`, {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ maxNotional: "30" }),
+  });
+  ok(implicit.status === 400, `enable 미명시 POST /api/live → 400 (fail-open 제거) (got ${implicit.status})`);
+  const pv = await (await fetch(`${base}/api/live?token=${token}`, {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ enable: true, maxNotional: "30", allowlist: "BTCUSDT" }),
   })).json();
-  ok(en.ok && en.live.masterOn === true, "POST /api/live 켜기 → masterOn=true");
+  ok(pv.ok === true && pv.phase === "preview" && !!pv.confirmToken, "켜기 1단계 → preview + confirmToken");
+  const st0 = await (await fetch(`${base}/api/credentials?token=${token}`)).json();
+  ok(st0.live.masterOn === false, "프리뷰만으로는 마스터 OFF 유지(무부작용)");
+  const badTok = await (await fetch(`${base}/api/live?token=${token}`, {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ enable: true, maxNotional: "30", allowlist: "BTCUSDT", confirmToken: "bogus" }),
+  })).json();
+  ok(badTok.ok === false, "가짜 confirmToken → 거절(fail-closed)");
+  const en = await (await fetch(`${base}/api/live?token=${token}`, {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ enable: true, maxNotional: "30", allowlist: "BTCUSDT", confirmToken: pv.confirmToken }),
+  })).json();
+  ok(en.ok === true && en.phase === "executed" && en.live.masterOn === true, "확정(동일 인자+토큰) → masterOn=true");
   ok(en.live.maxNotional === "30" && en.live.allowlist === "BTCUSDT", `라이브 한도 적용(캡=${en.live.maxNotional}, 허용=${en.live.allowlist})`);
   const dis = await (await fetch(`${base}/api/live?token=${token}`, {
     method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ enable: false }),
@@ -73,7 +104,9 @@ async function main() {
   ok(liveNoAuth.status === 401, `토큰 없는 /api/live → 401 (got ${liveNoAuth.status})`);
 
   console.log(`\n${process.exitCode ? "🔴 일부 실패" : "🟢 대시보드 자격증명 E2E ALL PASS"}`);
-  rmSync(dir, { recursive: true, force: true });
+  cleanup();
   process.exit(process.exitCode || 0);
 }
-main().catch((e) => { console.error("오류:", e); rmSync(dir, { recursive: true, force: true }); process.exit(1); });
+// best-effort: Windows에선 node:sqlite가 store.db 핸들을 유지해 EBUSY 가능(닫기 API 없음) — 임시 dir 잔존 허용
+function cleanup() { try { rmSync(dir, { recursive: true, force: true }); } catch { /* noop */ } }
+main().catch((e) => { console.error("오류:", e); cleanup(); process.exit(1); });

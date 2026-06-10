@@ -34,7 +34,9 @@ async function main() {
   // 2. 봇 생성(페이퍼)
   const cb = B.createBot({ name: "스모크 봇", compositeStrategyId: sv.compositeStrategyId!, capital: 1_000_000 });
   check(cb.ok === true && !!cb.botId, "create_bot → paper 봇 생성");
-  check(B.createBot({ name: "x", compositeStrategyId: sv.compositeStrategyId!, mode: "live" }).ok === false, "create_bot mode=live → 거부(안전)");
+  // live 봇 생성은 허용되지만(SETUP-LIVE 체계), 키/마스터스위치 게이트 통과 전엔 페이퍼 폴백이 안전 계약.
+  const lv = B.createBot({ name: "x", compositeStrategyId: sv.compositeStrategyId!, mode: "live" });
+  check(lv.ok === true && /페이퍼 폴백/.test(lv.note ?? ""), "create_bot mode=live → 게이트 전 페이퍼 폴백(안전)");
 
   // 3. 페이퍼 틱(실 Binance 데이터, core 엔진)
   const r1 = await tickBot(cb.botId!);
@@ -53,9 +55,9 @@ async function main() {
   check(dash.ok === true && dash.url.includes("127.0.0.1:7799"), "open_dashboard → 127.0.0.1 URL+토큰");
   const token = new URL(dash.url).searchParams.get("token");
   const res = await fetch(`http://127.0.0.1:7799/api/state?token=${token}`);
-  const state = await res.json() as { positions: { symbol: string; entryAvg: number }[] };
-  check(res.status === 200 && Array.isArray(state.positions), "/api/state 200 + positions[]");
-  check(state.positions.some((p) => p.symbol === "BTCUSDT" && p.entryAvg > 0), "대시보드 state에 봇 포지션 노출");
+  const state = await res.json() as { bots: { symbol: string; positions?: { symbol: string; entryAvg: number }[] }[] };
+  check(res.status === 200 && Array.isArray(state.bots), "/api/state 200 + bots[]");
+  check(state.bots.some((b) => (b.positions ?? []).some((p) => p.symbol === "BTCUSDT" && p.entryAvg > 0)), "대시보드 state에 봇 포지션 노출");
   check((await fetch(`http://127.0.0.1:7799/api/state`)).status === 401, "토큰 없으면 401(보안)");
 
   log(fail ? "\n❌ SMOKE FAIL" : "\n✅ V2 SMOKE PASS — 전략조립→로컬봇→페이퍼실행→HTML대시보드 전경로 동작(키 0)");

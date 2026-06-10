@@ -158,8 +158,9 @@ export function longLiquidationPrice(entry: number, leverage: number, mmr = 0.00
 /**
  * 선물(레버리지) 사이징(순수, I/O 0) → 라이브·백테 공용(backtest≡live).
  *
- * notional = baseNotional × leverage. baseNotional은 호출자가 산출한 '현물 환산 노출'(equity 대비 ≤1, 예: legacy/vol_target/atr/kelly 결과).
- *   → 선물은 그 노출을 레버리지배로 확대. legacy(quantityPercent=100, baseNotional=equity)면 notional=equity×leverage(=capital×leverage, 요구사항 직역).
+ * notional = baseNotional × leverage. baseNotional(필수)은 호출자가 산출한 '현물 환산 노출'(equity 대비 ≤1, 예: legacy/vol_target/atr/kelly 결과).
+ *   → 선물은 그 노출을 레버리지배로 확대. legacy(quantityPercent=100)는 호출자가 baseNotional=equity를 명시 → notional=equity×leverage(요구사항 직역).
+ * fail-closed: baseNotional 비유한/≤0 → 전부 0 반환(노출 0). 과거 '미지정→equity 1배 풀노출' 편의 폴백은 footgun(의도치 않은 풀노출 레버리지)이라 제거.
  * margin = notional / leverage (= 투입 증거금, 명목이 아닌 실제 묶이는 자본).
  * 안전(정규화-후-캡): notional은 equity×maxLeverage를 넘지 않음. leverage는 [1, maxLeverage] 클램프(과도 레버리지 차단).
  *   margin이 equity를 초과하지 않음(notional≤equity×leverage ⇒ margin=notional/leverage≤equity).
@@ -169,7 +170,7 @@ export function longLiquidationPrice(entry: number, leverage: number, mmr = 0.00
  */
 export function computeFuturesSize(opts: {
   equity: number; price: number; leverage: number;
-  baseNotional?: number;   // 레버리지 적용 전 현물 환산 노출(미지정 시 equity = 1배 풀노출)
+  baseNotional: number;    // 레버리지 적용 전 현물 환산 노출(필수). 비유한/≤0 → 전부 0(fail-closed). 풀노출 의도면 equity를 명시 전달.
   maxLeverage?: number;    // 레버리지 새너티 상한(기본 20). 클램프 상한 + notional 캡 기준.
   mmr?: number;            // 유지증거금률(청산가 근사용, 기본 0.005)
 }): { units: number; notional: number; margin: number; leverage: number; liqPrice: number } {
@@ -178,9 +179,11 @@ export function computeFuturesSize(opts: {
   // 레버리지 클램프: [1, maxLeverage]. ≤0/NaN → 1(현물 동치, 안전).
   const lev = Number.isFinite(opts.leverage) && opts.leverage > 1 ? Math.min(opts.leverage, maxLeverage) : 1;
   if (!(equity > 0) || !(price > 0)) return { units: 0, notional: 0, margin: 0, leverage: lev, liqPrice: 0 };
-  // baseNotional: 미지정/비정상 → equity(1배 풀노출). 음수 가드. equity 초과분은 의미상 그대로 두되(현물 환산 노출은 캡 호출자 책임),
+  // baseNotional(필수): 비유한/≤0 → 노출 0(fail-closed). '미지정→equity 풀노출' 편의 폴백은 제거(footgun: '의미 있는 0'이 풀노출로 둔갑).
+  //   타입 우회(JS/as any) 호출자도 이 런타임 가드가 막는다. equity 초과분은 의미상 그대로 두되(현물 환산 노출 캡은 호출자 책임),
   //   최종 notional 단계에서 equity×leverage로 정규화-후-캡 → margin≤equity 보장.
-  const base = Number.isFinite(opts.baseNotional) && (opts.baseNotional as number) > 0 ? (opts.baseNotional as number) : equity;
+  if (!(Number.isFinite(opts.baseNotional) && opts.baseNotional > 0)) return { units: 0, notional: 0, margin: 0, leverage: lev, liqPrice: 0 };
+  const base = opts.baseNotional;
   const rawNotional = base * lev;
   const notional = Math.max(0, Math.min(rawNotional, equity * lev)); // 캡: 명목 ≤ equity×leverage
   const units = notional / price;

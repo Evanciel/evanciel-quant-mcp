@@ -56,8 +56,8 @@ export interface OrderQtyInput {
   timeframe: string; // 연환산용(크립토 √365 계열)
   legacyQuantityPercent: number; // riskSizing 없을 때 기존 공식 재현(러너는 100=floor(capital/price) 동치)
   riskSizing?: RiskSizingConfig | null;
-  highs?: number[]; // ATR 모드용 고가(closes와 동일 길이·정렬). 미제공 시 ATR 산출 불가 → 무거래(fail-closed).
-  lows?: number[];  // ATR 모드용 저가(closes와 동일 길이·정렬).
+  highs?: number[]; // ATR 모드용 고가(closes와 동일 길이·정렬). 미제공/길이 불일치 시 ATR 산출 불가 → fixed(riskPct) 안전 폴백(노출=equity×riskPct, 무거래 아님 — order-sizing.test 'highs/lows 미제공' 케이스가 이 동작 고정).
+  lows?: number[];  // ATR 모드용 저가(closes와 동일 길이·정렬). 미제공 시 highs와 동일하게 fixed(riskPct) 폴백.
   // ── 선물(레버리지) opt-in. 미지정/spot/leverage≤1이면 현물 경로 **바이트 동일**(회귀 0). ──
   market?: "spot" | "futures"; // 기본 spot. "futures"일 때만 leverage가 노출에 적용됨.
   leverage?: number;           // 명목 배율. >1 + market="futures"일 때만 활성. 그 외엔 무시(현물 동치).
@@ -88,8 +88,8 @@ function finalizeQty(baseNotional: number, px: number, i: OrderQtyInput, detail:
     return { qty: floorQty(baseNotional / px), notional: baseNotional, detail };
   }
   // ⚠️ 머니패스 안전: baseNotional≤0은 모드의 '의도적 무거래'(zero-edge Kelly fraction 0, flat vol_target 무한레버리지 가드 → notional 0).
-  //   computeFuturesSize의 편의 폴백(baseNotional 미지정→equity)이 이 '의미 있는 0'을 풀노출로 오해해 레버리지 포지션을 만들면 안 됨
-  //   → 여기서 0 노출을 그대로 보존(레버리지 곱해도 0). 현물과 동일하게 '베팅 안 함' 유지.
+  //   computeFuturesSize도 이제 baseNotional 비유한/≤0 → 전부 0(fail-closed)이라 이중 방어. 여기서 선제 반환하는 이유:
+  //   0 노출을 그대로 보존(현물과 동일 '베팅 안 함') + 선물 detail 페이로드(futuresLeverage/margin/baseNotional) 구성.
   if (!(baseNotional > 0)) return { qty: 0, notional: 0, detail: { ...detail, market: "futures", futuresLeverage: Math.min(Math.max(i.leverage as number, 1), i.maxLeverage && i.maxLeverage > 0 ? i.maxLeverage : 20), margin: 0, baseNotional: 0 } };
   // 선물 경로(opt-in): baseNotional을 레버리지배로 확대(정규화-후-캡). 수수료반영가(px)로 수량 산출(현물과 동일 규약).
   // 주의: detail에 모드 고유 'leverage'(vol_target의 변동성 레버리지 등)가 이미 있을 수 있어 충돌 방지차 선물 배율은 'futuresLeverage'로 노출.

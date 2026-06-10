@@ -1,12 +1,21 @@
 /**
  * dashboard/server.ts — 로컬 실시간 HTML 대시보드(컴패니언 HTTP+SSE). 리서치 권장 (a)안.
- * 보안: 127.0.0.1 바인딩 / 런치별 랜덤 토큰(/api·/events 필수) / Host 검증(DNS-rebinding 차단) /
- *       시크릿 절대 미전송(포지션·플랜만). 수동주문(/api/order)은 live-handlers.placeOrder 안전경로만 경유
+ * 보안: 127.0.0.1 바인딩 / 부트스트랩 1회 ?token= → HttpOnly 세션쿠키(qm_sid_<port>, SameSite=Lax, 302로 주소창 토큰 제거) /
+ *       `/`(HTML)는 쿠키 전용(무인증 토큰-임베드 서빙 구멍 폐쇄), API는 쿠키+쿼리토큰 듀얼 억셉트(스크립트·curl 호환) /
+ *       Host 검증(DNS-rebinding 차단) + POST Origin 정밀검사(포트 포함, CSRF — SameSite는 포트를 무시하므로 보완) /
+ *       차트 라이브러리 /vendor 셀프호스팅(서드파티 스크립트 0, unpkg 제거) / 시크릿·토큰 절대 미전송(포지션·플랜만) /
+ *       /api/live 켜기=2단계 confirmToken(머니패스와 동일 safety.ts 재사용)+audit, 끄기=1샷(킬스위치 무마찰)+audit.
+ *       수동주문(/api/order)은 live-handlers.placeOrder 안전경로만 경유
  *       (liveGate testnet/mock-only·메인넷 마스터스위치 / 노셔널캡·allowlist / 2단계 confirmToken / 감사로그).
  * 페이지가 Binance 공개 WS로 시세를 직접 받아 미실현손익을 클라이언트 계산(대문자 WS키 사용).
+ * 잔여위험(문서화): 쿠키는 포트 비스코프 — 같은 127.0.0.1의 다른 포트 (악성)로컬 서버에 qm_sid가 전송될 수 있음.
+ *   전제=로컬 공격자(이미 credentials.env 직접 읽기 가능 계층)이고 Origin 포트검사로 역방향 CSRF는 차단 → 수용.
  */
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { randomBytes } from "node:crypto";
+import { randomBytes, timingSafeEqual } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { createRequire } from "node:module";
+import { dirname, join } from "node:path";
 import * as store from "../store/db.js";
 import { BROKER_FIELDS, upsertCredentials, credentialStatus, credentialsPath, enableLive, disableLive, liveSettingsStatus, type BrokerKey } from "../setup/credentials.js";
 import { fetchKlines } from "../data/binance-public.js";
@@ -16,7 +25,7 @@ import { computePositionDrift } from "../core/execution/reconcile.js"; // 페이
 import { detectAlerts, Debouncer, AlertBuffer, type BotAlertView } from "../core/alerts/alerts.js"; // 봇 이벤트 알림 엔진(순수)
 import { sendWebhook, validateWebhookUrl } from "../core/alerts/webhook.js"; // Slack/Discord 배달(SSRF 게이트)
 import { alertSettingsStatus } from "../setup/credentials.js";
-import type { Broker } from "../brokers/safety.js";
+import { orderHash, mintToken, consumeToken, audit, type Broker } from "../brokers/safety.js"; // /api/live 2단계 — 머니패스와 동일 토큰 골격 재사용(신규 안전로직 0)
 import { sma, ema, rsi, macd, bollingerBands, stochastic, adx, atr, williamsR, stochasticRsi, cci, supertrend, vwap, mfi, parabolicSar, ichimoku, roc, obv, donchian } from "../core/strategy/indicators.js";
 
 /** POST 본문을 안전하게 읽어 JSON 파싱(상한 64KB, 자격증명 폼은 작음). */
@@ -30,6 +39,7 @@ function readJsonBody(req: IncomingMessage): Promise<Record<string, unknown>> {
 }
 
 let _state: { url: string; port: number; token: string } | null = null;
+let _server: ReturnType<typeof createServer> | null = null; // stopDashboard용(테스트·graceful)
 
 // 실계정 응답 캐시(거래소 호출 코얼레싱) — /api/account가 매 요청마다 거래소를 때려 레이트리밋 밴나는 것 방지.
 // broker별 TTL 캐시 + in-flight 공유(동시 요청 1회 호출). 읽기전용·시크릿 없음이라 캐싱 안전.
@@ -499,17 +509,78 @@ function okHost(req: IncomingMessage): boolean {
   return h === "127.0.0.1" || h === "localhost";
 }
 
+/** 타이밍 안전 문자열 비교(길이 불일치=false, throw 없음). */
+function safeEq(a: string, b: string): boolean {
+  const A = Buffer.from(a), B = Buffer.from(b);
+  return A.length === B.length && timingSafeEqual(A, B);
+}
+
+/** Cookie 헤더에서 name 값 추출(의존성 0). 같은 키 중복 시 첫 값. */
+function getCookie(req: IncomingMessage, name: string): string | null {
+  for (const part of String(req.headers.cookie || "").split(";")) {
+    const i = part.indexOf("="); if (i < 0) continue;
+    if (part.slice(0, i).trim() === name) return part.slice(i + 1).trim();
+  }
+  return null;
+}
+
+/** CSRF 보강: 브라우저가 보낸 Origin은 이 서버의 정확한 로컬 오리진(포트 포함)이어야 함.
+ *  Origin 부재(curl/스크립트)는 통과 — 인증은 토큰/쿠키가 담당하므로 권한 상승 아님.
+ *  포트까지 보는 이유: SameSite는 포트를 무시(same-site)하므로 127.0.0.1:다른포트 의 악성 로컬 페이지가
+ *  Lax 쿠키가 첨부된 POST를 쏠 수 있음 → Origin 포트 불일치로 차단. */
+function okOrigin(req: IncomingMessage, port: number): boolean {
+  const o = req.headers.origin;
+  if (!o) return true;
+  return o === `http://127.0.0.1:${port}` || o === `http://localhost:${port}`;
+}
+
+// lightweight-charts standalone 번들을 node_modules에서 1회 로드(메모리 캐시) — 외부 CDN 의존 0(공급망/토큰탈취 면 제거).
+// exports 맵이 서브패스 resolve를 막으므로(ERR_PACKAGE_PATH_NOT_EXPORTED) package.json 경유로 디렉터리를 찾아 dist 파일을 직접 읽는다.
+let _vendorJs: Buffer | null = null;
+function vendorChartsJs(): Buffer | null {
+  if (_vendorJs) return _vendorJs;
+  try {
+    const pkg = createRequire(import.meta.url).resolve("lightweight-charts/package.json");
+    _vendorJs = readFileSync(join(dirname(pkg), "dist", "lightweight-charts.standalone.production.js"));
+  } catch { _vendorJs = null; }
+  return _vendorJs;
+}
+
 export function startDashboard(port = 7788): Promise<{ url: string; port: number }> {
   if (_state) return Promise.resolve({ url: _state.url, port: _state.port });
   const token = randomBytes(16).toString("hex");
+  const sessionId = randomBytes(16).toString("hex"); // 쿠키 세션값 — 부트스트랩 토큰과 별개 값(토큰 유출≠세션, 세션 유출≠토큰)
+  let actualPort = port; // listen 후 실포트(port 0=에페메랄 지원). 요청은 listen 후에만 도착하므로 핸들러에서 참조 안전.
 
   const server = createServer((req: IncomingMessage, res: ServerResponse) => {
     if (!okHost(req)) { res.writeHead(403).end("forbidden host"); return; }
+    if (req.method === "POST" && !okOrigin(req, actualPort)) { res.writeHead(403).end("forbidden origin"); return; } // CSRF: 교차출처 POST 차단(SameSite=Lax와 이중)
     const u = new URL(req.url || "/", "http://127.0.0.1");
-    const auth = u.searchParams.get("token") === token;
+    const cName = `qm_sid_${actualPort}`; // 포트별 쿠키 이름 — 같은 127.0.0.1 다중 인스턴스의 쿠키 덮어쓰기 방지
+    const qTok = u.searchParams.get("token");
+    const tokenOk = !!qTok && safeEq(qTok, token);
+    const cVal = getCookie(req, cName);
+    const cookieOk = !!cVal && safeEq(cVal, sessionId);
+    const auth = cookieOk || tokenOk; // API는 듀얼 억셉트: 쿠키(브라우저) + 쿼리토큰(스크립트·curl 호환)
 
-    if (u.pathname === "/") { res.writeHead(200, { "content-type": "text/html; charset=utf-8" }); res.end(html(token)); return; }
+    if (u.pathname === "/") {
+      // 부트스트랩: ?token= 제시 → 유효하면 HttpOnly 세션쿠키 발급 + 302로 주소창·이후 히스토리에서 토큰 제거.
+      if (qTok !== null) {
+        if (!tokenOk) { res.writeHead(401).end("unauthorized"); return; }
+        res.writeHead(302, { "set-cookie": `${cName}=${sessionId}; HttpOnly; SameSite=Lax; Path=/`, location: "/", "cache-control": "no-store" });
+        res.end(); return;
+      }
+      // HTML은 쿠키 세션 전용(쿼리토큰 폴백 없음) — 구버전의 '무인증 /가 토큰 임베드 HTML 서빙' 구멍 폐쇄.
+      if (!cookieOk) { res.writeHead(401, { "content-type": "text/plain; charset=utf-8" }); res.end("unauthorized — open_dashboard 도구가 알려준 URL(?token=…)로 접속하세요"); return; }
+      res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" }); res.end(html()); return;
+    }
     if (u.pathname === "/favicon.ico") { res.writeHead(204).end(); return; } // 토큰 불필요(콘솔 401 소거)
+    if (u.pathname === "/vendor/lightweight-charts.standalone.js") {
+      // 공개 정적 차트 라이브러리(시크릿 0) — 무인증·고정 경로(트래버설 불가). unpkg 제거=서드파티 스크립트 0.
+      const js = vendorChartsJs();
+      if (!js) { res.writeHead(404).end("vendor not installed (npm i)"); return; }
+      res.writeHead(200, { "content-type": "application/javascript; charset=utf-8", "cache-control": "public, max-age=86400" }); res.end(js); return;
+    }
     if (!auth) { res.writeHead(401).end("unauthorized"); return; }
 
     if (u.pathname === "/api/state") {
@@ -635,14 +706,33 @@ export function startDashboard(port = 7788): Promise<{ url: string; port: number
       }
       res.writeHead(405).end("method not allowed"); return;
     }
-    // 라이브 모드: POST {enable:true, maxNotional?, allowlist?} → 마스터 ON+안전기본값 / {enable:false} → 긴급 OFF(페이퍼 폴백).
+    // 라이브 모드: 켜기=머니패스와 동일 2단계 confirmToken(프리뷰→확정, 5분 TTL·단일사용·인자 해시 바인딩) / 끄기=긴급 정지라 1샷(킬스위치에 마찰 금지). 양쪽 audit.
+    // 과거 fail-open(빈 바디=켜짐) 제거 — enable:true|false 명시 필수.
     if (u.pathname === "/api/live") {
       if (req.method !== "POST") { res.writeHead(405).end("method not allowed"); return; }
       readJsonBody(req).then((body) => {
-        if (body.enable === false) { disableLive(); }
-        else { enableLive({ maxNotional: typeof body.maxNotional === "string" ? body.maxNotional : undefined, allowlist: typeof body.allowlist === "string" ? body.allowlist : undefined }); }
-        res.writeHead(200, { "content-type": "application/json" });
-        res.end(JSON.stringify({ ok: true, live: liveSettingsStatus() }));
+        const send = (code: number, obj: unknown) => { res.writeHead(code, { "content-type": "application/json" }); res.end(JSON.stringify(obj)); };
+        if (body.enable === false) {
+          disableLive();
+          audit({ event: "live_toggle", action: "disable", via: "dashboard" });
+          send(200, { ok: true, phase: "executed", live: liveSettingsStatus() }); return;
+        }
+        if (body.enable !== true) { send(400, { ok: false, error: "enable:true|false 명시 필요(빈 바디로 켜지지 않음 — fail-closed)" }); return; }
+        const maxNotional = typeof body.maxNotional === "string" ? body.maxNotional : "";
+        const allowlist = typeof body.allowlist === "string" ? body.allowlist : "";
+        const hash = orderHash({ kind: "live_enable", maxNotional, allowlist }); // 인자 해시 바인딩 — 프리뷰와 다른 인자로 확정 불가
+        const ct = typeof body.confirmToken === "string" ? body.confirmToken : undefined;
+        if (!ct) {
+          send(200, {
+            ok: true, phase: "preview", needConfirm: true, confirmToken: mintToken(hash),
+            preview: { action: "enable_live", env: liveSettingsStatus().env, maxNotional: maxNotional || "(통화별 기본)", allowlist: allowlist || "(전체 허용)" },
+            note: "⚠️ 실거래 마스터 ON 프리뷰. 동일 인자+confirmToken으로 재호출해야 실제 켜짐(5분 TTL, 단일사용).",
+          }); return;
+        }
+        if (!consumeToken(ct, hash)) { send(200, { ok: false, error: "확인토큰 무효/만료/불일치 → 거절(fail-closed). 프리뷰부터 다시." }); return; }
+        enableLive({ maxNotional: maxNotional || undefined, allowlist: allowlist || undefined });
+        audit({ event: "live_toggle", action: "enable", maxNotional: maxNotional || "(default)", allowlist: allowlist || "(all)", via: "dashboard" });
+        send(200, { ok: true, phase: "executed", live: liveSettingsStatus() });
       }).catch((e) => { res.writeHead(400, { "content-type": "application/json" }); res.end(JSON.stringify({ ok: false, error: e instanceof Error ? e.message : "bad request" })); });
       return;
     }
@@ -713,15 +803,27 @@ export function startDashboard(port = 7788): Promise<{ url: string; port: number
 
   return new Promise((resolve) => {
     server.listen(port, "127.0.0.1", () => {
-      const url = `http://127.0.0.1:${port}/?token=${token}`;
-      _state = { url, port, token };
+      const addr = server.address();
+      actualPort = addr && typeof addr === "object" ? addr.port : port; // port 0(에페메랄) 지원 — 쿠키 이름·Origin 검사도 실포트 기준
+      const url = `http://127.0.0.1:${actualPort}/?token=${token}`;
+      _state = { url, port: actualPort, token };
+      _server = server;
       if (!_alertTimer) { _prevBotViews = toBotViews(snapshot().bots); _alertTimer = setInterval(() => { void alertTick(); }, 5000); _alertTimer.unref?.(); } // 알림 엔진 시동(기준선 선적재)
-      resolve({ url, port });
+      resolve({ url, port: actualPort });
     });
   });
 }
 
-function html(token: string): string {
+/** 대시보드 정지(테스트·graceful 용). SSE 등 활성 연결도 끊고 닫는다. 프로덕션 경로에선 호출되지 않음. */
+export async function stopDashboard(): Promise<void> {
+  if (_alertTimer) { clearInterval(_alertTimer); _alertTimer = null; }
+  _prevBotViews = null;
+  const srv = _server;
+  _server = null; _state = null;
+  if (srv) { srv.closeAllConnections?.(); await new Promise<void>((resolve) => { srv.close(() => resolve()); }); }
+}
+
+function html(): string {
   return `<!doctype html><html lang="ko"><head><meta charset="utf-8"><title>quant-mcp 대시보드</title>
 <style>
 :root{color-scheme:dark}body{margin:0;background:#0b0e14;color:#e6e6e6;font:14px/1.5 system-ui,sans-serif}
@@ -812,7 +914,7 @@ h1{font-size:18px;margin:0 0 2px}.sub{color:#8a94a6;font-size:12px;margin-bottom
 .lstat{font-size:12px;color:#c9d2e3;margin-top:8px;line-height:1.6}.lstat b{color:#e6e6e6}
 @media(max-width:560px){.fld{grid-template-columns:1fr}}
 @media(max-width:560px){.wrap{padding:14px}.hdr{grid-template-columns:1fr 1fr}.pos{grid-template-columns:1fr}.v{font-size:20px}.sym{font-size:14px}}
-</style><script src="https://unpkg.com/lightweight-charts@5.2.0/dist/lightweight-charts.standalone.production.js"></script></head><body><div class="wrap">
+</style><script src="/vendor/lightweight-charts.standalone.js"></script></head><body><div class="wrap">
 <h1>내 자동매매 현황 <span class="dot"></span></h1>
 <div class="sub">봇이 알아서 사고팔아요 · 실시간 시세 반영 <span id="upd" style="color:#8a94a6">—</span>
   <span class="gear" onclick="toggleSettings()">⚙️ API 키 설정</span></div>
@@ -850,7 +952,6 @@ h1{font-size:18px;margin:0 0 2px}.sub{color:#8a94a6;font-size:12px;margin-bottom
   <div class="setmsg" id="orderMsg"></div>
 </div></div>
 <script>
-const TOKEN=${JSON.stringify(token)};
 let bots=[];const prices=new Map();let ws=null;var accounts={};var realAccounts={}; // realAccounts[broker]=거래소 실계정 스냅샷(getAccount)
 function fmt(n,d=2){return Number(n).toLocaleString(undefined,{minimumFractionDigits:d,maximumFractionDigits:d})}
 function ccyOf(broker){return broker==='binance'?'USD':'KRW'}
@@ -945,7 +1046,7 @@ function setupKline(sym,tf){closeKline();
 // 봉 마감 시 1회: 지표 다시 받아 기존 시리즈에 setData(차트/패널 유지 → 깜빡임·줌리셋 없음).
 function refreshSeries(){if(_refreshing||!_priceSeries||!_chartId)return;_refreshing=true;
  var _q=Array.from(chartInds).filter(function(k){return k!=='volume'});var indQ=_q.length?'&ind='+encodeURIComponent(_q.join(',')):'';
- fetch('/api/candles?token='+TOKEN+'&bot='+encodeURIComponent(_chartId)+(_chartTf?'&tf='+_chartTf:'')+indQ).then(function(r){return r.json()}).then(function(d){_refreshing=false;if(!d.ok||!_priceSeries)return;
+ fetch('/api/candles?bot='+encodeURIComponent(_chartId)+(_chartTf?'&tf='+_chartTf:'')+indQ).then(function(r){return r.json()}).then(function(d){_refreshing=false;if(!d.ok||!_priceSeries)return;
   try{_priceSeries.setData(d.bars||[]);}catch(e){}
   (d.overlays||[]).forEach(function(o,i){if(_ovSeries[i])try{_ovSeries[i].setData(o.data||[])}catch(e){}});
   var flat=(d.oscGroups||[]).reduce(function(a,g){return a.concat(g.series||[])},[]);
@@ -1071,7 +1172,7 @@ function openChart(id,tf){
  _chartId=id;var modal=document.getElementById('chartModal'),body=document.getElementById('chartBody');
  document.getElementById('chartTitle').textContent='차트 불러오는 중…';modal.style.display='flex';
  var _oq=Array.from(chartInds).filter(function(k){return k!=='volume'});var indQ=_oq.length?'&ind='+encodeURIComponent(_oq.join(',')):''; // volume=클라전용(refreshSeries와 일관)
- fetch('/api/candles?token='+TOKEN+'&bot='+encodeURIComponent(id)+(tf?'&tf='+tf:'')+indQ).then(function(r){return r.json()}).then(function(d){
+ fetch('/api/candles?bot='+encodeURIComponent(id)+(tf?'&tf='+tf:'')+indQ).then(function(r){return r.json()}).then(function(d){
   if(!d.ok){document.getElementById('chartTitle').textContent='차트 오류: '+(d.error||'불러오기 실패');document.getElementById('chartTf').innerHTML='';return;}
   var isC=d.broker==='binance';
   _chartTf=d.interval;
@@ -1165,7 +1266,7 @@ function onProtMouseUp(){if(!_protDrag)return;_protDrag=null;try{_chart.applyOpt
 function bindProtectDrag(){var body=document.getElementById('chartBody');if(!body)return;unbindProtectDrag();
  body.addEventListener('mousedown',onProtMouseDown);window.addEventListener('mousemove',onProtMouseMove);window.addEventListener('mouseup',onProtMouseUp);window.addEventListener('blur',onProtMouseUp);}
 function unbindProtectDrag(){var body=document.getElementById('chartBody');if(body)body.removeEventListener('mousedown',onProtMouseDown);window.removeEventListener('mousemove',onProtMouseMove);window.removeEventListener('mouseup',onProtMouseUp);window.removeEventListener('blur',onProtMouseUp);}
-function loadActiveProtect(id){if(!_protect)return;fetch('/api/protect?token='+TOKEN+'&symbol='+encodeURIComponent(_protect.sym)+'&broker='+encodeURIComponent(_protect.broker)).then(function(r){return r.json()}).then(function(d){if(!_protect||String(_chartId)!==String(id))return;
+function loadActiveProtect(id){if(!_protect)return;fetch('/api/protect?symbol='+encodeURIComponent(_protect.sym)+'&broker='+encodeURIComponent(_protect.broker)).then(function(r){return r.json()}).then(function(d){if(!_protect||String(_chartId)!==String(id))return;
  if(d&&d.ok&&typeof d.held==='number'&&!(d.held>0)){var bar=document.getElementById('chartProtect');if(bar)bar.style.display='none';var pm=document.getElementById('protectMsg');if(pm){pm.style.color='#8a94a6';pm.textContent='실거래 계정 보유가 없어 OCO 보호주문 불가(페이퍼 포지션).';}return;} // 페이퍼봇 죽은버튼 방지
  if(d&&d.ok&&d.active){_protect.active=true;_protect.orderListId=d.orderListId;if(typeof d.tpPrice==='number'&&d.tpPrice>0)_protect.tpPrice=d.tpPrice;if(typeof d.slPrice==='number'&&d.slPrice>0)_protect.slPrice=d.slPrice;drawProtectLines();renderProtectBar();}}).catch(function(){});}
 function invalidateProtPreview(){if(_protect&&_protect.confirmToken){_protect.confirmToken=null;var pm=document.getElementById('protectMsg');if(pm){pm.style.color='';pm.textContent='값이 바뀌었어요 — 다시 미리보기하세요.';}}}
@@ -1173,7 +1274,7 @@ function submitProtect(){if(!_protect)return;var msg=document.getElementById('pr
  if(!(_protect.tpPrice>_protect.entry)){msg.style.color='#f43f5e';msg.textContent='익절가는 진입가보다 높아야 해요.';return;}
  if(!(_protect.slPrice<_protect.entry)){msg.style.color='#f43f5e';msg.textContent='손절가는 진입가보다 낮아야 해요.';return;}
  msg.style.color='';msg.textContent='보호주문 미리보기 불러오는 중…';
- fetch('/api/protect?token='+TOKEN,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({bot:_chartId,broker:_protect.broker,market:_protect.market,symbol:_protect.sym,side:'sell',quantity:_protect.qty,takeProfitPrice:_protect.tpPrice,stopPrice:_protect.slPrice})})
+ fetch('/api/protect',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({bot:_chartId,broker:_protect.broker,market:_protect.market,symbol:_protect.sym,side:'sell',quantity:_protect.qty,takeProfitPrice:_protect.tpPrice,stopPrice:_protect.slPrice})})
   .then(function(r){return r.json()}).then(function(d){
    if(!d.ok){msg.style.color='#f43f5e';msg.textContent='차단/오류: '+(d.error||'알 수 없음');return;}
    if(d.phase==='preview'){_protect.confirmToken=d.confirmToken;var p=d.preview||{};
@@ -1181,13 +1282,13 @@ function submitProtect(){if(!_protect)return;var msg=document.getElementById('pr
    msg.style.color='#f43f5e';msg.textContent='예상치 못한 응답';
   }).catch(function(e){msg.style.color='#f43f5e';msg.textContent='실패: '+e.message;});}
 function confirmProtect(){if(!_protect||!_protect.confirmToken)return;var msg=document.getElementById('protectMsg');msg.style.color='';msg.textContent='OCO 전송 중…';
- fetch('/api/protect?token='+TOKEN,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({bot:_chartId,broker:_protect.broker,market:_protect.market,symbol:_protect.sym,side:'sell',quantity:_protect.qty,takeProfitPrice:_protect.tpPrice,stopPrice:_protect.slPrice,confirmToken:_protect.confirmToken})})
+ fetch('/api/protect',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({bot:_chartId,broker:_protect.broker,market:_protect.market,symbol:_protect.sym,side:'sell',quantity:_protect.qty,takeProfitPrice:_protect.tpPrice,stopPrice:_protect.slPrice,confirmToken:_protect.confirmToken})})
   .then(function(r){return r.json()}).then(function(d){_protect.confirmToken=null;
    if(d.ok&&d.phase==='executed'){_protect.active=true;_protect.orderListId=(d.result&&d.result.orderListId)||d.orderListId;msg.style.color='#10b981';msg.textContent='✅ OCO 보호주문 등록됨 ('+esc(d.env||'')+')';renderProtectBar();}
    else{msg.style.color='#f43f5e';msg.textContent='실패: '+(d.error||'알 수 없음')+' — 다시 시도하세요.';}
   }).catch(function(e){msg.style.color='#f43f5e';msg.textContent='실패: '+e.message;});}
 function cancelProtect(){if(!_protect)return;var msg=document.getElementById('protectMsg');msg.style.color='';msg.textContent='보호주문 취소 중…';
- fetch('/api/protect/cancel?token='+TOKEN,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({bot:_chartId,broker:_protect.broker,market:_protect.market,symbol:_protect.sym,orderListId:_protect.orderListId})})
+ fetch('/api/protect/cancel',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({bot:_chartId,broker:_protect.broker,market:_protect.market,symbol:_protect.sym,orderListId:_protect.orderListId})})
   .then(function(r){return r.json()}).then(function(d){
    if(d.ok){_protect.active=false;_protect.orderListId=null;msg.style.color='#10b981';msg.textContent='보호주문이 취소됐어요.';renderProtectBar();}
    else{msg.style.color='#f43f5e';msg.textContent='취소 실패: '+(d.error||'알 수 없음');}
@@ -1212,7 +1313,7 @@ function submitOrder(){if(!_order)return;var msg=document.getElementById('orderM
  _order.quantity=qty;var limit=document.getElementById('olimit').checked;
  if(limit){var pr=Number(document.getElementById('oprice').value);if(!(pr>0)){msg.className='setmsg err';msg.textContent='지정가를 입력하세요.';return;}_order.type='limit';_order.price=pr;}else{_order.type='market';_order.price=undefined;}
  msg.className='setmsg';msg.textContent='미리보기 불러오는 중…';
- fetch('/api/order?token='+TOKEN,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({broker:_order.broker,market:_order.market,symbol:_order.symbol,side:_order.side,type:_order.type,quantity:_order.quantity,price:_order.price})})
+ fetch('/api/order',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({broker:_order.broker,market:_order.market,symbol:_order.symbol,side:_order.side,type:_order.type,quantity:_order.quantity,price:_order.price})})
   .then(function(r){return r.json()}).then(function(d){
    if(!d.ok){msg.className='setmsg err';msg.textContent='차단/오류: '+(d.error||'알 수 없음');return;}
    if(d.phase==='preview'){_order.confirmToken=d.confirmToken;var p=d.preview||{};var live=p.env==='live';
@@ -1227,7 +1328,7 @@ function submitOrder(){if(!_order)return;var msg=document.getElementById('orderM
    msg.className='setmsg err';msg.textContent='예상치 못한 응답';
   }).catch(function(e){msg.className='setmsg err';msg.textContent='실패: '+e.message;});}
 function confirmOrder(){if(!_order||!_order.confirmToken)return;var msg=document.getElementById('orderMsg');msg.className='setmsg';msg.textContent='주문 전송 중…';
- fetch('/api/order?token='+TOKEN,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({broker:_order.broker,market:_order.market,symbol:_order.symbol,side:_order.side,type:_order.type,quantity:_order.quantity,price:_order.price,confirmToken:_order.confirmToken})})
+ fetch('/api/order',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({broker:_order.broker,market:_order.market,symbol:_order.symbol,side:_order.side,type:_order.type,quantity:_order.quantity,price:_order.price,confirmToken:_order.confirmToken})})
   .then(function(r){return r.json()}).then(function(d){
    if(d.ok&&d.phase==='executed'){msg.className='setmsg ok';msg.textContent='✅ 주문 완료 ('+esc(d.env)+') · 주문번호 '+esc((d.result&&d.result.orderId)||'-');loadBalances();}
    else{msg.className='setmsg err';msg.textContent='실패: '+(d.error||'알 수 없음')+' — 미리보기부터 다시 하세요.';_order.confirmToken=null;
@@ -1286,7 +1387,7 @@ function render(){var pos=document.getElementById('pos');pos.innerHTML='';
 let setLoaded=false;
 function toggleSettings(){const p=document.getElementById('setpanel');const show=p.style.display!=='block';p.style.display=show?'block':'none';if(show&&!setLoaded){loadSettings();}}
 function brokerLabel(b){return {binance:'Binance (암호화폐)',kis:'한국투자증권',kiwoom:'키움증권'}[b]||b;}
-function loadSettings(){fetch('/api/credentials?token='+TOKEN).then(r=>r.json()).then(d=>{if(!d.ok)return;setLoaded=true;
+function loadSettings(){fetch('/api/credentials').then(r=>r.json()).then(d=>{if(!d.ok)return;setLoaded=true;
  document.getElementById('credpath').textContent=d.path;
  const body=document.getElementById('setbody');body.innerHTML='';
  for(const b of Object.keys(d.fields)){const st=d.status[b];
@@ -1303,7 +1404,7 @@ function loadSettings(){fetch('/api/credentials?token='+TOKEN).then(r=>r.json())
  renderLive(d.live);loadAlertConfig();
 });}
 // 알림 설정(Slack/Discord 웹훅). URL은 SSRF 검증 후에만 저장, 화면엔 마스킹만 표시.
-function loadAlertConfig(){fetch('/api/alerts?token='+TOKEN).then(function(r){return r.json()}).then(function(d){if(d&&d.config)renderAlertCfg(d.config);}).catch(function(){});}
+function loadAlertConfig(){fetch('/api/alerts').then(function(r){return r.json()}).then(function(d){if(d&&d.config)renderAlertCfg(d.config);}).catch(function(){});}
 function renderAlertCfg(c){var box=document.getElementById('setalert');if(!box)return;
  var on=c.enabled;
  var h='<div class="lh"><span>🔔 알림(웹훅)</span><span class="'+(on?'on':'off')+'">'+(on?'🟢 켜짐':'⚪ 꺼짐')+'</span></div>';
@@ -1318,12 +1419,12 @@ function renderAlertCfg(c){var box=document.getElementById('setalert');if(!box)r
 function saveAlertCfg(){var msg=document.getElementById('setmsg');var url=document.getElementById('alurl').value.trim();var en=document.getElementById('alon').checked;
  var body={enabled:en};if(url)body.webhookUrl=url;
  msg.className='setmsg';msg.textContent='알림 설정 저장 중…';
- fetch('/api/alerts?token='+TOKEN,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)})
+ fetch('/api/alerts',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)})
   .then(function(r){return r.json()}).then(function(d){if(d.ok){msg.className='setmsg ok';msg.textContent='✅ 알림 설정 저장됨.';renderAlertCfg(d.config);}
    else{msg.className='setmsg err';msg.textContent='저장 실패: '+(d.error||'알 수 없음');}})
   .catch(function(e){msg.className='setmsg err';msg.textContent='저장 실패: '+e.message;});}
 function testAlert(){var msg=document.getElementById('setmsg');msg.className='setmsg';msg.textContent='테스트 발사 중…';
- fetch('/api/alerts?token='+TOKEN,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({test:true})})
+ fetch('/api/alerts',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({test:true})})
   .then(function(r){return r.json()}).then(function(d){if(d.ok){msg.className='setmsg ok';msg.textContent='✅ 테스트 알림 전송됨(채널 확인).';}
    else{msg.className='setmsg err';msg.textContent='전송 실패: '+(d.error||'알 수 없음');}})
   .catch(function(e){msg.className='setmsg err';msg.textContent='전송 실패: '+e.message;});}
@@ -1347,25 +1448,34 @@ function renderLive(live){const box=document.getElementById('setlive');if(!box)r
    if(!document.getElementById('livewd').checked){const m=document.getElementById('setmsg');m.className='setmsg err';m.textContent='먼저 거래소에서 출금 권한을 끄고 체크해주세요(실돈 안전).';return;}
    saveLive(true,document.getElementById('livecap').value.trim(),document.getElementById('liveallow').value.trim());});}
 }
-function saveLive(enable,cap,allow){const msg=document.getElementById('setmsg');msg.className='setmsg';msg.textContent=enable?'실거래 켜는 중…':'페이퍼로 전환 중…';
+// 실거래 켜기 = 2단계(프리뷰→확정). _liveConfirm에 프리뷰 토큰+당시 입력 보관 — 서버 해시 바인딩이라 확정은 프리뷰 당시 값으로만 성립. 끄기=1샷(킬스위치).
+var _liveConfirm=null;
+function saveLive(enable,cap,allow,confirmToken){const msg=document.getElementById('setmsg');msg.className='setmsg';msg.textContent=enable?(confirmToken?'실거래 켜는 중…':'실거래 켜기 확인 요청 중…'):'페이퍼로 전환 중…';
  const body=enable?{enable:true,maxNotional:cap||'',allowlist:allow||''}:{enable:false};
- fetch('/api/live?token='+TOKEN,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)})
-  .then(r=>r.json()).then(d=>{if(d.ok){msg.className='setmsg ok';msg.textContent=enable?'🟢 실거래 ON — 이제 봇이 실매매합니다(한도 보호 적용).':'⚪ 페이퍼로 전환됨(실주문 중단).';renderLive(d.live);}
-   else{msg.className='setmsg err';msg.textContent='실패: '+(d.error||'알 수 없음');}})
+ if(enable&&confirmToken)body.confirmToken=confirmToken;
+ fetch('/api/live',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)})
+  .then(r=>r.json()).then(d=>{
+   if(d.ok&&d.phase==='preview'){_liveConfirm={token:d.confirmToken,cap:cap||'',allow:allow||''};
+    msg.className='setmsg err';
+    msg.innerHTML='⚠ 실거래(실돈) 켜기 — 주문당 최대 '+esc((d.preview&&d.preview.maxNotional)||'기본')+' · 허용 '+esc((d.preview&&d.preview.allowlist)||'전체')+' <span class="ib on" onclick="confirmLive()">정말 켜기(확정)</span> <span class="ib" onclick="cancelLiveConfirm()">취소</span>';return;}
+   if(d.ok){msg.className='setmsg ok';msg.textContent=enable?'🟢 실거래 ON — 이제 봇이 실매매합니다(한도 보호 적용).':'⚪ 페이퍼로 전환됨(실주문 중단).';_liveConfirm=null;renderLive(d.live);}
+   else{msg.className='setmsg err';msg.textContent='실패: '+(d.error||'알 수 없음');_liveConfirm=null;}})
   .catch(e=>{msg.className='setmsg err';msg.textContent='실패: '+e.message;});}
+function cancelLiveConfirm(){_liveConfirm=null;var m=document.getElementById('setmsg');m.className='setmsg';m.textContent='';}
+function confirmLive(){if(!_liveConfirm)return;var c=_liveConfirm;_liveConfirm=null;saveLive(true,c.cap,c.allow,c.token);}
 function saveBroker(b,sec){const updates={};sec.querySelectorAll('input[data-key]').forEach(i=>{const v=i.value.trim();if(v)updates[i.getAttribute('data-key')]=v;});
  const msg=document.getElementById('setmsg');
  if(!Object.keys(updates).length){msg.className='setmsg err';msg.textContent='입력한 값이 없어요.';return;}
  msg.className='setmsg';msg.textContent='저장 중…';
- fetch('/api/credentials?token='+TOKEN,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(updates)})
+ fetch('/api/credentials',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(updates)})
   .then(r=>r.json()).then(d=>{if(d.ok){msg.className='setmsg ok';msg.textContent='✅ '+d.written+'개 저장 완료. 키는 안전하게 보관돼요(다시 표시 안 됨).';
    sec.querySelectorAll('input[data-key]').forEach(i=>i.value='');setLoaded=false;loadSettings();}
    else{msg.className='setmsg err';msg.textContent='저장 실패: '+(d.error||'알 수 없음');}})
   .catch(e=>{msg.className='setmsg err';msg.textContent='저장 실패: '+e.message;});}
-function loadBalances(){fetch('/api/balances?token='+TOKEN).then(function(r){return r.json()}).then(function(d){if(d&&d.accounts){d.accounts.forEach(function(a){accounts[a.broker]=a});render();}}).catch(function(){});}
+function loadBalances(){fetch('/api/balances').then(function(r){return r.json()}).then(function(d){if(d&&d.accounts){d.accounts.forEach(function(a){accounts[a.broker]=a});render();}}).catch(function(){});}
 // 거래소 실계정 패널(읽기전용). 브로커별 getAccount 폴링(60s). 주문/취소는 기존 안전경로만.
 function loadRealAccounts(){var bks=[];bots.forEach(function(b){if(bks.indexOf(b.broker)<0)bks.push(b.broker);});
- bks.forEach(function(bk){fetch('/api/account?token='+TOKEN+'&broker='+encodeURIComponent(bk)).then(function(r){return r.json()}).then(function(d){realAccounts[bk]=d;render();}).catch(function(){});});}
+ bks.forEach(function(bk){fetch('/api/account?broker='+encodeURIComponent(bk)).then(function(r){return r.json()}).then(function(d){realAccounts[bk]=d;render();}).catch(function(){});});}
 function acctPanelHtml(bk,ccy,ra){
  if(!ra.configured)return '<div class="k">🔑 거래소 실계정</div><div class="hint" style="margin-top:6px">키 미연동 — ⚙️에서 API 키를 넣으면 실잔고·실포지션이 보여요.</div>';
  if(ra.ok===false)return '<div class="k">🔑 거래소 실계정 <span class="envb safe">'+esc(String(ra.env||'').toUpperCase())+'</span></div><div class="hint" style="margin-top:6px">'+esc(ra.reason||ra.error||'조회 불가')+'</div>';
@@ -1384,8 +1494,8 @@ function acctPanelHtml(bk,ccy,ra){
 }
 // OCO 취소 — 기존 안전경로(/api/protect/cancel → cancelProtective)만 경유. 신규 쓰기로직 없음.
 function cancelAcctProtect(bk,sym,olid){if(!olid){alert('orderListId 없음');return;}
- fetch('/api/protect/cancel?token='+TOKEN,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({broker:bk,symbol:sym,orderListId:olid})}).then(function(r){return r.json()}).then(function(){loadRealAccounts();}).catch(function(){});}
-function loadPrices(){fetch('/api/prices?token='+TOKEN).then(function(r){return r.json()}).then(function(d){if(d&&d.prices){for(const k in d.prices)prices.set(k,d.prices[k]);render();}}).catch(function(){});} // KR 현재가 폴링(~45s) → 카드 평가손익 실값
+ fetch('/api/protect/cancel',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({broker:bk,symbol:sym,orderListId:olid})}).then(function(r){return r.json()}).then(function(){loadRealAccounts();}).catch(function(){});}
+function loadPrices(){fetch('/api/prices').then(function(r){return r.json()}).then(function(d){if(d&&d.prices){for(const k in d.prices)prices.set(k,d.prices[k]);render();}}).catch(function(){});} // KR 현재가 폴링(~45s) → 카드 평가손익 실값
 function renderAlerts(list){var el=document.getElementById('alertfeed');if(!el)return;var arr=list||[];
  if(!arr.length){el.style.display='none';return;}
  el.style.display='block';
@@ -1394,7 +1504,7 @@ function renderAlerts(list){var el=document.getElementById('alertfeed');if(!el)r
    var t=new Date(a.ts);var hh=('0'+t.getHours()).slice(-2)+':'+('0'+t.getMinutes()).slice(-2)+':'+('0'+t.getSeconds()).slice(-2);
    return '<div class="alertrow '+esc(a.level)+'"><span class="ad">'+icon(a.level)+'</span><span class="at">'+hh+'</span><span class="am">'+esc(a.message)+'</span></div>';
  }).join('');}
-const es=new EventSource('/events?token='+TOKEN);
+const es=new EventSource('/events'); // same-origin SSE — 세션쿠키 자동 첨부
 es.onmessage=e=>{const s=JSON.parse(e.data);bots=s.bots;document.getElementById('upd').textContent=new Date(s.updatedAt).toLocaleTimeString();subscribe();render();renderAlerts(s.alerts)};
 render();loadBalances();setTimeout(loadPrices,2500);setInterval(loadBalances,60000);setInterval(loadPrices,45000);
 setTimeout(loadRealAccounts,1500);setInterval(loadRealAccounts,60000); // 거래소 실계정 패널 폴링
