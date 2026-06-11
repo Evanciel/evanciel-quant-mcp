@@ -23,6 +23,10 @@ const a = got.adapter;
 
 console.log("── 키움 모의 주문 E2E (지정가 매수→취소) ──");
 try {
+  // 0) 테스트 전 보유 수량 캡처(모의계좌에 기존 보유가 있어도 '미체결 취소 후 불변'으로 정확히 검증)
+  const heldOf = (ps: { symbol: string; quantity: number }[]) => ps.filter((p) => p.symbol === SYMBOL).reduce((s, p) => s + p.quantity, 0);
+  const before = heldOf(await a.getPositions());
+
   // 1) 현재가
   const px = await a.getPrice(SYMBOL);
   ok(px.price > 0, `현재가 ${SYMBOL}: ${px.price}`);
@@ -45,9 +49,10 @@ try {
 
   await sleep(1500);
 
-  // 4) 보유 0 확인(미체결이라 포지션 없어야)
+  // 4) 보유 불변 확인(미체결 지정가→취소라 수량 증가 0. 모의계좌의 기존 보유는 그대로 유지돼야 정상)
   const pos = await a.getPositions();
-  ok(pos.filter((p) => p.symbol === SYMBOL).length === 0, `보유 ${SYMBOL} 0주(미체결 확인). 전체 보유 ${pos.length}개`);
+  const after = heldOf(pos);
+  ok(after === before, `보유 ${SYMBOL} 불변(${before}→${after}주, 미체결 취소 확인). 전체 보유 ${pos.length}개`);
 } catch (e) {
   console.log("🔴 예외:", e instanceof Error ? e.message : String(e)); fail++;
 }

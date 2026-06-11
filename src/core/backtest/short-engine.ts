@@ -14,7 +14,7 @@ import { resolveActiveStrategy, evalLadderSignals } from "./engine";
 interface OHLCV { date: string; open: number; high: number; low: number; close: number; volume: number }
 import { calcMaxDrawdown, calcSharpeRatio } from "./metrics";
 import { openShort, evaluateShortTick, computeShortPnl, type ShortPosition } from "../position/short";
-import { floorQty } from "../position/qty";
+import { floorQty, quantizeQty } from "../position/qty";
 import { computeOrderQty } from "../risk/order-sizing";
 
 export interface ShortRisk {
@@ -82,8 +82,9 @@ export function runShortBacktest(
     }
 
     if (!pos && sig.sell && !sig.buyRule) {
-      // 약세 신호 → 숏 진입. 노레버(기본): notional=capital → floorQty(capital/entryPrice) **바이트 동일**.
-      //   레버리지>1(opt-in): computeOrderQty 선물 경로(notional=capital×leverage, 캡 capital×leverage). 공용 함수 → 라이브 선물 도입 시 backtest≡live.
+      // 약세 신호 → 숏 진입. 노레버(기본): notional=capital → 수량. KR(6자리 심볼)=정수주, 크립토=8자리 소수(quantizeQty).
+      //   ⚠️ KR 주식 숏/선물은 라이브 미지원(러너 현물 전용) — 이 경로는 백테 시뮬. quantizeQty로 KR 백테도 정수 일관.
+      //   레버리지>1(opt-in): computeOrderQty 선물 경로(크립토 전용, notional=capital×leverage). 공용 함수 → 라이브 선물 도입 시 backtest≡live.
       const entryPrice = price * (1 - slip); // 숏 매도 = 슬리피지 불리(가격↓ 체결)
       const qty = leverage > 1
         ? computeOrderQty({
@@ -92,7 +93,7 @@ export function runShortBacktest(
             legacyQuantityPercent: 100, riskSizing: null,
             market: "futures", leverage, maxLeverage: typeof risk?.maxLeverage === "number" ? risk.maxLeverage : undefined,
           }).qty
-        : floorQty(config.initialCapital / entryPrice);
+        : quantizeQty(config.initialCapital / entryPrice, config.symbol);
       if (qty > 0) {
         pos = openShort({
           entryPrice, qty,

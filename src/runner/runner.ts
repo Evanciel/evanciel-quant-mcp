@@ -12,17 +12,46 @@ import { collectMtfConditions, buildMtfSeries, collectMtfRegimeConditions, build
 import { collectEventCalendars, buildEventCalendars } from "../core/calendar/calendars.js";
 import { rankUniverse, decideScannerActions, type RankBar } from "../core/scanner/rank.js";
 import { planProtectiveOrders, syncProtective } from "../core/execution/protective.js";
-import { sizeFromBalance, classifyFillStatus } from "../core/execution/reconcile.js";
+import { sizeFromBalance, classifyFillStatus, reconcilePositionFromExchange, type ExchangePos } from "../core/execution/reconcile.js";
 import { computeOrderQty } from "../core/risk/order-sizing.js"; // 스캐너 진입 사이징(opt-in 변동성 타게팅)
-// 주: computePositionDrift(포지션 드리프트 정정)는 선물(심볼별 순포지션) 개념. 현물은 공유 잔고라 봇별 귀속 불가 → 선물 봇 도입 시 배선.
+// 체결 reconcile(P0-4): 키움/KIS는 getOrderByClientId 미지원 → 주문 시점 체결확인 불가(지연체결). tickBot 시작 시
+//   거래소 실보유(getPositions)를 조회해 봇 장부를 거래소 진실로 동기화(reconcilePositionFromExchange). 크립토(Binance,
+//   getOrderByClientId 지원=주문 시점 즉시 filled 확인)는 reconcile 불필요 → 술어 미충족으로 미진입(회귀 0).
 import * as store from "../store/db.js";
 import { getAdapter } from "../brokers/index.js";
 import { liveGate, checkLimits, audit, loadPortfolioGateConfig, portfolioGate, type Broker } from "../brokers/safety.js";
-import { floorQty } from "../core/position/qty.js";
+import { floorQty, quantizeQty } from "../core/position/qty.js";
 import type { PortfolioPosition } from "../core/risk/portfolio.js";
 
 /** 보호주문 동기화 연속 실패 한도 — 도달 시 비상 청산(fail-closed). 손절 없는 나체 라이브 포지션 방치 금지(P0-2). */
 const PROTECTIVE_MAX_FAILS = 3;
+
+/** reconcile 가짜보유 정정 한도(연속 거래소 부재 틱). 키움 지연체결로 방금 산 정상 포지션이 거래소에 잠시
+ *  안 떠 빈배열로 보일 수 있어(adopt의 대칭 위험), 빈배열 1회를 곧장 '가짜보유'로 단정해 오삭제하지 않는다.
+ *  연속 N틱(거래소 진실=무보유 확정) 지속될 때만 장부 0으로 정정(fail-closed: 정상 포지션 보존 우선). */
+const RECON_CLEAR_MISSES = 3;
+
+// reconcile용 거래소 실보유 계좌 단위 캐시(broker+env). 같은 키움 계좌를 봇마다 매 틱 중복 조회하면
+// 레이트리밋(429)으로 일부 throw → reconcile 비결정 실패. 한 사이클 내 1회 조회를 공유(TTL) + in-flight 코얼레싱.
+const _reconPosCache = new Map<string, { at: number; positions: ExchangePos[] }>();
+const _reconPosInflight = new Map<string, Promise<ExchangePos[]>>();
+const RECON_POS_TTL_MS = 4000; // 키움 봇 평가 주기보다 짧고, 한 틱 사이클(봇 N개 순차) 공유엔 충분
+async function getReconcilePositions(broker: string, env: string, fetcher: () => Promise<ExchangePos[]>): Promise<ExchangePos[]> {
+  const key = `${broker}:${env}`;
+  const cached = _reconPosCache.get(key);
+  if (cached && Date.now() - cached.at < RECON_POS_TTL_MS) return cached.positions;
+  let inflight = _reconPosInflight.get(key);
+  if (!inflight) {
+    inflight = fetcher().then((positions) => { _reconPosCache.set(key, { at: Date.now(), positions }); return positions; })
+      .finally(() => { _reconPosInflight.delete(key); });
+    _reconPosInflight.set(key, inflight);
+  }
+  return inflight;
+}
+/** 라이브 주문(매수/매도) 후 호출 — 거래소 보유가 바뀌었으니 계좌 캐시를 버려 다음 reconcile이 fresh 조회하게. */
+function invalidateReconCache(broker: string, env: string): void { _reconPosCache.delete(`${broker}:${env}`); }
+/** 테스트 전용: reconcile 계좌 캐시 초기화(모듈 스코프라 테스트 간 누수 방지). 프로덕션 경로 미사용. */
+export function __clearReconCache(): void { _reconPosCache.clear(); _reconPosInflight.clear(); }
 
 type FillResult = { live: boolean; price: number; orderId?: string; note: string; filledQty?: number; failed?: boolean };
 
@@ -92,6 +121,10 @@ async function fillOrder(bot: store.BotRow, side: "buy" | "sell", qty: number, p
     } catch { /* 조회 실패 → 신규 주문 경로 */ }
   }
   audit({ event: "bot_order_attempt", botId: bot.id, broker, env: gate.env, symbol, side, qty: nq, price });
+  // 라이브 주문은 거래소 실보유를 바꾼다 → reconcile 계좌 캐시를 무효화(다음 reconcile은 fresh 조회).
+  //   안 하면 주문 후 같은 사이클/TTL 내 reconcile이 옛 스냅샷으로 stale-adopt하거나, 빈 스냅샷을 clear 카운트에
+  //   중복 반영(="N misses ≠ N 독립관측")할 수 있음(코덱스 지적). 무효화로 주문 직후 관측은 항상 신선.
+  invalidateReconCache(broker, gate.env ?? "testnet"); // 키 = reconcile의 live.env(gate.env ?? "testnet")와 동일해야 무효화가 맞음
   try {
     const r = await got.adapter.placeOrder({ symbol, side, type: "market", quantity: nq, clientOrderId: cid });
     audit({ event: "bot_order_result", botId: bot.id, env: gate.env, orderId: r.orderId, status: r.status });
@@ -100,15 +133,27 @@ async function fillOrder(bot: store.BotRow, side: "buy" | "sell", qty: number, p
       store.insertLog(bot.id, "error", `[${gate.env}] 주문 거부 ${symbol} ${side} qty=${nq}`);
       return blocked("주문 거부");
     }
-    // 체결가 미확인(접수형 브로커: 키움 시장가=pending·price 0): 참조가로 기록하되 침묵하지 않는다(P0-3 정직화).
-    //   진짜 체결가 보정은 체결조회 API 배선(P2) 전까지 불가 — 장부 오차 가능성을 로그+감사로 남긴다.
+    // 체결 미확인 판정: 'filled' + 체결가(>0)만 확정 체결. 그 외(status=pending=접수형 미체결 / 체결가 0)는 미확인.
+    //   ⚠️ priceConfirmed만으론 부족(P0-5 구멍): 키움 '지정가'는 pending인데도 참조가(>0)를 실어 보내 → priceConfirmed=true로
+    //   '보유'로 둔갑하던 발산(키움 모의 실측: 장부 보유, 실계좌 0). status=pending 자체를 미확인으로 본다(시장가 price0 + 지정가 둘 다 포착).
     const priceConfirmed = typeof r.price === "number" && r.price > 0;
-    if (!priceConfirmed) {
-      store.insertLog(bot.id, "live", `[${gate.env}] ⚠️ 접수됨(${r.status}) — 체결가 미확인, 참조가 ${price}로 기록(체결조회 미배선)`);
-      audit({ event: "fill_price_unconfirmed", botId: bot.id, env: gate.env, orderId: r.orderId, refPrice: price });
+    const fillConfirmed = r.status === "filled" && priceConfirmed;
+    if (!fillConfirmed) {
+      store.insertLog(bot.id, "live", `[${gate.env}] ⚠️ 접수됨(${r.status}) — 체결 미확인(${priceConfirmed ? `참조가 ${price}` : "체결가 미확인"}, 체결조회 미배선)`);
+      audit({ event: "fill_price_unconfirmed", botId: bot.id, env: gate.env, orderId: r.orderId, status: r.status, refPrice: price });
+      // P0-5(fail-closed): 체결 미확인 + 체결조회 미지원 브로커(키움/한투 — getOrderByClientId 미구현)면
+      //   접수=비동기 미체결이라 거래소엔 아직 포지션이 없는데 보유로 기록하면 장부≠계좌로 발산한다
+      //   (키움 모의 실측: 봇 장부엔 '보유'인데 실계좌는 변화 0). 보유로 기록하지 말고 동결 → 다음 틱 재시도.
+      //   진입/라이브채널 공히 동결(blocked의 진입 페이퍼폴백조차 '거래소에 없는 포지션을 만드는' 셈이라 금지).
+      //   바이낸스는 getOrderByClientId 지원 → 이 분기 미진입(시장가는 status='filled'+price>0=fillConfirmed라 애초에 안 옴, 회귀 0).
+      if (!got.adapter.getOrderByClientId) {
+        store.insertLog(bot.id, "error", `[${gate.env}] 체결 미확인(${r.status}) + 주문조회 미지원(${broker}) → 보유 기록 금지·동결(거래소 미반영 가능, 다음 틱 재시도)`);
+        audit({ event: "fill_unconfirmed_frozen", botId: bot.id, env: gate.env, orderId: r.orderId, status: r.status, broker, symbol });
+        return { live: false, price, note: "체결 미확인 동결(조회 미지원)", failed: true };
+      }
     }
     store.insertLog(bot.id, "live", `[${gate.env}] 실주문 ${symbol} ${side} qty=${nq} → ${r.status} (${r.orderId})`);
-    return { live: true, price: priceConfirmed ? r.price : price, orderId: r.orderId, note: `${gate.env} 실주문${priceConfirmed ? "" : "(체결가 미확인)"}`, filledQty: r.quantity || nq };
+    return { live: true, price: fillConfirmed ? r.price : price, orderId: r.orderId, note: `${gate.env} 실주문${fillConfirmed ? "" : "(체결 미확인)"}`, filledQty: r.quantity || nq };
   } catch (e) {
     // P0-4 체결 reconcile: 모호한 실패(타임아웃/네트워크)여도 주문이 실제 나갔을 수 있음 → 같은 clientOrderId로 조회.
     let verdict: ReturnType<typeof classifyFillStatus> = "unknown";
@@ -186,6 +231,7 @@ export interface PaperPosition {
   protectiveIds?: string[];  // 거래소에 걸린 상주 보호주문(SL/TP) clientOrderId 목록(syncProtective 추적)
   peakPrice?: number;        // 진입 후 고점(롱)/저점(숏) — 트레일링 스탑 기준(planProtectiveOrders extremeSinceEntry)
   protFails?: number;        // 보호주문 동기화 연속 실패 수 — PROTECTIVE_MAX_FAILS 도달 시 비상 청산(P0-2)
+  reconMisses?: number;      // reconcile 시 라이브 포지션이 거래소에 연속 부재한 틱 수 — RECON_CLEAR_MISSES 도달 시 가짜보유 정정(지연체결 오삭제 방지, 라이브 채널만)
 }
 
 /** 폴링 주기(초) → Binance kline 타임프레임. 인트라데이 봉이라야 시간대(hour) 조건이 의미. */
@@ -217,6 +263,104 @@ function derivePosition(trades: { action: string; price: number; quantity: numbe
     else { const sell = Math.min(t.quantity, qty); if (qty > 0) cost -= (cost / qty) * sell; qty -= sell; if (qty <= 1e-9) { qty = 0; cost = 0; } }
   }
   return { holding: qty > 1e-9, entryAvg: qty > 0 ? cost / qty : 0, qty };
+}
+
+/**
+ * 체결 reconcile(P0-4, 라이브 단일봇 전용). tickBot 신호평가 전에 봇 장부(position_state)를 거래소 실보유로 동기화.
+ *
+ * 적용 조건(셋 다 충족 시에만 getPositions 조회 — 그 외 즉시 cur 반환=거동/오버헤드 0):
+ *   ① bot.mode==='live'  ② 라이브 어댑터 해석 가능(liveAdapterFor: 게이트 통과 + 어댑터 존재)
+ *   ③ 어댑터가 getOrderByClientId 미지원(=키움/KIS; 바이낸스는 지원→주문 시점 즉시 체결확인되어 reconcile 불요).
+ *
+ * 동작:
+ *   - adopt: 거래소 보유>0 && 로컬과 발산 → 장부를 거래소 진실(실수량/평단)로 재구성(지연체결/부분체결 반영). live:true.
+ *            reconMisses=0 리셋. 보호주문(protectiveIds)은 후속 syncBotProtective가 재동기화하므로 여기선 비움.
+ *   - no_exchange_pos + 라이브 보유 장부: 거래소에 그 종목 없음 → '가짜보유 후보'. 단정 clear 금지(지연체결로 방금
+ *            산 정상 포지션이 거래소에 잠시 안 떴을 수 있음). reconMisses++ → RECON_CLEAR_MISSES 연속 도달 시에만 장부 0
+ *            정정(fail-closed). 미만이면 보유 유지(카운터만 증가).
+ *   - in_sync / 거래소 보유 정상: reconMisses=0 리셋, 무변경.
+ *   - 페이퍼 채널 장부(live!=true): reconcile 비대상(실주문 안 나가 발산 없음) — 무변경.
+ *   - getPositions 조회 실패(throw): 삼키되 침묵 금지(error 로그) + 장부 임의 변경 안 함(보수, 다음 틱 재시도).
+ *
+ * 멱등/재주문 폭주 방지: reconcile은 읽기(getPositions)만 — 주문 안 냄. adopt로 장부가 채워지면 다음 단계
+ *   planPositionDelta의 want vs curQty 델타가 0이 되어 재진입 자체가 사라진다(2차 방어). 멱등키는 같은 봉 1차 방어.
+ */
+async function reconcileLivePosition(bot: store.BotRow, cur: PaperPosition | null, lastIso: string): Promise<PaperPosition | null> {
+  if (bot.mode !== "live") return cur;
+  const live = liveAdapterFor(bot);
+  if (!live) return cur; // 게이트 미통과/어댑터 없음 → reconcile 불가(페이퍼처럼 동작, 회귀 0)
+  const adapter = live.adapter as {
+    getPositions?: () => Promise<ExchangePos[]>;
+    getOrderByClientId?: unknown;
+  };
+  // 바이낸스(getOrderByClientId 지원)는 주문 시점 즉시 체결확인 → reconcile 불요. getPositions 없는 어댑터도 스킵.
+  if (typeof adapter.getPositions !== "function" || adapter.getOrderByClientId !== undefined) return cur;
+
+  const curQty = cur && cur.status === "open" ? cur.qty : 0;
+  const curLive = curQty > 1e-9 ? (cur?.live ?? false) : false;
+
+  let exPos: ExchangePos[];
+  try {
+    // 계좌 단위 캐시(broker+env) — 여러 봇이 같은 키움 계좌를 매 틱 중복 조회하면 레이트리밋(429)으로 일부 throw됨.
+    // 한 틱 사이클 내 1회만 조회해 공유(TTL). 읽기전용·시크릿 없음이라 캐싱 안전(dashboard _acctCache와 동일 취지).
+    exPos = await getReconcilePositions(bot.broker, live.env, () => (adapter.getPositions as () => Promise<ExchangePos[]>)());
+  } catch (e) {
+    // 거래소 조회 실패 → 장부 임의 변경 금지(보수). 침묵 금지(다음 틱 재시도).
+    store.insertLog(bot.id, "error", `[${live.env}] reconcile 조회 실패(${e instanceof Error ? e.message : e}) → 기존 장부 유지(다음 틱 재시도)`);
+    return cur;
+  }
+
+  const rec = reconcilePositionFromExchange(curQty > 1e-9 ? { qty: curQty } : null, exPos, bot.symbol);
+  if (rec.ambiguous) {
+    // 같은 종목을 여러 라이브 봇이 보유하면 계좌 단위 보유를 어느 봇에 귀속할지 모호(종목당 단일봇 가정 위반).
+    //   잘못된 봇에 전체 계좌 수량을 adopt하면 더 큰 발산 → 정정 보류(거래소 채택 안 함, 기존 장부 유지)하고 경고만.
+    //   같은 종목 라이브 봇 중복을 정리해야 reconcile이 정확. (보수적 fail-safe.)
+    store.insertLog(bot.id, "error", `[${live.env}] reconcile 귀속 모호: ${bot.symbol} 거래소 보유 다중 매칭(종목당 단일봇 가정 위반) — 정정 보류(중복 봇 정리 필요)`);
+    return cur;
+  }
+
+  if (rec.action === "adopt" && rec.next) {
+    // 거래소 진실 채택: 지연체결/부분체결분을 장부에 확정. 평단=거래소값(없으면 기존/0 폴백).
+    const entryAvg = rec.next.entryAvg > 0 ? rec.next.entryAvg : (cur?.entryAvg ?? 0);
+    const adopted: PaperPosition = {
+      status: "open",
+      entryAvg,
+      qty: rec.next.qty,
+      openedAt: cur?.openedAt ?? new Date().toISOString(),
+      live: true,                                   // 거래소 실보유 = 라이브 채널
+      peakPrice: Math.max(cur?.peakPrice ?? entryAvg, entryAvg),
+      protectiveIds: cur?.protectiveIds ?? [],      // 후속 syncBotProtective가 재동기화
+      protFails: cur?.protFails ?? 0,
+      reconMisses: 0,
+    };
+    store.setBotPositionState(bot.id, adopted, true, false);
+    store.insertLog(bot.id, "live", `[${live.env}] reconcile 거래소 채택: ${bot.symbol} 장부 ${curQty}→${rec.next.qty}(평단 ${entryAvg})${rec.drift.severity === "major" ? " [major drift]" : ""} — 지연체결/부분체결 반영`);
+    audit({ event: "reconcile_adopt", botId: bot.id, env: live.env, symbol: bot.symbol, localQty: curQty, exchangeQty: rec.next.qty, severity: rec.drift.severity });
+    return adopted;
+  }
+
+  if (rec.action === "no_exchange_pos" && curLive && cur && curQty > 1e-9) {
+    // 가짜보유 후보(라이브 장부 보유 ↔ 거래소 부재). 지연체결 오삭제 방지 → 연속 N틱 부재 시에만 clear.
+    const misses = (cur.reconMisses ?? 0) + 1;
+    if (misses >= RECON_CLEAR_MISSES) {
+      store.setBotPositionState(bot.id, null, true, false);
+      store.insertLog(bot.id, "live", `[${live.env}] reconcile 가짜보유 정정: ${bot.symbol} 거래소 ${RECON_CLEAR_MISSES}틱 연속 부재 → 장부 ${curQty}→0(거래소 진실 채택)`);
+      audit({ event: "reconcile_clear", botId: bot.id, env: live.env, symbol: bot.symbol, localQty: curQty, misses });
+      return null;
+    }
+    const next: PaperPosition = { ...cur, reconMisses: misses };
+    store.setBotPositionState(bot.id, next, true, false);
+    store.insertLog(bot.id, "gate", `[${live.env}] reconcile: ${bot.symbol} 거래소 부재(${misses}/${RECON_CLEAR_MISSES}틱) — 보유 유지(지연체결 가능성, 즉시 삭제 안 함)`);
+    return next;
+  }
+
+  // in_sync / 거래소 보유 정상 / 페이퍼 채널 / 장부 0: reconMisses 리셋(연속성 깨짐) 후 무변경.
+  if (cur && (cur.reconMisses ?? 0) > 0) {
+    const next: PaperPosition = { ...cur, reconMisses: 0 };
+    store.setBotPositionState(bot.id, next, true, false);
+    return next;
+  }
+  return cur;
 }
 
 // ── 포트폴리오 레벨 캡(opt-in) — 러너측 스냅샷 + 진입 게이트 적용 ──
@@ -281,7 +425,7 @@ function applyPortfolioGate(symbol: string, qty: number, price: number): { qty: 
   const g = portfolioGate(cfg, snap);
   if (!g.allow) return { qty: 0, blocked: true, reasons: g.reasons };
   if (g.sizeMultiplier < 1) {
-    const scaled = floorQty(qty * g.sizeMultiplier);
+    const scaled = quantizeQty(qty * g.sizeMultiplier, symbol); // KR(6자리)=정수주, 크립토=8자리 소수(Bug#1 일관 — 포트폴리오 캡 축소분도 KR 정수)
     if (!(scaled > 0)) return { qty: 0, blocked: true, reasons: [...g.reasons, `MDD 디리스킹 ×${g.sizeMultiplier} → 수량 0`] };
     return { qty: scaled, blocked: false, reasons: g.reasons };
   }
@@ -340,11 +484,19 @@ export async function tickBot(botId: string): Promise<{ action: "buy" | "sell" |
   };
   const res = runCompositeBacktest(root, data as unknown as Parameters<typeof runCompositeBacktest>[1], cfg, 0, risk);
   const want = derivePosition(res.trades);
-  const cur = bot.position_state as PaperPosition | null;
+  let cur = bot.position_state as PaperPosition | null;
+  const lastIso = data[data.length - 1].datetime;
+
+  // ── P0-4 체결 reconcile(라이브 전용, 신호평가 전): 키움/KIS는 주문 시점 체결확인 불가(getOrderByClientId 미지원)
+  //    → 매수 시장가가 pending+price0로 동결(fail-closed)된 뒤 거래소가 지연체결하면 거래소엔 실보유·장부엔 0(역방향
+  //    발산). 틱 시작 시 거래소 실보유(getPositions)를 조회해 봇 장부를 거래소 진실로 동기화한다. 이후 curQty/델타가
+  //    정정된 cur를 본다. 가드 술어가 'mode=live + 게이트통과 + getOrderByClientId 미지원'으로 좁아 바이낸스(지원)·
+  //    페이퍼(mode!=live)·게이트OFF는 미진입 → getPositions 미호출 → 거동·오버헤드 0(회귀 0). 스캐너 경로는 별도(아래).
+  cur = await reconcileLivePosition(bot, cur, lastIso);
+
   const curQty = cur && cur.status === "open" ? cur.qty : 0;
   // 체결 채널: 라이브로 연 포지션인가. 레거시 상태(live 필드 없음)는 페이퍼로 보수 처리(실주문 안 나감 — 안전측).
   const curLive = curQty > 1e-9 ? (cur?.live ?? false) : false;
-  const lastIso = data[data.length - 1].datetime;
 
   // ── P0-2 에스컬레이션: 라이브 포지션의 상주 보호주문 동기화가 연속 실패하면 '손절 없는 나체 포지션'을
   //    계속 들고 있지 않는다(fail-closed). 손절류(고정/트레일링)를 설정한 포지션만 대상 — 사용자가 보호를 원했는데
@@ -485,6 +637,10 @@ function inSchedule(iso: string, schedule?: { hour: number[]; tz?: string }): bo
  * 체결은 fillOrder 경유 — mode=live+게이트통과(마스터스위치+심볼allowlist+노셔널캡+일일손실서킷)면 심볼별 실주문,
  * 아니면 페이퍼 폴백(fail-closed). 기본(키없음/마스터OFF)은 전부 페이퍼. position_state=심볼→포지션 맵.
  * 안전: 멀티심볼 실거래는 심볼 allowlist가 통제 — allowlist에 없는 심볼은 자동 페이퍼.
+ *
+ * 스코프: P0-4 체결 reconcile(reconcileLivePosition)은 단일봇 경로(tickBot)만 — 스캐너는 position_state가
+ *   심볼→포지션 맵이라 거래소 보유의 봇 귀속이 단일봇과 다르고, 키움 멀티심볼 라이브는 비대상이라 이번 제외.
+ *   (스캐너 심볼맵 reconcile은 후속 작업.)
  */
 async function tickScanner(bot: store.BotRow, node: ScannerNode, riskSizing?: BacktestConfig["riskSizing"]): Promise<{ action: "buy" | "sell" | "hold"; detail: string }> {
   const interval = secsToInterval(bot.interval_seconds);
@@ -554,7 +710,7 @@ async function tickScanner(bot: store.BotRow, node: ScannerNode, riskSizing?: Ba
     // riskSizing 있으면 변동성 타게팅/ATR/Kelly(심볼별 종가·고저로 산출), 없으면 기존 floor(perSymCapital/price) 그대로(회귀 0).
     const symBars = barsOf[sym] ?? [];
     const qty = riskSizing
-      ? computeOrderQty({ equity: perSymCapital, price, commissionPct: 0.1, closes: symBars.map((b) => b.close), highs: symBars.map((b) => b.high), lows: symBars.map((b) => b.low), timeframe: interval, legacyQuantityPercent: 100, riskSizing }).qty
+      ? computeOrderQty({ equity: perSymCapital, price, commissionPct: 0.1, closes: symBars.map((b) => b.close), highs: symBars.map((b) => b.high), lows: symBars.map((b) => b.low), timeframe: interval, legacyQuantityPercent: 100, riskSizing, symbol: sym }).qty
       : Math.floor(perSymCapital / price);
     if (qty <= 0) continue;
     // 포트폴리오 레벨 캡(opt-in): 심볼별 진입에 적용. 미설정이면 gate.qty===qty(거동 변화 0). blocked면 이 심볼 진입 스킵.

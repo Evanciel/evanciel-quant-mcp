@@ -7,7 +7,7 @@
  *
  * 정직: vol_target = 변동성 반비례 사이징 = **리스크 통제**(고변동 작게/저변동 크게, 무레버리지). 알파 아님.
  */
-import { floorQty } from "../position/qty.js";
+import { floorQty, quantizeQty } from "../position/qty.js";
 import { computePositionSize, computeEwmaVol, annualizeVol, toLogReturns, computeFuturesSize } from "./sizing.js";
 import { atr as atrIndicator } from "../strategy/indicators.js";
 
@@ -62,6 +62,9 @@ export interface OrderQtyInput {
   market?: "spot" | "futures"; // 기본 spot. "futures"일 때만 leverage가 노출에 적용됨.
   leverage?: number;           // 명목 배율. >1 + market="futures"일 때만 활성. 그 외엔 무시(현물 동치).
   maxLeverage?: number;        // 레버리지 새너티 상한(기본 20). computeFuturesSize 클램프/캡 기준.
+  // 인스트루먼트 인지 양자화(opt-in). KR 주식(6자리 숫자코드)이면 수량을 정수로 내림(소수주 미지원) → 엔진(백테)·러너(라이브)
+  //   동일 경로로 정수=store(장부)==거래소 실계좌(발산 방지). 미지정/크립토/미국주식이면 floorQty(8자리 분수)와 바이트 동일(회귀 0).
+  symbol?: string | null;
 }
 
 export interface OrderQtyResult {
@@ -84,8 +87,8 @@ function leverageActive(i: OrderQtyInput): boolean {
  */
 function finalizeQty(baseNotional: number, px: number, i: OrderQtyInput, detail: Record<string, unknown>): OrderQtyResult {
   if (!leverageActive(i)) {
-    // 현물 경로: 기존 공식 그대로(추가 필드 0). 회귀 0.
-    return { qty: floorQty(baseNotional / px), notional: baseNotional, detail };
+    // 현물 경로: 기존 공식 그대로(추가 필드 0). KR이면 정수 양자화, 그 외엔 floorQty와 바이트 동일(회귀 0).
+    return { qty: quantizeQty(baseNotional / px, i.symbol), notional: baseNotional, detail };
   }
   // ⚠️ 머니패스 안전: baseNotional≤0은 모드의 '의도적 무거래'(zero-edge Kelly fraction 0, flat vol_target 무한레버리지 가드 → notional 0).
   //   computeFuturesSize도 이제 baseNotional 비유한/≤0 → 전부 0(fail-closed)이라 이중 방어. 여기서 선제 반환하는 이유:

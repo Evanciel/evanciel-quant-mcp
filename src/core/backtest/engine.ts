@@ -13,7 +13,7 @@ import { calcMaxDrawdown, calcSharpeRatio, calcTradeStats } from "./metrics";
 import { computeRegime, type RegimeParams, type RegimeLabel } from "./regime";
 // 다단계 부분익절 라더 — 라이브(bot-runner)와 "동일 호출"로 backtest≡live (Design Ref: tp-ladder §2 Option C).
 import { evaluateLadderTick, openPosition, type PositionState, type LadderLevel, type ScaleInConfig, type PyramidConfig } from "../position/ladder";
-import { floorQty } from "../position/qty";
+import { floorQty, quantizeQty } from "../position/qty";
 import { computeOrderQty } from "../risk/order-sizing"; // 변동성 타게팅 사이징(엔진·러너 공용 → backtest≡live)
 
 interface OHLCV {
@@ -238,6 +238,7 @@ export function runBacktest(
           closes: prices.slice(0, i + 1), highs: highs.slice(0, i + 1), lows: lows.slice(0, i + 1),
           timeframe: config.timeframe ?? "1d",
           legacyQuantityPercent: rule.quantityPercent, riskSizing: config.riskSizing ?? null,
+          symbol: config.symbol, // KR(6자리 숫자)이면 정수주 양자화 → 라이브와 일관(크립토는 분수 유지)
         }).qty;
         if (qty > 0) {
           const cost = qty * fillPrice * (1 + config.commission / 100);
@@ -827,6 +828,7 @@ export function runCompositeBacktest(
             closes: prices.slice(0, i + 1), highs: highs.slice(0, i + 1), lows: lows.slice(0, i + 1),
             timeframe: config.timeframe ?? "1d",
             legacyQuantityPercent: rule.quantityPercent, riskSizing: config.riskSizing ?? null,
+            symbol: config.symbol, // KR(6자리 숫자)이면 정수주 양자화 → 라이브와 일관(크립토는 분수 유지)
           }).qty;
           if (qty > 0) {
             balance -= qty * buyPrice * (1 + (config.commission ?? 0.1) / 100);
@@ -853,7 +855,7 @@ export function runCompositeBacktest(
         const sell = activeStrategy
           ? evalLadderSignals(activeStrategy, i, prices, volumes, highs, lows, compositeIndicatorCache).sell
           : false;
-        const { exits, adds, next } = evaluateLadderTick(positionState, price, ladder ?? [], { strategySell: sell, scaleIn, pyramid });
+        const { exits, adds, next } = evaluateLadderTick(positionState, price, ladder ?? [], { strategySell: sell, scaleIn, pyramid, symbol: config.symbol });
         const slip = (config.slippage ?? 0.05) / 100;
         for (const ex of exits) {
           const sellPrice = price * (1 - slip);
@@ -885,7 +887,8 @@ export function runCompositeBacktest(
           const slip = (config.slippage ?? 0.05) / 100;
           const buyPrice = price * (1 + slip);
           const investAmount = balance * (buyRule.quantityPercent / 100);
-          const qty = floorQty(investAmount / (buyPrice * (1 + (config.commission ?? 0.1) / 100)));
+          // KR(6자리 숫자)이면 정수주 양자화(라이브와 일관), 크립토는 floorQty(8자리 분수)와 바이트 동일.
+          const qty = quantizeQty(investAmount / (buyPrice * (1 + (config.commission ?? 0.1) / 100)), config.symbol);
           if (qty > 0) {
             balance -= qty * buyPrice * (1 + (config.commission ?? 0.1) / 100);
             position = qty;

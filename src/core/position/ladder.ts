@@ -9,7 +9,7 @@
  *   ①~④는 가격 구간이 배타적(↑=TP, ↓past SL=손절, ↓above SL=물타기)이라 한 틱에 청산·추가가 동시 발생 안 함.
  * v1=스케일아웃(진입1회+부분익절). v2=스케일인(물타기 평단낮추기, 총포지션 배수캡=마틴게일 폭발 방지).
  */
-import { floorQty } from "./qty";
+import { quantizeQty } from "./qty";
 
 /** TP 라더 레벨: pct=익절선 상승률(%), sellPct=그 시점 "남은 수량" 대비 매도 비율(%). */
 export interface LadderLevel {
@@ -127,11 +127,14 @@ export function evaluateLadderTick(
   state: PositionState,
   price: number,
   ladder: LadderLevel[],
-  opts: { strategySell?: boolean; scaleIn?: ScaleInConfig | null; pyramid?: PyramidConfig | null } = {}
+  // symbol: KR 주식(6자리 숫자)이면 부분익절/물타기/피라미딩 수량도 정수주로 양자화 → 라이브와 일관(발산 방지).
+  //   미지정/크립토면 floorQty(8자리 분수)와 바이트 동일(회귀 0). 엔진이 config.symbol로 주입(단일 평가 경로 → backtest≡live).
+  opts: { strategySell?: boolean; scaleIn?: ScaleInConfig | null; pyramid?: PyramidConfig | null; symbol?: string | null } = {}
 ): { exits: LadderExit[]; adds: LadderAdd[]; next: PositionState } {
   if (state.status !== "open" || state.remainingQty <= 0) {
     return { exits: [], adds: [], next: { ...state, status: "closed" } };
   }
+  const qz = (q: number) => quantizeQty(q, opts.symbol); // 인스트루먼트 인지 양자화(KR=정수, 크립토=8자리)
   const peakPrice = Math.max(state.peakPrice, price);
   const baseQty = state.baseQty ?? state.originalQty;
   const slNow = effectiveStopLoss(state, peakPrice);
@@ -169,7 +172,7 @@ export function evaluateLadderTick(
     if (filled.includes(i) || remaining <= 0) continue;
     if (gainPct + 1e-9 < ladder[i].pct) continue;
     const isLast = i === ladder.length - 1 || ladder[i].sellPct >= 100;
-    let qty = isLast ? remaining : floorQty(remaining * (ladder[i].sellPct / 100));
+    let qty = isLast ? remaining : qz(remaining * (ladder[i].sellPct / 100));
     if (qty <= 0 && isLast) qty = remaining;
     if (qty <= 0) { filled.push(i); continue; }
     remaining -= qty;
@@ -181,13 +184,13 @@ export function evaluateLadderTick(
   //   TP가 발동한 틱(가격↑)에선 dropPct 미달이라 자연히 스킵 → 한 틱에 청산·추가 동시 없음.
   const si = opts.scaleIn;
   if (si && si.ladder.length > 0 && remaining > 0 && exits.length === 0) {
-    const capQty = floorQty(baseQty * (si.maxMultiple > 0 ? si.maxMultiple : 1));
+    const capQty = qz(baseQty * (si.maxMultiple > 0 ? si.maxMultiple : 1));
     for (let i = 0; i < si.ladder.length; i++) {
       if (filledSI.includes(i)) continue;
       // running 평단 기준 하락률(%) — 추가할수록 평단↓ → 다음 레벨 트리거가 더 깊어짐(자기-간격조정, 마틴게일 완화).
       const dropNow = ((entryAvg - price) / entryAvg) * 100;
       if (dropNow + 1e-9 < si.ladder[i].dropPct) continue; // -dropPct 도달?
-      let addQty = floorQty(baseQty * (si.ladder[i].addPct / 100));
+      let addQty = qz(baseQty * (si.ladder[i].addPct / 100));
       const room = capQty - remaining; // 배수캡 잔여
       if (room <= 0) { filledSI.push(i); continue; } // 캡 도달 → 더 못 담음(레벨 마킹, 추가 없음)
       if (addQty > room) addQty = room; // 캡까지만
@@ -205,12 +208,12 @@ export function evaluateLadderTick(
   //   추가할수록 평단↑ → 다음 트리거가 더 높아짐(자기-간격조정). 트레일링 스탑과 조합 시 트렌드라이딩(고점 추종 청산).
   const py = opts.pyramid;
   if (py && py.ladder.length > 0 && remaining > 0 && exits.length === 0) {
-    const capQtyP = floorQty(baseQty * (py.maxMultiple > 0 ? py.maxMultiple : 1));
+    const capQtyP = qz(baseQty * (py.maxMultiple > 0 ? py.maxMultiple : 1));
     for (let i = 0; i < py.ladder.length; i++) {
       if (filledPy.includes(i)) continue;
       const riseNow = ((price - entryAvg) / entryAvg) * 100; // running 평단 기준 상승률
       if (riseNow + 1e-9 < py.ladder[i].risePct) continue; // +risePct 도달?
-      let addQty = floorQty(baseQty * (py.ladder[i].addPct / 100));
+      let addQty = qz(baseQty * (py.ladder[i].addPct / 100));
       const room = capQtyP - remaining; // 배수캡 잔여
       if (room <= 0) { filledPy.push(i); continue; }
       if (addQty > room) addQty = room;
