@@ -626,15 +626,20 @@ export function startDashboard(port = 7788): Promise<{ url: string; port: number
           if ((ps as { status?: string }).status === "open") add((ps as { qty?: number }).qty);
           else for (const v of Object.values(ps as Record<string, { status?: string; qty?: number }>)) if (v?.status === "open") add(v.qty);
         }
+        // 봇이 실제 거래하는 종목의 base 자산만 — 거래소 실계정엔 무관한 자산이 많다(특히 Binance testnet은
+        //   기본 지급 코인·더미 토큰 '这是测试币'·'456' 등을 다 들고 있어 패널이 지저분). 봇 종목만 남겨 깔끔히 + drift도 일관.
+        const botBases = new Set(symbols.map((s) => s.replace(/USDT$|USDC$|BUSD$/i, "")));
+        const baseOf = (sym: unknown) => String(sym).toUpperCase().replace(/USDT$|USDC$|BUSD$/i, "");
         inflight = getAccount({ broker: bk as Broker, market, symbols }).then((acc) => {
+          const positions = acc.ok && Array.isArray(acc.positions) ? acc.positions.filter((p) => botBases.has(baseOf(p.symbol))) : acc.positions;
           let drift: { base: string; localQty: number; exchangeQty: number; severity: string; inSync: boolean }[] = [];
-          if (acc.ok && Array.isArray(acc.positions)) {
+          if (acc.ok && Array.isArray(positions)) {
             const exByBase = new Map<string, number>();
-            for (const p of acc.positions) { const k = String(p.symbol).toUpperCase(); exByBase.set(k, (exByBase.get(k) || 0) + (Number(p.quantity) || 0)); }
+            for (const p of positions) { const k = baseOf(p.symbol); exByBase.set(k, (exByBase.get(k) || 0) + (Number(p.quantity) || 0)); }
             const bases = new Set<string>([...paperByBase.keys(), ...exByBase.keys()]);
             drift = [...bases].map((base) => { const d = computePositionDrift(paperByBase.get(base) || 0, exByBase.get(base) || 0); return { base, localQty: d.localQty, exchangeQty: d.exchangeQty, severity: d.severity, inSync: d.inSync }; }).filter((d) => d.localQty > 0 || d.exchangeQty > 0);
           }
-          const payload = JSON.stringify({ ...acc, market, drift });
+          const payload = JSON.stringify({ ...acc, positions, market, drift });
           _acctCache.set(bk, { at: Date.now(), payload }); // 성공만 캐시(실패는 즉시 재시도 허용)
           return payload;
         }).finally(() => { _acctInflight.delete(bk); });
