@@ -197,6 +197,9 @@ function liveAdapterFor(bot: store.BotRow): { adapter: LiveAdapter; env: string 
 
 interface RiskCfg { stopLossPercent?: number | null; takeProfitPercent?: number | null; trailingStopPercent?: number | null }
 
+/** KR 상주 보호주문 미지원 경고를 봇당 1회만 남기기 위한 기록(프로세스 생애 — 재시작 시 1회 재고지는 의도). */
+const krProtectiveWarned = new Set<string>();
+
 /**
  * 라이브 봇의 거래소 상주 보호주문(SL/TP/트레일링)을 현 포지션에 맞게 동기화.
  * posLive=false(페이퍼 채널 포지션)면 no-op — 페이퍼 포지션에 실보호주문을 걸면 트리거 시 실계좌 매도가 나간다(금지).
@@ -205,6 +208,16 @@ interface RiskCfg { stopLossPercent?: number | null; takeProfitPercent?: number 
  */
 async function syncBotProtective(bot: store.BotRow, posLive: boolean, symbol: string, posQty: number, entryAvg: number, peakPrice: number, risk: RiskCfg, restingIds: string[]): Promise<{ ids: string[]; failed: number }> {
   if (!posLive) return { ids: restingIds, failed: 0 }; // 페이퍼 채널 → 보호주문 없음(엔진이 시뮬레이트)
+  // KR 브로커(KIS/키움)는 거래소 상주 SL/TP 미지원(audit P0-3). 어댑터가 protective 타입을 명시 거절하므로
+  // 시도 자체를 스킵 — 시도하면 매 틱 실패 집계 → PROTECTIVE_MAX_FAILS 비상청산 오발동. 경고는 봇당 1회(스팸 금지).
+  // KR 포지션의 SL/TP는 봇 폴링 평가(소프트스톱)가 수행한다(봇 다운 시 손절 공백 — 문서·로그로 정직 고지).
+  if (bot.broker === "kis" || bot.broker === "kiwoom") {
+    if (posQty > 1e-9 && !krProtectiveWarned.has(bot.id)) {
+      krProtectiveWarned.add(bot.id);
+      store.insertLog(bot.id, "gate", `KR 브로커(${bot.broker})는 거래소 상주 보호주문(SL/TP) 미지원 — 봇 폴링 평가로만 손절/익절 동작. 봇/프로세스 다운 시 손절 공백(audit P0-3).`);
+    }
+    return { ids: restingIds, failed: 0 };
+  }
   const live = liveAdapterFor(bot);
   if (!live) {
     // 라이브 채널 포지션인데 게이트/어댑터 불가 = 보호 불능. 침묵하지 않고 실패로 집계(에스컬레이션 대상).

@@ -15,6 +15,7 @@
  *   베이스URL은 credentials.env로만 선택(메인넷 하드코딩 금지), env 누락 시 SAFE값(mock)으로 폴백.
  */
 import { BaseBrokerAdapter } from "./base.js";
+import { roundToKrxTick } from "./krx-tick.js";
 import type {
   BrokerType,
   BrokerCredentials,
@@ -56,24 +57,7 @@ function toNum(v: unknown): number {
   return Number.isFinite(n) ? n : 0;
 }
 
-/**
- * KRX 호가단위(2023 개편). 가격대별 틱. ⚠️ 모의서버 검증(2026-06): 지정가가 틱에 안 맞으면
- * return_code=20(RC4003 호가단위 오류)로 거부 → placeOrder가 지정가를 이 틱으로 정렬해야 함.
- */
-function krxTick(price: number): number {
-  if (price < 2000) return 1;
-  if (price < 5000) return 5;
-  if (price < 20000) return 10;
-  if (price < 50000) return 50;
-  if (price < 200000) return 100;
-  if (price < 500000) return 500;
-  return 1000;
-}
-function roundToKrxTick(price: number): number {
-  if (!(price > 0)) return price;
-  const t = krxTick(price);
-  return Math.round(price / t) * t;
-}
+// KRX 호가단위 정렬은 공용 모듈(krx-tick.ts)로 추출 — KIS와 공유(audit P0-4).
 
 interface KiwoomResponse {
   return_code?: number;
@@ -419,6 +403,11 @@ export class KiwoomBrokerAdapter extends BaseBrokerAdapter {
    * 성공/주문번호는 바디 return_code===0 / ord_no.
    */
   async placeOrder(order: OrderRequest): Promise<OrderResult> {
+    // 거래소 상주 보호주문(stop_*/take_profit_*)은 키움 REST 미지원 — 지정가로 silent 둔갑 금지(fail-closed, audit P0-3).
+    // KR은 봇 폴링 평가(소프트스톱)로만 SL/TP 동작. 상주스톱 필요 시 Binance만 가능.
+    if (order.type !== "market" && order.type !== "limit") {
+      throw new Error(`Kiwoom은 거래소 상주 보호주문(${order.type}) 미지원 — 일반 주문으로 대체하지 않음(fail-closed). market/limit만 허용.`);
+    }
     try {
       const apiId = order.side === "buy" ? API_ID.buy : API_ID.sell;
       const isMarket = order.type === "market";

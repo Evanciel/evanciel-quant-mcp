@@ -1232,7 +1232,9 @@ function closeChart(){document.getElementById('chartModal').style.display='none'
 function findBot(id){for(var i=0;i<bots.length;i++)if(String(bots[i].id)===String(id))return bots[i];return null;}
 function initProtect(id){var bar=document.getElementById('chartProtect');var b=findBot(id);
  var pos=b&&!b.isScanner&&(b.positions||[]).filter(function(p){return p.side==='long'&&p.qty>0;})[0]; // 현물 롱만(OCO SELL)
- if(!pos||!_priceSeries||(b.broker!=='binance')){_protect=null;if(bar)bar.style.display='none';var pm0=document.getElementById('protectMsg');if(pm0)pm0.textContent='';return;}
+ if(!pos||!_priceSeries||(b.broker!=='binance')){_protect=null;if(bar)bar.style.display='none';var pm0=document.getElementById('protectMsg');
+  // KR(키움/KIS)은 거래소 상주 OCO 미지원 — 조용히 숨기지 않고 정직하게 고지(audit P0-3). 봇 폴링 손절만 동작.
+  if(pm0)pm0.textContent=(pos&&b&&(b.broker==='kis'||b.broker==='kiwoom'))?'ℹ️ 한국주식은 거래소 상주 OCO 보호주문 미지원 — 봇이 켜져 있을 때만 손절/익절이 동작해요.':'';return;}
  var entry=pos.entryAvg;
  _protect={sym:pos.symbol,broker:b.broker,market:b.market||'spot',ccy:ccyOf(b.broker),qty:pos.qty,entry:entry,side:'long',
    tpPrice:entry*(1+PROT_TP_PCT/100),slPrice:entry*(1-PROT_SL_PCT/100),tpLine:null,slLine:null,confirmToken:null,active:false,orderListId:null};

@@ -27,6 +27,7 @@
 import { createHash } from "node:crypto";
 import { z } from "zod";
 import { BaseBrokerAdapter } from "./base.js";
+import { roundToKrxTick } from "./krx-tick.js";
 import type {
   BrokerType,
   AccountBalance,
@@ -442,13 +443,19 @@ export class KisBrokerAdapter extends BaseBrokerAdapter {
   // ----------------------------------------------------------------------------
 
   async placeOrder(order: OrderRequest): Promise<OrderResult> {
+    // 거래소 상주 보호주문(stop_*/take_profit_*)은 KIS order-cash 미지원 — 지정가로 silent 둔갑 금지(fail-closed, audit P0-3).
+    // KR은 봇 폴링 평가(소프트스톱)로만 SL/TP 동작. 상주스톱 필요 시 Binance만 가능.
+    if (order.type !== "market" && order.type !== "limit") {
+      throw new Error(`KIS는 거래소 상주 보호주문(${order.type}) 미지원 — 일반 주문으로 대체하지 않음(fail-closed). market/limit만 허용.`);
+    }
     this.assertAccount("place order");
 
     const pdno = this.toPdno(order.symbol);
     // ORD_DVSN: '00' = limit, '01' = market.
     const ordDvsn = order.type === "market" ? "01" : "00";
     // Market orders carry price 0; limit orders require a price.
-    const ordUnpr = order.type === "market" ? "0" : String(order.price ?? 0);
+    // 지정가는 KRX 호가단위 정렬 필수 — 미정렬 가격 직송 시 예측 가능한 거부(RC4003 계열). (audit P0-4)
+    const ordUnpr = order.type === "market" ? "0" : String(roundToKrxTick(order.price ?? 0));
 
     const body: Record<string, string> = {
       CANO: this.cano,
@@ -482,7 +489,8 @@ export class KisBrokerAdapter extends BaseBrokerAdapter {
       symbol: pdno,
       side: order.side,
       quantity: order.quantity,
-      price: order.type === "market" ? 0 : order.price ?? 0,
+      // 지정가는 실제 전송된 틱 정렬가를 반환(요청 원가가 아님 — 장부/감사 정직성).
+      price: order.type === "market" ? 0 : roundToKrxTick(order.price ?? 0),
       // KIS accepts the order into its queue on rt_cd '0'; settlement is async → "pending".
       status: filled ? "pending" : "rejected",
       timestamp: new Date(),
