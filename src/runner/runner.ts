@@ -326,9 +326,12 @@ async function reconcileLivePosition(bot: store.BotRow, cur: PaperPosition | nul
   const rec = reconcilePositionFromExchange(curQty > 1e-9 ? { qty: curQty } : null, exPos, bot.symbol);
   if (rec.ambiguous) {
     // 같은 종목을 여러 라이브 봇이 보유하면 계좌 단위 보유를 어느 봇에 귀속할지 모호(종목당 단일봇 가정 위반).
-    //   잘못된 봇에 전체 계좌 수량을 adopt하면 더 큰 발산 → 정정 보류(거래소 채택 안 함, 기존 장부 유지)하고 경고만.
-    //   같은 종목 라이브 봇 중복을 정리해야 reconcile이 정확. (보수적 fail-safe.)
-    store.insertLog(bot.id, "error", `[${live.env}] reconcile 귀속 모호: ${bot.symbol} 거래소 보유 다중 매칭(종목당 단일봇 가정 위반) — 정정 보류(중복 봇 정리 필요)`);
+    //   경고만 남기고 계속 돌리면 다음 틱에 발산 상태로 추가 매수가 나갈 수 있다(audit P1-8) →
+    //   봇을 자동 정지(status=error)하고 타이머 해제. 사용자가 중복 봇을 정리 후 재시작해야 한다(fail-closed).
+    runner().stop(bot.id);
+    store.setBotStatus(bot.id, "error"); // stop()의 'stopped'를 'error'로 승격(원인 구분 — 대시보드 표시)
+    store.insertLog(bot.id, "error", `[${live.env}] reconcile 귀속 모호: ${bot.symbol} 거래소 보유 다중 매칭(종목당 단일봇 가정 위반) → 봇 자동 정지(audit P1-8). 중복 라이브 봇 정리 후 재시작 필요.`);
+    audit({ event: "ambiguous_halt", botId: bot.id, env: live.env, symbol: bot.symbol });
     return cur;
   }
 
@@ -373,6 +376,78 @@ async function reconcileLivePosition(bot: store.BotRow, cur: PaperPosition | nul
     store.setBotPositionState(bot.id, next, true, false);
     return next;
   }
+  return cur;
+}
+
+// ── P0-1 기동 포지션 시드(크래시/재시작 갭 복구) ──
+
+/** 프로세스 기동 후 봇당 1회만 시드(재시도 폭주 방지). 재시작하면 다시 1회 수행(의도). */
+const bootSeeded = new Set<string>();
+
+/** Binance 현물 getPositions는 자산 단위(BTC) 반환 — bot.symbol(BTCUSDT)에서 base 자산 환원(매칭용). */
+function baseAsset(symbol: string): string {
+  const s = String(symbol).trim().toUpperCase();
+  for (const q of ["USDT", "USDC", "FDUSD", "TUSD", "BUSD"]) {
+    if (s.endsWith(q) && s.length > q.length) return s.slice(0, -q.length);
+  }
+  return s;
+}
+
+/**
+ * 기동 포지션 시드(audit P0-1). fillOrder 성공 ↔ 장부 기록 사이 크래시 후 재기동하면 position_state=null인데
+ * 거래소엔 실포지션이 남는다(손절 없는 발산). 주기 reconcile은 ① KR 전용(바이낸스 스킵) ② liveGate 통과 필요라
+ * 이 시나리오(특히 gate-off 재기동)를 못 덮는다 → 첫 틱에서 1회, 게이트와 무관하게 read-only 조회로 복원한다.
+ *
+ * fail-closed 가드(수동 보유 오입양 금지):
+ *   - 이 봇의 라이브 체결 장부(liveOpenLedger)상 미청산 수량>0 일 때만 채택 — 근거 없이 계좌 보유를
+ *     봇에 귀속하면 사용자의 수동 보유를 봇이 관리(매도)하게 된다(금지).
+ *   - 채택 수량은 min(거래소 보유, 장부 미청산) — 계좌에 섞인 수동 보유분은 채택 안 함.
+ *   - 평단: 거래소 평단(>0) 우선, 현물 잔고(평단 미상=0)는 장부 가중평단 폴백.
+ *   - 다중 매칭(ambiguous)/조회 실패/어댑터 없음 → 채택 보류(로그만, 장부 무변경).
+ * 주문은 절대 안 냄(read-only) — 게이트 OFF 상태에서도 안전.
+ */
+async function bootSeedLivePosition(bot: store.BotRow, cur: PaperPosition | null): Promise<PaperPosition | null> {
+  if (bot.mode !== "live" || bootSeeded.has(bot.id)) return cur;
+  bootSeeded.add(bot.id);
+  if (cur && cur.status === "open") return cur; // 장부 존재 → 주기 reconcile 책임(여긴 null 갭 전용)
+  const ledger = store.liveOpenLedger(bot.id);
+  if (!(ledger.qty > 1e-9)) return cur; // 라이브 체결 근거 0 → 거래소 보유는 수동 보유로 간주(채택 금지)
+  const broker = (["binance", "kis", "kiwoom"].includes(bot.broker) ? bot.broker : "binance") as Broker;
+  const got = getAdapter(broker, "spot"); // liveGate 비경유 — 게이트 OFF여도 read-only 조회는 수행(P0-1 핵심)
+  const adapter = got?.adapter as { getPositions?: () => Promise<ExchangePos[]> } | undefined;
+  if (!got || typeof adapter?.getPositions !== "function") {
+    store.insertLog(bot.id, "error", `기동 시드 불가(어댑터/키 없음) — 장부상 라이브 미청산 ${ledger.qty} 존재, 거래소 수동 대조 필요(audit P0-1)`);
+    return cur;
+  }
+  let exPos: ExchangePos[];
+  try {
+    exPos = await (adapter.getPositions as () => Promise<ExchangePos[]>)();
+  } catch (e) {
+    store.insertLog(bot.id, "error", `기동 시드 조회 실패(${e instanceof Error ? e.message : e}) — 장부 무변경(다음 재시작/주기 reconcile에 위임)`);
+    return cur;
+  }
+  let rec = reconcilePositionFromExchange({ qty: 0 }, exPos, bot.symbol);
+  if (rec.action === "no_exchange_pos" && broker === "binance") {
+    rec = reconcilePositionFromExchange({ qty: 0 }, exPos, baseAsset(bot.symbol)); // 현물 잔고는 자산 단위(BTC)
+  }
+  if (rec.ambiguous) {
+    store.insertLog(bot.id, "error", `기동 시드 귀속 모호(${bot.symbol} 거래소 다중 매칭) — 채택 보류(중복 봇/보유 정리 필요)`);
+    return cur;
+  }
+  if (rec.action === "adopt" && rec.next) {
+    const qty = Math.min(rec.next.qty, ledger.qty); // 수동 보유 혼입분 제외(장부 근거 상한)
+    const entryAvg = rec.next.entryAvg > 0 ? rec.next.entryAvg : ledger.avgPrice;
+    const adopted: PaperPosition = {
+      status: "open", entryAvg, qty,
+      openedAt: new Date().toISOString(), live: true,
+      peakPrice: entryAvg, protectiveIds: [], protFails: 0, reconMisses: 0,
+    };
+    store.setBotPositionState(bot.id, adopted, true, false);
+    store.insertLog(bot.id, "live", `기동 포지션 시드: 거래소 진실 복원 ${bot.symbol} qty=${qty}(평단 ${entryAvg}) — 크래시/재시작 갭 복구(audit P0-1)`);
+    audit({ event: "boot_seed_adopt", botId: bot.id, symbol: bot.symbol, qty, entryAvg, ledgerQty: ledger.qty, exchangeQty: rec.next.qty });
+    return adopted;
+  }
+  store.insertLog(bot.id, "gate", `기동 시드: 장부상 라이브 미청산 ${ledger.qty} 있으나 거래소 보유 없음 — 외부 청산 추정(장부 무변경)`);
   return cur;
 }
 
@@ -505,6 +580,7 @@ export async function tickBot(botId: string): Promise<{ action: "buy" | "sell" |
   //    발산). 틱 시작 시 거래소 실보유(getPositions)를 조회해 봇 장부를 거래소 진실로 동기화한다. 이후 curQty/델타가
   //    정정된 cur를 본다. 가드 술어가 'mode=live + 게이트통과 + getOrderByClientId 미지원'으로 좁아 바이낸스(지원)·
   //    페이퍼(mode!=live)·게이트OFF는 미진입 → getPositions 미호출 → 거동·오버헤드 0(회귀 0). 스캐너 경로는 별도(아래).
+  cur = await bootSeedLivePosition(bot, cur); // P0-1: 재시작 첫 틱 1회, 게이트 무관 read-only 복원
   cur = await reconcileLivePosition(bot, cur, lastIso);
 
   const curQty = cur && cur.status === "open" ? cur.qty : 0;
@@ -518,9 +594,12 @@ export async function tickBot(botId: string): Promise<{ action: "buy" | "sell" |
     const ec = await fillOrder(bot, "sell", curQty, price, bot.symbol, { posLive: true, barIso: lastIso });
     if (!ec.failed) {
       const pnl = (ec.price - cur.entryAvg) * curQty;
-      store.insertTrade({ bot_id: botId, side: "sell", price: ec.price, qty: curQty, pnl, is_paper: ec.live ? 0 : 1, reason: `비상 청산(보호주문 ${cur.protFails}회 연속 실패, fail-closed)`, idempotency_key: `${botId}:${lastIso}:ec` });
+      // 체결 기록+장부 0을 원자화(P1-21) — 사이 크래시 시 '체결 기록만 있고 장부 보유 잔존' 갭 차단.
+      store.tx(() => {
+        store.insertTrade({ bot_id: botId, side: "sell", price: ec.price, qty: curQty, pnl, is_paper: ec.live ? 0 : 1, reason: `비상 청산(보호주문 ${cur.protFails}회 연속 실패, fail-closed)`, idempotency_key: `${botId}:${lastIso}:ec` });
+        store.setBotPositionState(botId, null, true, true);
+      });
       await syncBotProtective(bot, true, bot.symbol, 0, cur.entryAvg, 0, risk, cur.protectiveIds ?? []); // 잔여 보호주문 취소(베스트에포트)
-      store.setBotPositionState(botId, null, true, true);
       audit({ event: "emergency_close_protective_failed", botId, qty: curQty, price: ec.price, fails: cur.protFails });
       store.insertLog(botId, "sell", `[${ec.live ? "실거래" : "페이퍼"}] 비상 청산 -${curQty} @ ${ec.price} — 보호주문 ${cur.protFails}회 연속 실패(나체 포지션 금지)`);
       return { action: "sell", detail: `비상 청산(보호주문 실패 ${cur.protFails}회, pnl=${pnl.toFixed(2)})` };
@@ -567,19 +646,25 @@ export async function tickBot(botId: string): Promise<{ action: "buy" | "sell" |
       return { action: "hold", detail: `라이브 매수 실패 — 동결(${fill.note})` };
     }
     const reason = plan.partial ? "추가매수(스케일인/피라미딩)" : "전략 진입";
-    const t = store.insertTrade({ bot_id: botId, side: "buy", price: fill.price, qty: buyQty, pnl: 0, is_paper: fill.live ? 0 : 1, reason, idempotency_key: idem("buy") });
+    // 평단: 미축소면 엔진 가중평단 그대로(기존 동작 동일). 축소면 기존보유+부분추가의 가중평균(엔진 목표 미도달이라 직접 산출).
+    const entryAvg = scaled
+      ? (curQty + buyQty > 0 ? (curQty * (cur?.entryAvg ?? fill.price) + buyQty * fill.price) / (curQty + buyQty) : fill.price)
+      : (want.entryAvg > 0 ? want.entryAvg : fill.price);
+    const peakPrice = Math.max(cur?.peakPrice ?? entryAvg, price);
+    const nextLive = curQty > 1e-9 ? curLive : fill.live; // 채널은 진입 체결로 고정(추가매수는 기존 채널 유지)
+    const openedAt = cur?.openedAt ?? new Date().toISOString();
+    // 체결 기록+장부 갱신 원자화(P1-21): 보호주문 동기화(async)는 tx 밖 후속 — 사이 크래시여도 장부는 이미 일관.
+    const t = store.tx(() => {
+      const t0 = store.insertTrade({ bot_id: botId, side: "buy", price: fill.price, qty: buyQty, pnl: 0, is_paper: fill.live ? 0 : 1, reason, idempotency_key: idem("buy") });
+      if (t0) store.setBotPositionState(botId, { status: "open", entryAvg, qty: actualWantQty, openedAt, live: nextLive, peakPrice, protectiveIds: cur?.protectiveIds ?? [], protFails: cur?.protFails ?? 0 } satisfies PaperPosition, true, true);
+      return t0;
+    });
     if (t) {
-      // 평단: 미축소면 엔진 가중평단 그대로(기존 동작 동일). 축소면 기존보유+부분추가의 가중평균(엔진 목표 미도달이라 직접 산출).
-      const entryAvg = scaled
-        ? (curQty + buyQty > 0 ? (curQty * (cur?.entryAvg ?? fill.price) + buyQty * fill.price) / (curQty + buyQty) : fill.price)
-        : (want.entryAvg > 0 ? want.entryAvg : fill.price);
-      const peakPrice = Math.max(cur?.peakPrice ?? entryAvg, price);
-      const nextLive = curQty > 1e-9 ? curLive : fill.live; // 채널은 진입 체결로 고정(추가매수는 기존 채널 유지)
       // 라이브 채널: 거래소 상주 보호주문(SL/TP/트레일링) 배치/갱신. 페이퍼 채널: no-op(엔진이 시뮬레이트).
       const ps = await syncBotProtective(bot, nextLive, bot.symbol, actualWantQty, entryAvg, peakPrice, risk, cur?.protectiveIds ?? []);
       const protFails = ps.failed > 0 ? (cur?.protFails ?? 0) + 1 : 0;
       if (ps.failed > 0) noteProtectiveFailure(botId, protFails);
-      store.setBotPositionState(botId, { status: "open", entryAvg, qty: actualWantQty, openedAt: cur?.openedAt ?? new Date().toISOString(), live: nextLive, peakPrice, protectiveIds: ps.ids, protFails } satisfies PaperPosition, true, true);
+      store.setBotPositionState(botId, { status: "open", entryAvg, qty: actualWantQty, openedAt, live: nextLive, peakPrice, protectiveIds: ps.ids, protFails } satisfies PaperPosition, true, true);
       const capNote = scaled ? ` [포트폴리오 캡 ×축소 ${plan.qty}→${buyQty}]` : "";
       store.insertLog(botId, "buy", `[${fill.live ? "실거래" : "페이퍼"}] ${reason} +${buyQty} → 보유 ${actualWantQty} @ ${fill.price}(평단 ${entryAvg.toFixed(2)})${capNote}`);
       return { action: "buy", detail: `${reason} +${buyQty} (보유 ${actualWantQty}, ${fill.note})${capNote}` };
@@ -599,14 +684,20 @@ export async function tickBot(botId: string): Promise<{ action: "buy" | "sell" |
     const refAvg = cur?.entryAvg ?? fill.price;
     const realPnl = (fill.price - refAvg) * plan.qty;
     const reason = plan.partial ? "부분 익절(라더)" : "전략 청산";
-    const t = store.insertTrade({ bot_id: botId, side: "sell", price: fill.price, qty: plan.qty, pnl: realPnl, is_paper: fill.live ? 0 : 1, reason, idempotency_key: idem("sell") });
+    const peakPrice = plan.partial ? Math.max(cur?.peakPrice ?? refAvg, price) : 0;
+    const openedAt = cur?.openedAt ?? new Date().toISOString();
+    // 체결 기록+장부 갱신 원자화(P1-21). 보호주문 재동기화(async)는 tx 밖 후속(멱등 — clientOrderId 기준).
+    const t = store.tx(() => {
+      const t0 = store.insertTrade({ bot_id: botId, side: "sell", price: fill.price, qty: plan.qty, pnl: realPnl, is_paper: fill.live ? 0 : 1, reason, idempotency_key: idem("sell") });
+      if (t0) store.setBotPositionState(botId, plan.partial ? { status: "open", entryAvg: refAvg, qty: plan.wantQty, openedAt, live: curLive, peakPrice, protectiveIds: cur?.protectiveIds ?? [], protFails: cur?.protFails ?? 0 } satisfies PaperPosition : null, true, true);
+      return t0;
+    });
     if (t) {
       // 부분이면 줄어든 수량으로 보호주문 재동기화, 전량 청산이면 desired=[]→전부 취소(고아주문 0).
-      const peakPrice = plan.partial ? Math.max(cur?.peakPrice ?? refAvg, price) : 0;
       const ps = await syncBotProtective(bot, curLive, bot.symbol, plan.wantQty, refAvg, peakPrice, risk, cur?.protectiveIds ?? []);
       const protFails = ps.failed > 0 ? (cur?.protFails ?? 0) + 1 : 0;
       if (ps.failed > 0) noteProtectiveFailure(botId, protFails);
-      const next: PaperPosition | null = plan.partial ? { status: "open", entryAvg: refAvg, qty: plan.wantQty, openedAt: cur?.openedAt ?? new Date().toISOString(), live: curLive, peakPrice, protectiveIds: ps.ids, protFails } : null;
+      const next: PaperPosition | null = plan.partial ? { status: "open", entryAvg: refAvg, qty: plan.wantQty, openedAt, live: curLive, peakPrice, protectiveIds: ps.ids, protFails } : null;
       store.setBotPositionState(botId, next, true, true);
       store.insertLog(botId, "sell", `[${fill.live ? "실거래" : "페이퍼"}] ${reason} -${plan.qty} → 보유 ${plan.wantQty} @ ${fill.price} pnl=${realPnl.toFixed(2)}`);
       return { action: "sell", detail: `${reason} -${plan.qty} (보유 ${plan.wantQty}, pnl=${realPnl.toFixed(2)}, ${fill.note})` };
@@ -745,6 +836,14 @@ async function tickScanner(bot: store.BotRow, node: ScannerNode, riskSizing?: Ba
 export class Runner {
   private timers = new Map<string, ReturnType<typeof setInterval>>();
   private alive = true;
+  private backupTimer: ReturnType<typeof setInterval> | null = null;
+
+  constructor() {
+    // 주기 백업(P1-21): 기동 직후 1회 + 24h마다. 실패는 backupDb가 내부 고지(거래 비차단). unref=프로세스 종료 비차단.
+    store.backupDb();
+    this.backupTimer = setInterval(() => { store.backupDb(); }, 24 * 3600 * 1000);
+    this.backupTimer.unref?.();
+  }
 
   start(botId: string): void {
     const bot = store.getBot(botId);
@@ -760,7 +859,7 @@ export class Runner {
     store.setBotStatus(botId, "stopped");
   }
   resumeAll(): void { for (const b of store.listRunningBots()) this.start(b.id); }
-  shutdown(): void { this.alive = false; for (const t of this.timers.values()) clearInterval(t); this.timers.clear(); }
+  shutdown(): void { this.alive = false; for (const t of this.timers.values()) clearInterval(t); this.timers.clear(); if (this.backupTimer) { clearInterval(this.backupTimer); this.backupTimer = null; } }
 }
 
 let _runner: Runner | null = null;

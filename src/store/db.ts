@@ -5,7 +5,7 @@
  */
 import { DatabaseSync } from "node:sqlite";
 import { homedir } from "node:os";
-import { mkdirSync } from "node:fs";
+import { mkdirSync, readdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 
@@ -42,6 +42,9 @@ export function db(): DatabaseSync {
   const dir = dataDir();
   mkdirSync(dir, { recursive: true });
   const d = new DatabaseSync(join(dir, "store.db"));
+  // 내구성/동시성(audit P1-21): WAL=크래시 시 마지막 커밋까지 보존+읽기 비차단, NORMAL=WAL과 조합 시 안전한 fsync 수준.
+  d.exec(`PRAGMA journal_mode=WAL;`);
+  d.exec(`PRAGMA synchronous=NORMAL;`);
   d.exec(`
     CREATE TABLE IF NOT EXISTS composite_strategies (
       id TEXT PRIMARY KEY, name TEXT NOT NULL, root_node TEXT NOT NULL, symbol TEXT NOT NULL,
@@ -75,6 +78,44 @@ export function db(): DatabaseSync {
   try { d.exec(`ALTER TABLE composite_strategies ADD COLUMN risk_sizing TEXT`); } catch { /* 이미 존재 */ }
   _db = d;
   return d;
+}
+
+/**
+ * 동기 트랜잭션 래퍼(audit P1-21). 체결 기록(insertTrade)과 장부(setBotPositionState)처럼 함께 살거나 함께
+ * 죽어야 하는 쓰기를 원자화 — 사이 크래시로 '체결은 기록됐는데 장부는 없음'(P0-1 발산 갭) 방지.
+ * ⚠️ fn은 동기만(await 금지 — tx를 이벤트루프에 걸쳐 잡으면 다른 쓰기 차단). 중첩 호출 금지(BEGIN 중복 throw).
+ */
+export function tx<T>(fn: () => T): T {
+  const d = db();
+  d.exec("BEGIN IMMEDIATE");
+  try {
+    const r = fn();
+    d.exec("COMMIT");
+    return r;
+  } catch (e) {
+    try { d.exec("ROLLBACK"); } catch { /* 롤백 불가(연결 종료 등) — 원 에러를 우선 전파 */ }
+    throw e;
+  }
+}
+
+/**
+ * 주기 백업(audit P1-21). VACUUM INTO로 일관 스냅샷을 backups/에 생성, 최근 keep개만 유지.
+ * 실패는 throw하지 않고 null(백업 실패가 거래를 멈추면 안 됨 — 단 침묵 금지, console로 고지).
+ */
+export function backupDb(keep = 7): string | null {
+  try {
+    const dir = join(dataDir(), "backups");
+    mkdirSync(dir, { recursive: true });
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+    const dest = join(dir, `store-${stamp}.db`);
+    db().exec(`VACUUM INTO '${dest.replace(/'/g, "''")}'`);
+    const files = readdirSync(dir).filter((f) => /^store-.*\.db$/.test(f)).sort();
+    for (const f of files.slice(0, Math.max(0, files.length - keep))) rmSync(join(dir, f), { force: true });
+    return dest;
+  } catch (e) {
+    console.error(`[store] 백업 실패(거래는 계속): ${e instanceof Error ? e.message : e}`);
+    return null;
+  }
 }
 
 const now = () => new Date().toISOString();
@@ -157,6 +198,30 @@ export function recentLogs(bot_id: string, limit = 50): LogRow[] {
 }
 
 /**
+ * 봇의 라이브 체결 장부상 미청산 수량/가중평단(audit P0-1 기동 시드 근거).
+ * is_paper=0 거래를 시간순으로 걸어 buy=적립 / sell=평단 기준 차감. 음수 방지(과매도 기록은 0으로 캡).
+ * 용도: 재시작 시 position_state=null인데 이 값>0이면 '체결됐는데 장부가 유실된 크래시 갭' 시그니처 —
+ * 거래소 보유를 봇에 귀속(채택)해도 되는 근거가 된다(근거 없는 수동 보유 입양 금지, fail-closed).
+ */
+export function liveOpenLedger(bot_id: string): { qty: number; avgPrice: number } {
+  // 동일 ts(같은 ms) 다건은 rowid(삽입 순서)로 안정 정렬 — id(랜덤 UUID) 정렬은 buy/sell 순서를 뒤섞는다.
+  const rows = db().prepare(`SELECT side, price, qty FROM trades WHERE bot_id=? AND is_paper=0 ORDER BY ts, rowid`)
+    .all(bot_id) as { side: string; price: number; qty: number }[];
+  let qty = 0, cost = 0;
+  for (const r of rows) {
+    if (!(r.qty > 0)) continue;
+    if (r.side === "buy") { qty += r.qty; cost += r.qty * r.price; }
+    else if (r.side === "sell") {
+      const avg = qty > 1e-12 ? cost / qty : 0;
+      const q = Math.min(r.qty, qty);
+      cost -= q * avg;
+      qty -= q;
+    }
+  }
+  return qty > 1e-12 ? { qty, avgPrice: cost / qty } : { qty: 0, avgPrice: 0 };
+}
+
+/**
  * 포트폴리오 실현손익 곡선 요약(전 봇 합산, 시간순). 포트폴리오 레벨 캡(MDD 디리스킹)의 peak 자기자본 도출용.
  *  - realized = Σpnl(전 거래, 청산 시 기록) → 현재까지 실현손익.
  *  - peakCum  = 실현손익 누적곡선의 고점(prefix-sum 최댓값, 음수면 0). base+peakCum = peak equity.
@@ -167,7 +232,7 @@ export function realizedEquityCurve(): { realized: number; peakCum: number } {
     const total = db().prepare(`SELECT COALESCE(SUM(pnl),0) s FROM trades`).get() as { s: number } | undefined;
     // 누적합의 최댓값(고점). 거래 0건이면 peak 0.
     const peak = db().prepare(
-      `SELECT COALESCE(MAX(cum),0) p FROM (SELECT SUM(pnl) OVER (ORDER BY ts, id) AS cum FROM trades)`
+      `SELECT COALESCE(MAX(cum),0) p FROM (SELECT SUM(pnl) OVER (ORDER BY ts, rowid) AS cum FROM trades)` /* rowid=삽입 순서(동일 ms 안정 정렬) */
     ).get() as { p: number } | undefined;
     return { realized: total?.s ?? 0, peakCum: Math.max(0, peak?.p ?? 0) };
   } catch { return { realized: 0, peakCum: 0 }; }

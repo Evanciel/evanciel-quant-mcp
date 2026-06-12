@@ -64,6 +64,12 @@ export function getBotStatus(a: { botId: string }) {
 export function startBot(a: { botId: string }) {
   const b = store.getBot(a.botId);
   if (!b) return { ok: false, error: `봇 없음: ${a.botId}` };
+  // 동일 종목+브로커 라이브 봇 중복 가동 차단(audit P1-8): 계좌 보유 귀속이 모호해져 reconcile이 발산한다.
+  //   사전 차단(여기) + 런타임 감지 시 자동 정지(runner ambiguous_halt) 이중 방어. 페이퍼는 중복 허용(실계좌 무관).
+  if (b.mode === "live") {
+    const dup = store.listRunningBots().find((o) => o.id !== b.id && o.mode === "live" && o.broker === b.broker && o.symbol === b.symbol);
+    if (dup) return { ok: false, error: `동일 종목(${b.symbol})·브로커(${b.broker}) 라이브 봇이 이미 가동 중(${dup.name}, ${dup.id}) — 계좌 보유 귀속 모호로 발산 위험. 기존 봇을 정지한 뒤 시작하세요.` };
+  }
   runner().start(a.botId);
   // 표시 라벨은 봇 mode를 그대로 반영(라이브 봇을 '페이퍼'로 거짓 표기하지 않음). 실제 실주문 여부는 러너의 게이트가 통제.
   const modeLabel = b.mode === "live" ? "라이브(게이트 통과 시 실주문·미통과 시 페이퍼 폴백)" : "페이퍼";
