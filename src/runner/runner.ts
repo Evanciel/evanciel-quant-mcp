@@ -273,8 +273,8 @@ export function planPositionDelta(
   return { side: "hold", qty: 0, partial: false, wantQty };
 }
 
-/** 백테스트 결과의 trade 시퀀스에서 "현재 보유 여부 + 평단/수량"을 도출(net). */
-function derivePosition(trades: { action: string; price: number; quantity: number }[]): { holding: boolean; entryAvg: number; qty: number } {
+/** 백테스트 결과의 trade 시퀀스에서 "현재 보유 여부 + 평단/수량"을 도출(net). (export: 라더 평단 패리티 테스트용 — audit P1-11) */
+export function derivePosition(trades: { action: string; price: number; quantity: number }[]): { holding: boolean; entryAvg: number; qty: number } {
   let qty = 0, cost = 0;
   for (const t of trades) {
     if (t.action === "buy") { cost += t.price * t.quantity; qty += t.quantity; }

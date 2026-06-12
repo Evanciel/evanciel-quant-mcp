@@ -15,6 +15,7 @@ export const validateStrategyShape = {
 export const backtestShape = {
   tree: z.unknown().describe("검증·백테스트할 전략 트리"),
   symbol, interval, days,
+  gapHandling: z.enum(["close", "worst"]).optional().describe("손절 갭 모델(audit P1-12). close(기본)=종가 판정 — 갭다운 손실 과소평가 가능. worst=봉 저가 터치 발동+min(시가,손절선) 체결(실거래 상주 STOP_MARKET에 근접한 보수 모델)."),
 };
 
 export const backtestShortShape = {

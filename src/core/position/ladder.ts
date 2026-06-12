@@ -129,7 +129,10 @@ export function evaluateLadderTick(
   ladder: LadderLevel[],
   // symbol: KR 주식(6자리 숫자)이면 부분익절/물타기/피라미딩 수량도 정수주로 양자화 → 라이브와 일관(발산 방지).
   //   미지정/크립토면 floorQty(8자리 분수)와 바이트 동일(회귀 0). 엔진이 config.symbol로 주입(단일 평가 경로 → backtest≡live).
-  opts: { strategySell?: boolean; scaleIn?: ScaleInConfig | null; pyramid?: PyramidConfig | null; symbol?: string | null } = {}
+  // buySlipPct(audit P1-11): 추가매수 평단을 '실제 체결가(슬리피지 조정가)' 기준으로 갱신하기 위한 매수 슬리피지(%).
+  //   미지정(0)=기존 동작 바이트 동일. 엔진이 config.slippage를 주입하면 내부 평단 == 기록된 trade 가격 가중평균
+  //   == 라이브 derivePosition 평단으로 3자 일치(backtest≡live 평단 패리티). 트리거 판정은 여전히 원시 price.
+  opts: { strategySell?: boolean; scaleIn?: ScaleInConfig | null; pyramid?: PyramidConfig | null; symbol?: string | null; buySlipPct?: number } = {}
 ): { exits: LadderExit[]; adds: LadderAdd[]; next: PositionState } {
   if (state.status !== "open" || state.remainingQty <= 0) {
     return { exits: [], adds: [], next: { ...state, status: "closed" } };
@@ -159,6 +162,7 @@ export function evaluateLadderTick(
   }
 
   const gainPct = ((price - state.entryAvg) / state.entryAvg) * 100;
+  const execBuyPrice = price * (1 + (opts.buySlipPct ?? 0) / 100); // 추가매수 체결가(평단 갱신용 — P1-11)
   let remaining = state.remainingQty;
   let entryAvg = state.entryAvg;
   const filled = [...state.filledLevels];
@@ -195,8 +199,8 @@ export function evaluateLadderTick(
       if (room <= 0) { filledSI.push(i); continue; } // 캡 도달 → 더 못 담음(레벨 마킹, 추가 없음)
       if (addQty > room) addQty = room; // 캡까지만
       if (addQty <= 0) { filledSI.push(i); continue; }
-      // 평단 가중평균 갱신
-      entryAvg = (entryAvg * remaining + price * addQty) / (remaining + addQty);
+      // 평단 가중평균 갱신 — 체결가(슬리피지 조정) 기준(P1-11: 기록 trade·라이브 장부와 동일 기준)
+      entryAvg = (entryAvg * remaining + execBuyPrice * addQty) / (remaining + addQty);
       remaining += addQty;
       filledSI.push(i);
       adds.push({ qty: addQty, reason: `scale-in S${i + 1} -${si.ladder[i].dropPct}%`, levelIndex: i, newAvg: +entryAvg.toFixed(8) });
@@ -218,7 +222,7 @@ export function evaluateLadderTick(
       if (room <= 0) { filledPy.push(i); continue; }
       if (addQty > room) addQty = room;
       if (addQty <= 0) { filledPy.push(i); continue; }
-      entryAvg = (entryAvg * remaining + price * addQty) / (remaining + addQty); // 평단 가중평균(↑)
+      entryAvg = (entryAvg * remaining + execBuyPrice * addQty) / (remaining + addQty); // 평단 가중평균(↑, 체결가 기준 — P1-11)
       remaining += addQty;
       filledPy.push(i);
       adds.push({ qty: addQty, reason: `pyramid P${i + 1} +${py.ladder[i].risePct}%`, levelIndex: i, newAvg: +entryAvg.toFixed(8) });

@@ -161,16 +161,20 @@ export function runBacktest(
   for (let i = 0; i < data.length; i++) {
     const price = data[i].close;
 
-    // 손절/익절 체크
+    // 손절/익절 체크. gapHandling='worst'(P1-12)면 SL은 봉 저가 터치로 판정, 체결가=min(시가, 손절선)(갭 보수 모델).
     if (position > 0) {
       const pnlPercent = ((price - avgEntryPrice) / avgEntryPrice) * 100;
-      if (strategy.stopLossPercent && pnlPercent <= -strategy.stopLossPercent) {
-        const pnl = (price - avgEntryPrice) * position;
-        balance += position * price * (1 - config.commission / 100);
+      const worst = config.gapHandling === "worst";
+      const stopLevel = strategy.stopLossPercent ? avgEntryPrice * (1 - strategy.stopLossPercent / 100) : 0;
+      const slHit = !!strategy.stopLossPercent && (worst ? (data[i].low ?? price) <= stopLevel + 1e-12 : pnlPercent <= -strategy.stopLossPercent);
+      if (slHit) {
+        const exitPrice = worst ? Math.min(data[i].open ?? price, stopLevel) : price;
+        const pnl = (exitPrice - avgEntryPrice) * position;
+        balance += position * exitPrice * (1 - config.commission / 100);
         trades.push({
           date: data[i].date,
           action: "sell",
-          price,
+          price: exitPrice,
           quantity: position,
           pnl,
           balance,
@@ -786,10 +790,16 @@ export function runCompositeBacktest(
       const pnlPercent = ((price - avgEntryPrice) / avgEntryPrice) * 100;
       const sl = activeStrategy?.stopLossPercent ?? compositeRisk?.stopLossPercent;
       const tp = activeStrategy?.takeProfitPercent ?? compositeRisk?.takeProfitPercent;
-      if ((sl && pnlPercent <= -sl) || (tp && pnlPercent >= tp)) {
-        const pnl = (price - avgEntryPrice) * position;
-        balance += position * price * (1 - (config.commission ?? 0.1) / 100);
-        trades.push({ date: data[i].date, action: "sell", price, quantity: position, pnl, balance });
+      // gapHandling='worst'(P1-12): SL은 봉 저가 터치 판정 + 체결가=min(시가, 손절선). TP는 종가 유지(보수).
+      const worst = config.gapHandling === "worst";
+      const stopLevel = sl ? avgEntryPrice * (1 - sl / 100) : 0;
+      const slHit = !!sl && (worst ? (data[i].low ?? price) <= stopLevel + 1e-12 : pnlPercent <= -sl);
+      const tpHit = !!tp && pnlPercent >= (tp as number);
+      if (slHit || tpHit) {
+        const exitPrice = slHit && worst ? Math.min(data[i].open ?? price, stopLevel) : price;
+        const pnl = (exitPrice - avgEntryPrice) * position;
+        balance += position * exitPrice * (1 - (config.commission ?? 0.1) / 100);
+        trades.push({ date: data[i].date, action: "sell", price: exitPrice, quantity: position, pnl, balance });
         position = 0;
         avgEntryPrice = 0;
         sltpExited = true;
@@ -855,7 +865,7 @@ export function runCompositeBacktest(
         const sell = activeStrategy
           ? evalLadderSignals(activeStrategy, i, prices, volumes, highs, lows, compositeIndicatorCache).sell
           : false;
-        const { exits, adds, next } = evaluateLadderTick(positionState, price, ladder ?? [], { strategySell: sell, scaleIn, pyramid, symbol: config.symbol });
+        const { exits, adds, next } = evaluateLadderTick(positionState, price, ladder ?? [], { strategySell: sell, scaleIn, pyramid, symbol: config.symbol, buySlipPct: config.slippage ?? 0.05 }); // 평단=체결가 기준(P1-11)
         const slip = (config.slippage ?? 0.05) / 100;
         for (const ex of exits) {
           const sellPrice = price * (1 - slip);

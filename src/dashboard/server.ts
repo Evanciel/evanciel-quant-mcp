@@ -20,7 +20,7 @@ import * as store from "../store/db.js";
 import { BROKER_FIELDS, upsertCredentials, credentialStatus, credentialsPath, enableLive, disableLive, liveSettingsStatus, type BrokerKey } from "../setup/credentials.js";
 import { fetchKlines } from "../data/binance-public.js";
 import { getAdapter } from "../brokers/index.js";
-import { placeOrder, placeProtective, cancelProtective, getProtective, getAccount, getOpenOrders, getOrderStatus, cancelOrderById } from "../mcp-server/live-handlers.js"; // 수동주문·OCO보호주문·실계정조회·미체결조회/취소 — 안전경로 재사용
+import { placeOrder, placeProtective, cancelProtective, getProtective, getAccount, getOpenOrders, getOrderStatus, cancelOrderById, getQuote } from "../mcp-server/live-handlers.js"; // 수동주문·OCO보호주문·실계정조회·미체결조회/취소 — 안전경로 재사용
 import { computePositionDrift } from "../core/execution/reconcile.js"; // 페이퍼 vs 거래소 실보유 드리프트(정보용)
 import { detectAlerts, Debouncer, AlertBuffer, type BotAlertView } from "../core/alerts/alerts.js"; // 봇 이벤트 알림 엔진(순수)
 import { sendWebhook, validateWebhookUrl } from "../core/alerts/webhook.js"; // Slack/Discord 배달(SSRF 게이트)
@@ -806,6 +806,16 @@ export function startDashboard(port = 7788): Promise<{ url: string; port: number
       }).catch((e) => { res.writeHead(400, { "content-type": "application/json" }); res.end(JSON.stringify({ ok: false, error: e instanceof Error ? e.message : "bad request" })); });
       return;
     }
+    if (u.pathname === "/api/quote") {
+      // 수동주문 입력 보조(현재가/가용잔고/보유) — 읽기전용. 잘못된 심볼은 에러 메시지로 검증 대체.
+      if (req.method !== "GET") { res.writeHead(405).end("method not allowed"); return; }
+      const qb = (u.searchParams.get("broker") || "binance") as Broker;
+      const qs = (u.searchParams.get("symbol") || "").trim();
+      if (!qs) { res.writeHead(400, { "content-type": "application/json" }); res.end(JSON.stringify({ ok: false, error: "symbol 필요" })); return; }
+      getQuote({ broker: qb, market: "spot", symbol: qs }).then((r) => { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify(r)); })
+        .catch((e) => { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify({ ok: false, error: e instanceof Error ? e.message : "err" })); });
+      return;
+    }
     if (u.pathname === "/api/trades") {
       // 전 봇 체결 내역(audit P1-18). 기간 필터: ?days=1|7|30 (미지정=전체, 최대 500건).
       if (req.method !== "GET") { res.writeHead(405).end("method not allowed"); return; }
@@ -1457,13 +1467,27 @@ function orderFormBody(side,qty){return '<div class="fld"><label>수량</label><
 function manualFormBody(o){o=o||{};var sel=function(v){return o.broker===v?' selected':''};var ss=function(v){return (o.side||'buy')===v?' selected':''};
  return '<div class="fld"><label>거래소/증권사</label><select id="obroker"><option value="binance"'+sel('binance')+'>Binance (암호화폐)</option><option value="kiwoom"'+sel('kiwoom')+'>키움증권 (주식)</option><option value="kis"'+sel('kis')+'>한국투자증권 (주식)</option></select></div>'+
   '<div class="fld"><label>종목</label><input id="osym" type="text" autocomplete="off" placeholder="예: BTCUSDT 또는 005930" value="'+(o.symbol?esc(o.symbol):'')+'"></div>'+
+  '<div class="fld"><label>시세/잔고</label><div style="display:flex;gap:8px;align-items:center;min-width:0"><span class="tfb" onclick="quoteManual()">조회</span><span id="oquote" class="hint" style="overflow:hidden;text-overflow:ellipsis">종목 입력 후 조회 — 현재가·가용잔고·보유 확인</span></div></div>'+
   '<div class="fld"><label>방향</label><select id="oside"><option value="buy"'+ss('buy')+'>매수 (사기)</option><option value="sell"'+ss('sell')+'>매도 (팔기)</option></select></div>'+
   '<div class="fld"><label>수량</label><input id="oqty" type="text" inputmode="decimal" autocomplete="off" placeholder="코인: 0.01 / 주식: 1" value="'+(o.quantity?esc(o.quantity):'')+'"></div>'+
+  '<div class="fld"><label></label><div style="display:flex;gap:6px"><span class="tfb" data-p="25" onclick="applyPreset(this.dataset.p)">25%</span><span class="tfb" data-p="50" onclick="applyPreset(this.dataset.p)">50%</span><span class="tfb" data-p="max" onclick="applyPreset(this.dataset.p)">Max</span><span class="hint" style="align-self:center">매수=가용잔고, 매도=보유 기준</span></div></div>'+
   '<label style="display:flex;gap:7px;align-items:center;cursor:pointer;margin:6px 0;font-size:12px;color:#8a94a6"><input type="checkbox" id="olimit" onchange="toggleLimit(this.checked)"'+(o.price?' checked':'')+'> 지정가로 주문 <span class="hint">(체크 안 하면 시장가)</span></label>'+
   '<div class="fld" id="olimitwrap" style="display:'+(o.price?'block':'none')+'"><label>지정가</label><input id="oprice" type="text" inputmode="decimal" autocomplete="off" placeholder="한 주(개) 가격" value="'+(o.price?esc(o.price):'')+'"></div>'+
   '<div class="hint" style="margin:4px 0 8px">미리보기에서 서버가 현재가·예상금액을 다시 계산해 보여드려요. 거기서 한 번 더 확인 후 확정됩니다.</div>'+
   '<button class="obig" onclick="submitOrder()">주문 미리보기 →</button>';}
-function openManualOrder(){_order={manual:true,market:'spot',side:'buy'};
+var _quote=null; // 수동주문 보조 시세(현재가/가용/보유) — 프리셋·매도초과 경고용
+function quoteManual(){var b=document.getElementById('obroker').value;var sym=document.getElementById('osym').value.trim();if(/[a-z]/i.test(sym))sym=sym.toUpperCase();var out=document.getElementById('oquote');if(!sym){out.textContent='종목을 입력하세요';return;}out.textContent='조회 중…';
+ fetch('/api/quote?broker='+encodeURIComponent(b)+'&symbol='+encodeURIComponent(sym)).then(function(r){return r.json()}).then(function(d){
+  if(!d.ok){_quote=null;out.textContent='⚠ '+(d.error||'조회 실패');return;}
+  _quote=d;var ccy=ccyOf(b);out.innerHTML='현재가 <b>'+fmt(d.price,ccy==='KRW'?0:2)+'</b> · 가용 '+money(d.cashBalance,ccy)+' · 보유 '+fmt(d.held,4);
+ }).catch(function(){_quote=null;out.textContent='조회 실패';});}
+function applyPreset(p){var out=document.getElementById('oquote');if(!_quote){if(out)out.textContent='먼저 [조회]로 시세/잔고를 불러오세요';return;}
+ var side=document.getElementById('oside').value;var pct=p==='max'?100:Number(p);var qty;
+ if(side==='sell'){qty=_quote.held*pct/100;}else{qty=(_quote.cashBalance*pct/100)/_quote.price*0.99;} // 수수료 여유 1%
+ var kr=/^\d{6}$/.test(String(_quote.symbol||''));qty=kr?Math.floor(qty):Math.floor(qty*1e8)/1e8;
+ document.getElementById('oqty').value=qty>0?String(qty):'0';
+ if(side==='sell'&&!(qty>0)&&out)out.textContent='매도할 보유 수량이 없어요';}
+function openManualOrder(){_quote=null;_order={manual:true,market:'spot',side:'buy'};
  var m=document.getElementById('orderModal');document.getElementById('orderMsg').textContent='';document.getElementById('orderMsg').className='setmsg';
  document.getElementById('orderTitle').textContent='✋ 수동 주문';
  document.getElementById('orderBody').innerHTML=manualFormBody(_order);
@@ -1471,7 +1495,7 @@ function openManualOrder(){_order={manual:true,market:'spot',side:'buy'};
 function openOrder(el){var side=el.dataset.side;_order={broker:el.dataset.broker,market:el.dataset.market||'spot',symbol:el.dataset.sym,ccy:el.dataset.ccy,side:side};
  var m=document.getElementById('orderModal');document.getElementById('orderMsg').textContent='';document.getElementById('orderMsg').className='setmsg';
  document.getElementById('orderTitle').innerHTML=esc(coin(_order.symbol))+' · '+(side==='buy'?'<span style="color:#10b981">매수</span>':'<span style="color:#f43f5e">매도</span>');
- document.getElementById('orderBody').innerHTML=orderFormBody(side,'');
+ document.getElementById('orderBody').innerHTML=orderFormBody(side,el.dataset.qty||'');
  m.style.display='flex';}
 function closeOrder(){document.getElementById('orderModal').style.display='none';_order=null;}
 function submitOrder(){if(!_order)return;var msg=document.getElementById('orderMsg');
@@ -1482,6 +1506,7 @@ function submitOrder(){if(!_order)return;var msg=document.getElementById('orderM
   _order.symbol=sym;_order.side=document.getElementById('oside').value;
   document.getElementById('orderTitle').innerHTML=esc(coin(sym))+' · '+(_order.side==='buy'?'<span style="color:#10b981">매수</span>':'<span style="color:#f43f5e">매도</span>');}
  var qty=Number(document.getElementById('oqty').value);if(!(qty>0)){msg.className='setmsg err';msg.textContent='수량을 0보다 크게 입력하세요.';return;}
+ if(_order.manual&&_quote&&_quote.symbol===_order.symbol&&_order.side==='sell'&&qty>_quote.held*1.0000001){msg.className='setmsg err';msg.textContent='매도 수량('+qty+')이 보유('+_quote.held+')를 초과해요.';return;}
  _order.quantity=qty;var limit=document.getElementById('olimit').checked;
  if(limit){var pr=Number(document.getElementById('oprice').value);if(!(pr>0)){msg.className='setmsg err';msg.textContent='지정가를 입력하세요.';return;}_order.type='limit';_order.price=pr;}else{_order.type='market';_order.price=undefined;}
  msg.className='setmsg';msg.textContent='미리보기 불러오는 중…';
@@ -1522,7 +1547,8 @@ function card(r){var b=r.b,live=b.mode==='live',open=expanded.has(b.id),rp=r.rp;
   '<div class="cbtn" data-id="'+esc(b.id)+'" onclick="openChart(this.dataset.id)">📈 차트 보기</div>'+
   (b.isScanner?'':( // 스캐너 봇은 b.symbol이 명목 라벨(런타임 유니버스 선별)이라 수동주문 대상 아님 → 버튼 숨김
    '<div class="obar"><span class="obtn buy" data-side="buy" data-broker="'+esc(b.broker)+'" data-market="'+esc(b.market||'spot')+'" data-sym="'+esc(b.symbol)+'" data-ccy="'+esc(r.ccy)+'" onclick="openOrder(this)">매수</span>'+
-    '<span class="obtn sell" data-side="sell" data-broker="'+esc(b.broker)+'" data-market="'+esc(b.market||'spot')+'" data-sym="'+esc(b.symbol)+'" data-ccy="'+esc(r.ccy)+'" onclick="openOrder(this)">매도</span></div>'))+
+    '<span class="obtn sell" data-side="sell" data-broker="'+esc(b.broker)+'" data-market="'+esc(b.market||'spot')+'" data-sym="'+esc(b.symbol)+'" data-ccy="'+esc(r.ccy)+'" onclick="openOrder(this)">매도</span>'+
+    (r.bsum>0||r.ps.some(function(p){return p.side==='long'&&p.qty>0})?'<span class="obtn sell" data-side="sell" data-qty="'+esc(r.ps.filter(function(p){return p.side==='long'}).reduce(function(a,p){return a+p.qty},0))+'" data-broker="'+esc(b.broker)+'" data-market="'+esc(b.market||'spot')+'" data-sym="'+esc(b.symbol)+'" data-ccy="'+esc(r.ccy)+'" onclick="openOrder(this)">전량매도</span>':'')+'</div>'))+
   '<div class="more" data-id="'+esc(b.id)+'" onclick="tgl(this)">'+(open?'간단히 ▴':'전략 자세히 ▾')+'</div>'+
   '<div class="strat" style="display:'+(open?'block':'none')+'">'+detailHtml(b)+'</div>';
  return el;}

@@ -53,6 +53,9 @@ export interface BacktestConfig {
   initialCapital: number;
   commission: number; // %
   slippage?: number; // % (기본 0.05 — 시장가 체결 시 가격 변동)
+  // 손절 갭 처리(audit P1-12). 'close'(기본)=종가로만 SL 판정·체결(기존 동작 — 갭다운 손실 과소평가 가능).
+  // 'worst'=봉 저가가 손절선 터치 시 발동, 체결가=min(시가, 손절선)(갭 통과 시 시가 체결 — 실거래 상주 STOP_MARKET에 근접한 보수 모델).
+  gapHandling?: "close" | "worst";
   timeframe?: string; // 봉 주기(1m~1d). Sharpe 연환산에 사용. 미지정 시 일봉(크립토 365). (mig017 연계)
   auxSeries?: Record<string, number[]>; // 스프레드 조건용: symbolB → 종가 배열(메인 data와 동일 길이·정렬). 러너/백테스트툴이 주입.
   mtfSeries?: Record<string, number[]>; // 멀티타임프레임용: mtfKey → 상위TF 지표값(LTF 정렬·전방채움). 러너/백테스트툴이 주입.

@@ -22,6 +22,30 @@ export async function getBalance(a: { broker?: Broker; market?: "spot" | "future
   catch (e) { return { ok: false, error: e instanceof Error ? e.message : String(e) }; }
 }
 
+/**
+ * 수동주문 입력 보조 시세(읽기전용, audit §7-4/8): 현재가 + 가용현금 + 해당 종목 보유수량.
+ * 잘못된 심볼이면 getPrice가 실패 → 클라가 '종목 확인' 안내(자동완성 대체 검증). 시크릿/키 미노출.
+ */
+export async function getQuote(a: { broker?: Broker; market?: "spot" | "futures"; symbol: string }) {
+  const broker = a.broker || "binance", market = a.market || "spot";
+  const got = getAdapter(broker, market);
+  if (!got) return { ok: false, error: `${broker} 키 미설정(env).` };
+  try {
+    const px = await got.adapter.getPrice(a.symbol);
+    if (!(px.price > 0)) return { ok: false, error: `시세 0 — 종목(${a.symbol}) 확인 필요` };
+    let cashBalance = 0, held = 0;
+    try { cashBalance = (await got.adapter.getBalance()).cashBalance; } catch { /* 잔고 실패해도 시세는 반환 */ }
+    try {
+      const base = a.symbol.toUpperCase().replace(/(USDT|USDC|FDUSD|TUSD|BUSD)$/, "");
+      for (const p of await got.adapter.getPositions()) {
+        const ps = String(p.symbol).toUpperCase();
+        if (ps === a.symbol.toUpperCase() || ps === base) held += Number((p as { free?: number }).free ?? p.quantity) || 0;
+      }
+    } catch { /* 보유 실패해도 시세는 반환 */ }
+    return { ok: true, broker, env: got.env, symbol: a.symbol, price: px.price, cashBalance, held };
+  } catch (e) { return { ok: false, error: `시세 조회 실패 — 종목(${a.symbol}) 확인: ${e instanceof Error ? e.message : e}` }; }
+}
+
 /** 미체결(상주) 주문 목록(읽기전용, audit P1-16/19). KR 어댑터는 미구현 — 정직하게 미지원 반환. */
 export async function getOpenOrders(a: { broker?: Broker; market?: "spot" | "futures"; symbol: string }) {
   const broker = a.broker || "binance", market = a.market || "spot";

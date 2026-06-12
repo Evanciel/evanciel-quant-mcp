@@ -69,6 +69,18 @@ export function startBot(a: { botId: string }) {
   if (b.mode === "live") {
     const dup = store.listRunningBots().find((o) => o.id !== b.id && o.mode === "live" && o.broker === b.broker && o.symbol === b.symbol);
     if (dup) return { ok: false, error: `동일 종목(${b.symbol})·브로커(${b.broker}) 라이브 봇이 이미 가동 중(${dup.name}, ${dup.id}) — 계좌 보유 귀속 모호로 발산 위험. 기존 봇을 정지한 뒤 시작하세요.` };
+    // weighted 노드 라이브 거절(audit P1-13): 백테는 자식별 자본 분할 시뮬, 라이브 러너는 단일 병합 포지션 실행 —
+    //   자본분할 실행 구현 전까지 backtest≡live 위반이므로 silent 실행 금지(fail-closed). 페이퍼는 허용(시뮬 일관).
+    const comp = store.getComposite(b.composite_strategy_id);
+    const hasWeighted = (node: unknown): boolean => {
+      if (!node || typeof node !== "object") return false;
+      const n = node as { mode?: string; children?: unknown[] };
+      if (n.mode === "weighted") return true;
+      return Array.isArray(n.children) ? n.children.some(hasWeighted) : false;
+    };
+    if (comp && hasWeighted(comp.root_node)) {
+      return { ok: false, error: "weighted(자본분할) 모드는 라이브 미지원 — 백테스트는 자식별 자본을 분할하지만 라이브는 단일 포지션으로 실행되어 backtest≡live가 깨집니다(audit P1-13). priority 모드로 바꾸거나 페이퍼로 운용하세요." };
+    }
   }
   runner().start(a.botId);
   // 표시 라벨은 봇 mode를 그대로 반영(라이브 봇을 '페이퍼'로 거짓 표기하지 않음). 실제 실주문 여부는 러너의 게이트가 통제.
