@@ -905,8 +905,8 @@ h1{font-size:18px;margin:0 0 2px}.sub{color:#8a94a6;font-size:12px;margin-bottom
 .brkh .ok{font-size:11px;color:#10b981}.brkh .no{font-size:11px;color:#8a94a6}
 .fld{display:grid;grid-template-columns:140px 1fr;gap:8px;align-items:center;margin-bottom:7px}
 .fld label{font-size:12px;color:#c9d2e3}.fld .cur{font-size:11px;color:#6b7588}
-.fld input{background:#0e1320;border:1px solid #222838;border-radius:6px;color:#e6e6e6;padding:7px 9px;font:13px system-ui,sans-serif;width:100%;box-sizing:border-box}
-.fld input:focus{outline:none;border-color:#7aa2f7}
+.fld input,.fld select{background:#0e1320;border:1px solid #222838;border-radius:6px;color:#e6e6e6;padding:7px 9px;font:13px system-ui,sans-serif;width:100%;box-sizing:border-box}
+.fld input:focus,.fld select:focus{outline:none;border-color:#7aa2f7}
 .savebtn{background:#7aa2f7;color:#0b0e14;border:0;border-radius:8px;padding:8px 16px;font-weight:700;font-size:13px;cursor:pointer;margin-top:8px}.savebtn:hover{background:#a8c0ff}
 .setmsg{font-size:12px;margin-top:10px;min-height:16px}.setmsg.ok{color:#10b981}.setmsg.err{color:#f43f5e}
 .livebox{border-top:1px solid #222838;margin-top:14px;padding-top:12px}
@@ -922,6 +922,7 @@ h1{font-size:18px;margin:0 0 2px}.sub{color:#8a94a6;font-size:12px;margin-bottom
 </style><script src="/vendor/lightweight-charts.standalone.js"></script></head><body><div class="wrap">
 <h1>내 자동매매 현황 <span class="dot"></span></h1>
 <div class="sub">봇이 알아서 사고팔아요 · 실시간 시세 반영 <span id="upd" style="color:#8a94a6">—</span>
+  <span class="gear" onclick="openManualOrder()">✋ 수동 주문</span>
   <span class="gear" onclick="toggleSettings()">⚙️ API 키 설정</span></div>
 <div class="card setpanel" id="setpanel" style="display:none">
   <div class="row"><div><b>거래소 API 키 입력</b> <span class="hint">실거래/모의거래를 하려면 키가 필요해요</span></div>
@@ -1307,6 +1308,21 @@ function orderFormBody(side,qty){return '<div class="fld"><label>수량</label><
   '<label style="display:flex;gap:7px;align-items:center;cursor:pointer;margin:6px 0;font-size:12px;color:#8a94a6"><input type="checkbox" id="olimit" onchange="toggleLimit(this.checked)"> 지정가로 주문</label>'+
   '<div class="fld" id="olimitwrap" style="display:none"><label>지정가</label><input id="oprice" type="text" inputmode="decimal" autocomplete="off" placeholder="한 주 가격"></div>'+
   '<button class="obig'+(side==='sell'?' danger':'')+'" onclick="submitOrder()">주문 미리보기 →</button>';}
+// 자유 수동주문 폼 — 브로커·종목·방향까지 직접 선택(봇 카드와 무관). o={broker,symbol,side,quantity} 프리필(확정 실패 후 복원용).
+function manualFormBody(o){o=o||{};var sel=function(v){return o.broker===v?' selected':''};var ss=function(v){return (o.side||'buy')===v?' selected':''};
+ return '<div class="fld"><label>거래소/증권사</label><select id="obroker"><option value="binance"'+sel('binance')+'>Binance (암호화폐)</option><option value="kiwoom"'+sel('kiwoom')+'>키움증권 (주식)</option><option value="kis"'+sel('kis')+'>한국투자증권 (주식)</option></select></div>'+
+  '<div class="fld"><label>종목</label><input id="osym" type="text" autocomplete="off" placeholder="예: BTCUSDT 또는 005930" value="'+(o.symbol?esc(o.symbol):'')+'"></div>'+
+  '<div class="fld"><label>방향</label><select id="oside"><option value="buy"'+ss('buy')+'>매수 (사기)</option><option value="sell"'+ss('sell')+'>매도 (팔기)</option></select></div>'+
+  '<div class="fld"><label>수량</label><input id="oqty" type="text" inputmode="decimal" autocomplete="off" placeholder="코인: 0.01 / 주식: 1" value="'+(o.quantity?esc(o.quantity):'')+'"></div>'+
+  '<label style="display:flex;gap:7px;align-items:center;cursor:pointer;margin:6px 0;font-size:12px;color:#8a94a6"><input type="checkbox" id="olimit" onchange="toggleLimit(this.checked)"'+(o.price?' checked':'')+'> 지정가로 주문 <span class="hint">(체크 안 하면 시장가)</span></label>'+
+  '<div class="fld" id="olimitwrap" style="display:'+(o.price?'block':'none')+'"><label>지정가</label><input id="oprice" type="text" inputmode="decimal" autocomplete="off" placeholder="한 주(개) 가격" value="'+(o.price?esc(o.price):'')+'"></div>'+
+  '<div class="hint" style="margin:4px 0 8px">미리보기에서 서버가 현재가·예상금액을 다시 계산해 보여드려요. 거기서 한 번 더 확인 후 확정됩니다.</div>'+
+  '<button class="obig" onclick="submitOrder()">주문 미리보기 →</button>';}
+function openManualOrder(){_order={manual:true,market:'spot',side:'buy'};
+ var m=document.getElementById('orderModal');document.getElementById('orderMsg').textContent='';document.getElementById('orderMsg').className='setmsg';
+ document.getElementById('orderTitle').textContent='✋ 수동 주문';
+ document.getElementById('orderBody').innerHTML=manualFormBody(_order);
+ m.style.display='flex';}
 function openOrder(el){var side=el.dataset.side;_order={broker:el.dataset.broker,market:el.dataset.market||'spot',symbol:el.dataset.sym,ccy:el.dataset.ccy,side:side};
  var m=document.getElementById('orderModal');document.getElementById('orderMsg').textContent='';document.getElementById('orderMsg').className='setmsg';
  document.getElementById('orderTitle').innerHTML=esc(coin(_order.symbol))+' · '+(side==='buy'?'<span style="color:#10b981">매수</span>':'<span style="color:#f43f5e">매도</span>');
@@ -1314,6 +1330,12 @@ function openOrder(el){var side=el.dataset.side;_order={broker:el.dataset.broker
  m.style.display='flex';}
 function closeOrder(){document.getElementById('orderModal').style.display='none';_order=null;}
 function submitOrder(){if(!_order)return;var msg=document.getElementById('orderMsg');
+ if(_order.manual){ // 자유 주문 — 브로커·종목·방향을 폼에서 수집(서버 placeOrder가 심볼 실재·가격·한도 전부 재검증)
+  _order.broker=document.getElementById('obroker').value;_order.ccy=ccyOf(_order.broker);
+  var sym=document.getElementById('osym').value.trim();if(/[a-z]/i.test(sym))sym=sym.toUpperCase(); // 코인 심볼은 대문자 정규화, KR 종목코드(숫자)는 그대로
+  if(!sym){msg.className='setmsg err';msg.textContent='종목을 입력하세요. (예: BTCUSDT, 005930)';return;}
+  _order.symbol=sym;_order.side=document.getElementById('oside').value;
+  document.getElementById('orderTitle').innerHTML=esc(coin(sym))+' · '+(_order.side==='buy'?'<span style="color:#10b981">매수</span>':'<span style="color:#f43f5e">매도</span>');}
  var qty=Number(document.getElementById('oqty').value);if(!(qty>0)){msg.className='setmsg err';msg.textContent='수량을 0보다 크게 입력하세요.';return;}
  _order.quantity=qty;var limit=document.getElementById('olimit').checked;
  if(limit){var pr=Number(document.getElementById('oprice').value);if(!(pr>0)){msg.className='setmsg err';msg.textContent='지정가를 입력하세요.';return;}_order.type='limit';_order.price=pr;}else{_order.type='market';_order.price=undefined;}
@@ -1337,7 +1359,7 @@ function confirmOrder(){if(!_order||!_order.confirmToken)return;var msg=document
   .then(function(r){return r.json()}).then(function(d){
    if(d.ok&&d.phase==='executed'){msg.className='setmsg ok';msg.textContent='✅ 주문 완료 ('+esc(d.env)+') · 주문번호 '+esc((d.result&&d.result.orderId)||'-');loadBalances();}
    else{msg.className='setmsg err';msg.textContent='실패: '+(d.error||'알 수 없음')+' — 미리보기부터 다시 하세요.';_order.confirmToken=null;
-    document.getElementById('orderBody').innerHTML=orderFormBody(_order.side,_order.quantity);} // 입력 폼 복원(막다른 골목 방지)
+    document.getElementById('orderBody').innerHTML=_order.manual?manualFormBody(_order):orderFormBody(_order.side,_order.quantity);} // 입력 폼 복원(막다른 골목 방지) — 수동주문은 브로커·종목까지 프리필
   }).catch(function(e){msg.className='setmsg err';msg.textContent='실패: '+e.message;});}
 function card(r){var b=r.b,live=b.mode==='live',open=expanded.has(b.id),rp=r.rp;
  var wr=b.winRate!=null?', '+b.closes+'번 중 '+Math.round(b.winRate*b.closes/100)+'번 수익':'';
