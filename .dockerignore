@@ -1,0 +1,11 @@
+node_modules
+dist
+.git
+.env*
+docs
+test
+scripts
+*.md
+.claude
+.bkit
+.playwright-mcp

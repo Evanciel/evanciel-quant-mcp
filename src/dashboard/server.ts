@@ -575,6 +575,14 @@ export function startDashboard(port = 7788): Promise<{ url: string; port: number
       res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" }); res.end(html()); return;
     }
     if (u.pathname === "/favicon.ico") { res.writeHead(204).end(); return; } // 토큰 불필요(콘솔 401 소거)
+    if (u.pathname === "/healthz") {
+      // 무인증 헬스체크(audit P0-2): Docker HEALTHCHECK/외부 워치독용. 시크릿·포지션·심볼 등 민감정보 0 —
+      //   살아있음 + 가동 봇 수만. 127.0.0.1 바인딩이라 외부 노출 없음(컨테이너 내부/로컬 모니터 전용).
+      let running = 0; try { running = store.listRunningBots().length; } catch { /* DB 장애 시에도 200은 내되 -1 */ running = -1; }
+      res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
+      res.end(JSON.stringify({ ok: true, uptimeSec: Math.floor(process.uptime()), runningBots: running }));
+      return;
+    }
     if (u.pathname === "/vendor/lightweight-charts.standalone.js") {
       // 공개 정적 차트 라이브러리(시크릿 0) — 무인증·고정 경로(트래버설 불가). unpkg 제거=서드파티 스크립트 0.
       const js = vendorChartsJs();

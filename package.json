@@ -42,7 +42,8 @@
     "dev": "tsx src/mcp-server/index.ts",
     "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\"",
     "build": "npm run clean && esbuild src/mcp-server/index.ts --bundle --platform=node --format=esm --target=node22 --packages=external --outfile=dist/index.js --banner:js=\"#!/usr/bin/env node\"",
-    "prepublishOnly": "npm run typecheck && npm run build"
+    "prepublishOnly": "npm run typecheck && npm run build",
+    "daemon": "tsx src/daemon.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.4",

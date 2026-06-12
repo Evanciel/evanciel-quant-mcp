@@ -890,3 +890,42 @@ export class Runner {
 
 let _runner: Runner | null = null;
 export function runner(): Runner { if (!_runner) _runner = new Runner(); return _runner; }
+
+/**
+ * 글로벌 킬스위치 실행부(audit P1-17). 전 가동 봇 정지 + (옵션) 라이브 오픈 포지션 시장가 청산.
+ * 청산은 fillOrder 안전경로 재사용(liveGate/checkLimits/멱등 cid — 새 주문 경로 0). 호출 측은 청산을 끝낸
+ * '뒤에' LIVE_TRADING_HALT를 설정해야 한다(HALT 먼저 켜면 청산 주문도 게이트에 막힘).
+ * 실패는 삼키지 않고 집계 반환 — 봇별 청산 실패 시 거래소 수동 정리 필요(로그·감사 기록).
+ */
+export async function emergencyStopAll(opts?: { closePositions?: boolean }): Promise<{ stopped: number; closed: number; failed: number }> {
+  const bots = store.listRunningBots();
+  let closed = 0, failed = 0;
+  for (const bot of bots) runner().stop(bot.id); // 먼저 전부 정지(추가 진입 차단)
+  if (opts?.closePositions) {
+    for (const bot of bots) {
+      const cur = bot.position_state as PaperPosition | null;
+      if (bot.mode !== "live" || !cur || cur.status !== "open" || !(cur.qty > 1e-9) || cur.live !== true) continue; // 라이브 채널 오픈 포지션만
+      try {
+        const live = liveAdapterFor(bot);
+        const px = live ? (await (live.adapter as { getPrice: (s: string) => Promise<{ price: number }> }).getPrice(bot.symbol)).price : 0;
+        if (!(px > 0)) { failed++; store.insertLog(bot.id, "error", "비상 전체청산: 시세 조회 실패 — 거래소에서 수동 청산 필요"); continue; }
+        const ec = await fillOrder(bot, "sell", cur.qty, px, bot.symbol, { posLive: true });
+        if (ec.failed) { failed++; store.insertLog(bot.id, "error", `비상 전체청산 실패(${ec.note}) — 거래소에서 수동 청산 필요`); continue; }
+        const soldQty = ec.filledQty != null && ec.filledQty > 0 ? ec.filledQty : cur.qty;
+        const pnl = (ec.price - cur.entryAvg) * soldQty;
+        store.tx(() => {
+          store.insertTrade({ bot_id: bot.id, side: "sell", price: ec.price, qty: soldQty, pnl, is_paper: ec.live ? 0 : 1, reason: "비상 전체청산(킬스위치)", idempotency_key: `${bot.id}:${Date.now()}:halt` });
+          store.setBotPositionState(bot.id, null, true, true);
+        });
+        await syncBotProtective(bot, true, bot.symbol, 0, cur.entryAvg, 0, {}, cur.protectiveIds ?? []); // 잔여 보호주문 취소(베스트에포트)
+        store.insertLog(bot.id, "sell", `[킬스위치] 비상 전체청산 -${soldQty} @ ${ec.price} pnl=${pnl.toFixed(2)}`);
+        closed++;
+      } catch (e) {
+        failed++;
+        store.insertLog(bot.id, "error", `비상 전체청산 예외(${e instanceof Error ? e.message : e}) — 수동 확인 필요`);
+      }
+    }
+  }
+  audit({ event: "emergency_stop_all", stopped: bots.length, closed, failed, closePositions: !!opts?.closePositions });
+  return { stopped: bots.length, closed, failed };
+}

@@ -45,6 +45,11 @@ export function loadCredentials(broker: Broker, market: "spot" | "futures" = "sp
 export function liveGate(broker: Broker, market: "spot" | "futures" = "spot"): { allowed: boolean; env: Env | null; reason: string } {
   const c = loadCredentials(broker, market);
   if (!c) return { allowed: false, env: null, reason: `${broker} 키 미설정(env). 페이퍼로 유지.` };
+  // 글로벌 킬스위치(audit P1-17): HALT면 환경 불문 전 주문 차단. 매 호출 env 재평가라 런타임 토글 즉시 반영
+  //   (텔레그램 /halt 등). 기존 포지션 청산은 emergencyStopAll(closePositions)이 HALT 설정 '전에' 수행.
+  if (trim(process.env.LIVE_TRADING_HALT) === "true") {
+    return { allowed: false, env: c.env, reason: "LIVE_TRADING_HALT=true — 글로벌 킬스위치 작동(모든 주문 차단). 해제: 환경변수 제거." };
+  }
   const masterOn = trim(process.env.LIVE_TRADING_ENABLED) === "true";
   if (c.env === "live") {
     if (!masterOn) return { allowed: false, env: "live", reason: "메인넷 키지만 LIVE_TRADING_ENABLED!=true → 차단(마스터 OFF). 페이퍼로 유지." };
