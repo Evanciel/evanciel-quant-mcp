@@ -22,6 +22,48 @@ export async function getBalance(a: { broker?: Broker; market?: "spot" | "future
   catch (e) { return { ok: false, error: e instanceof Error ? e.message : String(e) }; }
 }
 
+/** 미체결(상주) 주문 목록(읽기전용, audit P1-16/19). KR 어댑터는 미구현 — 정직하게 미지원 반환. */
+export async function getOpenOrders(a: { broker?: Broker; market?: "spot" | "futures"; symbol: string }) {
+  const broker = a.broker || "binance", market = a.market || "spot";
+  const got = getAdapter(broker, market);
+  if (!got) return { ok: false, error: `${broker} 키 미설정(env). SETUP-LIVE.md 참고.` };
+  if (typeof got.adapter.getOpenOrders !== "function") {
+    return { ok: false, error: `${broker} 어댑터는 미체결 조회 미구현(현재 Binance만, audit P2 — KIS/키움 후속). 거래소 앱에서 확인하세요.` };
+  }
+  try { return { ok: true, broker, env: got.env, symbol: a.symbol, orders: await got.adapter.getOpenOrders(a.symbol) }; }
+  catch (e) { return { ok: false, error: e instanceof Error ? e.message : String(e) }; }
+}
+
+/** 주문 상태 역쿼리(읽기전용, audit P1-16). orderId 또는 clientOrderId 중 하나 필수. 없으면 found:false. */
+export async function getOrderStatus(a: { broker?: Broker; market?: "spot" | "futures"; symbol: string; orderId?: string; clientOrderId?: string }) {
+  const broker = a.broker || "binance", market = a.market || "spot";
+  const got = getAdapter(broker, market);
+  if (!got) return { ok: false, error: `${broker} 키 미설정(env). SETUP-LIVE.md 참고.` };
+  try {
+    if (a.orderId && typeof got.adapter.getOrderById === "function") {
+      const o = await got.adapter.getOrderById(a.symbol, a.orderId);
+      return { ok: true, broker, env: got.env, found: !!o, order: o };
+    }
+    if (a.clientOrderId && typeof got.adapter.getOrderByClientId === "function") {
+      const o = await got.adapter.getOrderByClientId(a.symbol, a.clientOrderId);
+      return { ok: true, broker, env: got.env, found: !!o, order: o };
+    }
+    return { ok: false, error: a.orderId || a.clientOrderId ? `${broker} 어댑터는 주문 역쿼리 미구현(현재 Binance만).` : "orderId 또는 clientOrderId가 필요합니다." };
+  } catch (e) { return { ok: false, error: e instanceof Error ? e.message : String(e) }; }
+}
+
+/** 미체결 주문 취소(audit P1-19). 리스크 감소 방향 조작이라 2단계 토큰 없이 허용 — 감사로그는 남김. */
+export async function cancelOrderById(a: { broker?: Broker; market?: "spot" | "futures"; symbol: string; orderId: string }) {
+  const broker = a.broker || "binance", market = a.market || "spot";
+  const got = getAdapter(broker, market);
+  if (!got) return { ok: false, error: `${broker} 키 미설정(env).` };
+  try {
+    const cancelled = await got.adapter.cancelOrder(a.orderId, a.symbol);
+    audit({ event: "manual_cancel", broker, env: got.env, symbol: a.symbol, orderId: a.orderId, cancelled });
+    return { ok: true, broker, env: got.env, cancelled, note: cancelled ? "취소됨" : "취소 실패(이미 체결/취소됐을 수 있음 — get_order_status로 확인)" };
+  } catch (e) { return { ok: false, error: e instanceof Error ? e.message : String(e) }; }
+}
+
 /** 라이브 설정 상태(키 노출 0). 무엇이 켜져 있는지 한눈에 — 안내용. */
 export function liveStatus() {
   const brokers = configuredBrokers();

@@ -86,6 +86,8 @@ export interface BrokerAdapter {
   // clientOrderId로 주문 조회 (모호한 placeOrder 실패 후 실제 체결 여부 reconcile).
   // 미구현 어댑터는 undefined → 호출측은 reconcile 불가로 간주(보수적 처리). 주문 없으면 null.
   getOrderByClientId?(symbol: string, clientOrderId: string): Promise<OrderResult | null>;
+  // 거래소 orderId로 주문 조회(수동 지정가 체결 추적·역쿼리, audit P1-16/20). 주문 없으면 null.
+  getOrderById?(symbol: string, orderId: string): Promise<OrderResult | null>;
   // 거래소 수량 단위(LOT_SIZE 등)에 맞춰 주문 수량 정규화. 미구현 시 원본 수량 사용.
   normalizeQuantity?(symbol: string, quantity: number, refPrice: number): Promise<number>;
   // 현물 OCO 보호주문(익절 LIMIT_MAKER + 손절 STOP_LOSS_LIMIT 묶음, 한쪽 체결 시 다른쪽 자동취소). 현물 SELL 전용.

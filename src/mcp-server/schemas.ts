@@ -186,4 +186,10 @@ export const placeProtectiveShape = {
   confirmToken: z.string().optional().describe("프리뷰가 반환한 토큰. 없으면 프리뷰만(실주문 안 함=fail-closed)"),
 };
 export const getProtectiveShape = { broker: brokerEnum, symbol: z.string().describe("상주 OCO·실보유를 조회할 현물 심볼") };
+export const getOpenOrdersShape = { broker: brokerEnum, market: marketEnum, symbol: z.string().describe("미체결 주문을 조회할 심볼") };
+export const getOrderStatusShape = {
+  broker: brokerEnum, market: marketEnum, symbol: z.string().describe("심볼"),
+  orderId: z.string().optional().describe("거래소 주문번호(place_order 결과)"),
+  clientOrderId: z.string().optional().describe("클라이언트 멱등키(봇 주문 cid)"),
+};
 export const cancelProtectiveShape = { broker: brokerEnum, symbol: z.string().describe("현물 심볼"), orderListId: z.string().describe("취소할 OCO orderListId(get_protective가 반환)") };

@@ -63,7 +63,7 @@ No tool advertises expected returns. Ever.
 - [How it works](#how-it-works-3-steps)
 - [Quick start](#quick-start)
 - [What can an agent build?](#what-can-an-agent-build)
-- [Tool reference (25 tools)](#tool-reference-25-tools)
+- [Tool reference (27 tools)](#tool-reference-25-tools)
 - [Strategy expressiveness](#strategy-expressiveness)
 - [Bots & live dashboard](#bots--live-dashboard)
 - [Risk & execution layer](#risk--execution-layer)
@@ -78,7 +78,7 @@ No tool advertises expected returns. Ever.
 
 ## Quick start
 
-quant-mcp is a stdio MCP server — **any MCP-compatible agent** (Claude Desktop, Claude Code, Cursor, Continue, …) can use its 25 tools. No API keys needed (data is Binance's public REST).
+quant-mcp is a stdio MCP server — **any MCP-compatible agent** (Claude Desktop, Claude Code, Cursor, Continue, …) can use its 27 tools. No API keys needed (data is Binance's public REST).
 
 ### From source (works today)
 
@@ -106,7 +106,7 @@ Register it with your MCP client (replace `ABSOLUTE_PATH`):
 - **Claude Desktop:** `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) · `%APPDATA%\Claude\claude_desktop_config.json` (Windows)
 - **Cursor:** `.cursor/mcp.json`
 
-The server announces `quant-mcp server ready (stdio) — 25 tools` on stderr.
+The server announces `quant-mcp server ready (stdio) — 27 tools` on stderr.
 
 ### Via npm (after publish)
 
@@ -132,7 +132,7 @@ All of the above is expressible **today**, backtested with OOS+DSR, and runnable
 
 ---
 
-## Tool reference (25 tools)
+## Tool reference (27 tools)
 
 Every tool maps 1:1 to a verified pure function and carries the *"risk filter, not alpha source"* disclaimer.
 
@@ -167,7 +167,7 @@ Every tool maps 1:1 to a verified pure function and carries the *"risk filter, n
 | `list_bots` / `get_bot_status` | List bots / inspect positions + recent fills + logs. |
 | `open_dashboard` | Launch the local (127.0.0.1) real-time HTML dashboard. |
 
-### 🔐 Live trading — bring-your-own-keys (7)
+### 🔐 Live trading — bring-your-own-keys (9)
 
 | Tool | What it does |
 |---|---|
@@ -177,6 +177,8 @@ Every tool maps 1:1 to a verified pure function and carries the *"risk filter, n
 | `place_protective` | Resting **OCO** (take-profit + stop-loss, one-cancels-the-other) on a spot long — same fail-closed 2-step token; server re-checks held quantity / direction / notional. Keeps the stop at the exchange even if the bot is down. |
 | `get_protective` | Inspect the resting OCO for a symbol + sellable (free) balance — for cross-session restore / dedupe. Read-only, no key exposure. |
 | `cancel_protective` | Cancel a resting OCO by `orderListId` (returned by `get_protective`), via `liveGate` + audit. |
+| `get_open_orders` | Open (resting) orders for a symbol — leftover limit / orphan order check (read-only; Binance only for now). |
+| `get_order_status` | Re-query an order by `orderId`/`clientOrderId` so agents can verify fills after placing (read-only). |
 
 > **Default is paper.** Live trading is off unless you set keys *and* the master switch. Mainnet is gated behind testnet validation.
 
@@ -284,7 +286,7 @@ src/store/        node:sqlite local store (bots, strategies, trades, logs)
 src/runner/       paper/live bot runner (reuses the backtest engine → backtest≡live)
 src/dashboard/    127.0.0.1 real-time HTML dashboard
 src/brokers/      multi-broker adapters (Binance + 한국투자/KIS + 키움) + safety gates
-src/mcp-server/   stdio MCP server + 25 tools
+src/mcp-server/   stdio MCP server + 27 tools
 ```
 
 **Design principle:** the live runner *reuses* `runCompositeBacktest`, so adding a condition type means editing exactly three files (types + validation + engine) and live inherits it — backtest ≡ live by construction.
@@ -294,7 +296,7 @@ src/mcp-server/   stdio MCP server + 25 tools
 ## Roadmap
 
 - ✅ Portable core + keyless Binance data
-- ✅ MCP server + 25 tools (analysis, screening, portfolio, events, bots, live BYOK)
+- ✅ MCP server + 27 tools (analysis, screening, portfolio, events, bots, live BYOK)
 - ✅ Strategy expressiveness: indicator/time/regime/anchor/spread/MTF/event conditions + scanner nodes
 - ✅ Position management: SL/TP, TP ladder, scale-in, pyramid, trailing, short/futures
 - ✅ Paper bot runner + real-time dashboard

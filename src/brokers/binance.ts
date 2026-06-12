@@ -629,6 +629,36 @@ export class BinanceBrokerAdapter extends BaseBrokerAdapter {
   }
 
   /**
+   * 거래소 orderId로 주문 조회(수동 주문 체결 추적·역쿼리, audit P1-16/20). getOrderByClientId와 동일
+   * 안전계약: 없음(-2013)→null, 형식변형/미지 상태→throw(fail-closed).
+   */
+  async getOrderById(symbol: string, orderId: string): Promise<OrderResult | null> {
+    let data: Record<string, unknown>;
+    try {
+      data = await this.request<Record<string, unknown>>(this.paths.order, {
+        method: "GET", signed: true, params: { symbol, orderId },
+      });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      if (msg.includes("-2013") || msg.toLowerCase().includes("does not exist")) return null;
+      throw e;
+    }
+    if (!data || data.orderId == null) return null;
+    const ack = parseOrderAck(data, "주문조회(id)");
+    return {
+      orderId: String(ack.orderId),
+      symbol,
+      side: String(ack.side ?? "").toUpperCase() === "SELL" ? "sell" : "buy",
+      quantity: parseFloat(String(ack.executedQty ?? ack.origQty ?? "0")),
+      executedQty: parseFloat(String(ack.executedQty ?? "0")),
+      origQty: parseFloat(String(ack.origQty ?? "0")),
+      price: this.fillPriceFrom(ack),
+      status: this.mapStatus(String(ack.status ?? "")),
+      timestamp: new Date(Number(ack.updateTime ?? ack.time ?? Date.now())),
+    };
+  }
+
+  /**
    * 주문 취소. **현물·선물 모두 symbol 필수**(Binance DELETE /order). 이전엔 현물에서 symbol 누락 →
    * -1102(symbol 누락)로 취소 실패(testnet 검증서 적발). symbol 인자 우선, 없으면 credentials.symbol 폴백.
    */

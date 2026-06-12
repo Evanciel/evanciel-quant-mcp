@@ -193,6 +193,17 @@ export function tradeStats(bot_id: string): { realizedPnl: number; closes: numbe
 export function recentTrades(bot_id: string, limit = 50): TradeRow[] {
   return db().prepare(`SELECT * FROM trades WHERE bot_id=? ORDER BY ts DESC LIMIT ?`).all(bot_id, limit) as unknown as TradeRow[];
 }
+/** 전 봇 체결 내역(봇 이름 조인, 최신순). 대시보드 주문/체결 내역 탭(audit P1-18). sinceIso로 기간 필터. */
+export function listTradesAll(limit = 200, sinceIso?: string): (TradeRow & { bot_name: string; symbol: string })[] {
+  const lim = Math.max(1, Math.min(1000, limit));
+  if (sinceIso) {
+    return db().prepare(`SELECT t.*, b.name AS bot_name, b.symbol AS symbol FROM trades t LEFT JOIN bots b ON b.id=t.bot_id WHERE t.ts >= ? ORDER BY t.ts DESC, t.rowid DESC LIMIT ?`)
+      .all(sinceIso, lim) as unknown as (TradeRow & { bot_name: string; symbol: string })[];
+  }
+  return db().prepare(`SELECT t.*, b.name AS bot_name, b.symbol AS symbol FROM trades t LEFT JOIN bots b ON b.id=t.bot_id ORDER BY t.ts DESC, t.rowid DESC LIMIT ?`)
+    .all(lim) as unknown as (TradeRow & { bot_name: string; symbol: string })[];
+}
+
 export function recentLogs(bot_id: string, limit = 50): LogRow[] {
   return db().prepare(`SELECT * FROM bot_logs WHERE bot_id=? ORDER BY ts DESC LIMIT ?`).all(bot_id, limit) as unknown as LogRow[];
 }

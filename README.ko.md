@@ -63,7 +63,7 @@ quant-mcp는 알파(초과수익)를 찾아준다고 **주장하지 않습니다
 - [3단계로 어떻게 돌아가나](#3단계로-어떻게-돌아가나)
 - [빠른 시작](#빠른-시작)
 - [에이전트가 무엇을 만들 수 있나](#에이전트가-무엇을-만들-수-있나)
-- [툴 레퍼런스 (25개)](#툴-레퍼런스-25개)
+- [툴 레퍼런스 (27개)](#툴-레퍼런스-25개)
 - [전략 표현력](#전략-표현력)
 - [봇 & 실시간 대시보드](#봇--실시간-대시보드)
 - [리스크 & 실행 레이어](#리스크--실행-레이어)
@@ -78,7 +78,7 @@ quant-mcp는 알파(초과수익)를 찾아준다고 **주장하지 않습니다
 
 ## 빠른 시작
 
-quant-mcp는 stdio MCP 서버입니다 — **MCP를 지원하는 어떤 에이전트**(Claude Desktop, Claude Code, Cursor, Continue 등)든 25개 툴을 쓸 수 있습니다. API 키 불필요(데이터는 바이낸스 공개 REST).
+quant-mcp는 stdio MCP 서버입니다 — **MCP를 지원하는 어떤 에이전트**(Claude Desktop, Claude Code, Cursor, Continue 등)든 27개 툴을 쓸 수 있습니다. API 키 불필요(데이터는 바이낸스 공개 REST).
 
 ### 소스에서 (지금 바로 동작)
 
@@ -106,7 +106,7 @@ MCP 클라이언트에 등록(`ABSOLUTE_PATH`를 clone 위치로 교체):
 - **Claude Desktop:** `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) · `%APPDATA%\Claude\claude_desktop_config.json` (Windows)
 - **Cursor:** `.cursor/mcp.json`
 
-서버는 stderr에 `quant-mcp server ready (stdio) — 25 tools`를 출력합니다.
+서버는 stderr에 `quant-mcp server ready (stdio) — 27 tools`를 출력합니다.
 
 ### npm으로 (발행 후)
 
@@ -132,7 +132,7 @@ MCP 클라이언트에 등록(`ABSOLUTE_PATH`를 clone 위치로 교체):
 
 ---
 
-## 툴 레퍼런스 (25개)
+## 툴 레퍼런스 (27개)
 
 모든 툴은 검증된 순수 함수와 1:1 대응하며 *"알파가 아니라 리스크 필터"* 고지를 담고 있습니다.
 
@@ -167,7 +167,7 @@ MCP 클라이언트에 등록(`ABSOLUTE_PATH`를 clone 위치로 교체):
 | `list_bots` / `get_bot_status` | 봇 목록 / 포지션 + 최근 체결 + 로그 조회. |
 | `open_dashboard` | 로컬(127.0.0.1) 실시간 HTML 대시보드 실행. |
 
-### 🔐 라이브 거래 — BYOK(키 직접 보유) (7)
+### 🔐 라이브 거래 — BYOK(키 직접 보유) (9)
 
 | 툴 | 설명 |
 |---|---|
@@ -177,6 +177,8 @@ MCP 클라이언트에 등록(`ABSOLUTE_PATH`를 clone 위치로 교체):
 | `place_protective` | 현물 롱에 상주 **OCO**(익절+손절, 한쪽 체결 시 다른쪽 자동취소) — 동일 fail-closed 2단계 토큰; 서버가 실보유수량/방향/노셔널 재검증. 봇 다운/봉 사이에도 거래소가 손절 유지. |
 | `get_protective` | 심볼의 상주 OCO + 매도가능(free) 잔고 조회 — 세션 간 복원/중복등록 방지용. 읽기전용, 키 미노출. |
 | `cancel_protective` | `orderListId`(get_protective 반환)로 상주 OCO 취소 — liveGate 경유 + audit. |
+| `get_open_orders` | 심볼의 미체결(상주) 주문 목록 — 지정가 잔존·고아 주문 점검(읽기전용, 현재 Binance만). |
+| `get_order_status` | `orderId`/`clientOrderId`로 주문 상태 역쿼리 — 주문 후 체결 검증(읽기전용). |
 
 > **기본은 페이퍼.** 키와 마스터 스위치를 둘 다 설정해야 라이브가 켜집니다. 메인넷은 testnet 검증 뒤에만 게이트가 열립니다.
 
@@ -284,7 +286,7 @@ src/store/        node:sqlite 로컬 스토어(봇, 전략, 거래, 로그)
 src/runner/       페이퍼/라이브 봇 러너(백테스트 엔진 재사용 → backtest≡live)
 src/dashboard/    127.0.0.1 실시간 HTML 대시보드
 src/brokers/      멀티브로커 어댑터(바이낸스 + 한국투자/KIS + 키움) + 안전 게이트
-src/mcp-server/   stdio MCP 서버 + 25개 툴
+src/mcp-server/   stdio MCP 서버 + 27개 툴
 ```
 
 **설계 원칙:** 라이브 러너가 `runCompositeBacktest`를 *재사용*합니다. 그래서 조건 타입 추가 = 정확히 3개 파일(types + validation + engine) 수정이면 라이브가 자동 상속 — backtest ≡ live가 구조적으로 보장됩니다.
@@ -294,7 +296,7 @@ src/mcp-server/   stdio MCP 서버 + 25개 툴
 ## 로드맵
 
 - ✅ 이식 가능한 코어 + 키 없는 바이낸스 데이터
-- ✅ MCP 서버 + 25개 툴(분석, 스크리닝, 포트폴리오, 이벤트, 봇, 라이브 BYOK)
+- ✅ MCP 서버 + 27개 툴(분석, 스크리닝, 포트폴리오, 이벤트, 봇, 라이브 BYOK)
 - ✅ 전략 표현력: indicator/time/regime/anchor/spread/MTF/event 조건 + 스캐너 노드
 - ✅ 포지션 관리: SL/TP, TP 라더, 스케일인, 피라미딩, 트레일링, 숏/선물
 - ✅ 페이퍼 봇 러너 + 실시간 대시보드

@@ -160,6 +160,18 @@ export function buildServer(): McpServer {
     inputSchema: S.getProtectiveShape, annotations: { readOnlyHint: true },
   }, guard((a) => L.getProtective(a as Parameters<typeof L.getProtective>[0])));
 
+  server.registerTool("get_open_orders", {
+    title: "미체결 주문 조회(BYOK)",
+    description: `심볼의 미체결(상주) 주문 목록 — 지정가 잔존·고아 주문 점검(audit P1-16). 읽기전용. 현재 Binance만(KIS/키움 후속). ${DISCLAIMER}`,
+    inputSchema: S.getOpenOrdersShape, annotations: { readOnlyHint: true },
+  }, guard((a) => L.getOpenOrders(a as Parameters<typeof L.getOpenOrders>[0])));
+
+  server.registerTool("get_order_status", {
+    title: "주문 상태 역쿼리(BYOK)",
+    description: `orderId(place_order 결과) 또는 clientOrderId로 주문의 체결/미체결/거부 상태 재확인 — 에이전트가 주문 후 체결을 검증할 수 있다(audit P1-16). 읽기전용. ${DISCLAIMER}`,
+    inputSchema: S.getOrderStatusShape, annotations: { readOnlyHint: true },
+  }, guard((a) => L.getOrderStatus(a as Parameters<typeof L.getOrderStatus>[0])));
+
   server.registerTool("cancel_protective", {
     title: "보호주문 OCO 취소(BYOK)",
     description: `orderListId로 상주 OCO 취소(get_protective가 반환). liveGate 경유 + audit. 취소 후 재등록 가능. ${DISCLAIMER}`,
@@ -181,7 +193,7 @@ async function main() {
   const shutdown = () => { runner().shutdown(); process.exit(0); };
   process.on("SIGINT", shutdown); process.on("SIGTERM", shutdown);
   // stdio 서버는 stdout=프로토콜 채널 → 로그는 stderr로.
-  process.stderr.write("quant-mcp server ready (stdio) — 25 tools (8 analysis + scan_universe + allocate_portfolio + list_events + 7 bot + 7 live). paper mode. risk filter, not alpha source.\n");
+  process.stderr.write("quant-mcp server ready (stdio) — 27 tools (8 analysis + scan_universe + allocate_portfolio + list_events + 7 bot + 9 live). paper mode. risk filter, not alpha source.\n");
 }
 
 // 직접 실행 시에만 기동(테스트 import 시엔 buildServer만 사용).

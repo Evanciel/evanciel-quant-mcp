@@ -20,7 +20,7 @@ import * as store from "../store/db.js";
 import { BROKER_FIELDS, upsertCredentials, credentialStatus, credentialsPath, enableLive, disableLive, liveSettingsStatus, type BrokerKey } from "../setup/credentials.js";
 import { fetchKlines } from "../data/binance-public.js";
 import { getAdapter } from "../brokers/index.js";
-import { placeOrder, placeProtective, cancelProtective, getProtective, getAccount } from "../mcp-server/live-handlers.js"; // 수동주문·OCO보호주문·실계정조회 — 안전경로 재사용
+import { placeOrder, placeProtective, cancelProtective, getProtective, getAccount, getOpenOrders, getOrderStatus, cancelOrderById } from "../mcp-server/live-handlers.js"; // 수동주문·OCO보호주문·실계정조회·미체결조회/취소 — 안전경로 재사용
 import { computePositionDrift } from "../core/execution/reconcile.js"; // 페이퍼 vs 거래소 실보유 드리프트(정보용)
 import { detectAlerts, Debouncer, AlertBuffer, type BotAlertView } from "../core/alerts/alerts.js"; // 봇 이벤트 알림 엔진(순수)
 import { sendWebhook, validateWebhookUrl } from "../core/alerts/webhook.js"; // Slack/Discord 배달(SSRF 게이트)
@@ -64,6 +64,37 @@ function toBotViews(bots: ReturnType<typeof snapshot>["bots"]): BotAlertView[] {
 }
 
 /** 5초마다 봇 상태를 비교해 알림 생성 → 버퍼 적재 + (활성 시)디바운스된 웹훅 발사. */
+// ── 수동 주문 체결 추적(audit P1-20): /api/order 확정(pending=지정가 접수) 시 등록 → 30s 폴링 →
+//    체결/취소를 알림 피드+웹훅으로 통지. 추적 미지원 브로커(KR — getOrderById 미구현)는 등록 시점에 제외.
+interface ManualOrderTrack { broker: Broker; market: "spot" | "futures"; symbol: string; orderId: string; side: string; at: number }
+const _manualOrders: ManualOrderTrack[] = [];
+const MANUAL_MAX_AGE_MS = 48 * 3600_000; // 48h 지나면 추적 포기(메모리 누수 방지)
+let _manualTimer: ReturnType<typeof setInterval> | null = null;
+
+function pushManualAlert(level: "info" | "warn", message: string): void {
+  const ev = { id: `manual-${Date.now()}-${Math.floor(Math.random() * 1e6)}`, ts: new Date().toISOString(), level, kind: "manual_order", message } as const;
+  _alertBuf.push([ev]);
+  const enabled = (process.env.ALERT_ENABLED ?? "").trim() === "true";
+  const url = (process.env.ALERT_WEBHOOK_URL ?? "").trim();
+  if (enabled && url) void sendWebhook(url, [ev]).catch(() => {});
+}
+
+async function manualOrderTick(): Promise<void> {
+  for (const mo of [..._manualOrders]) {
+    const drop = () => { const i = _manualOrders.indexOf(mo); if (i >= 0) _manualOrders.splice(i, 1); };
+    if (Date.now() - mo.at > MANUAL_MAX_AGE_MS) { drop(); continue; }
+    try {
+      const r = await getOrderStatus({ broker: mo.broker, market: mo.market, symbol: mo.symbol, orderId: mo.orderId });
+      if (!r.ok) { drop(); continue; }                 // 역쿼리 미지원/키 제거 → 추적 포기(스팸 방지)
+      if (!("found" in r) || !r.found || !r.order) { drop(); continue; } // 거래소에 없음(만료 정리 등)
+      const o = r.order as { status: string; price: number; executedQty?: number; quantity: number };
+      if (o.status === "filled") { pushManualAlert("info", `✅ 수동 ${mo.side === "buy" ? "매수" : "매도"} 체결: ${mo.symbol} ${o.executedQty || o.quantity} @ ${o.price} (주문 ${mo.orderId})`); drop(); }
+      else if (o.status === "rejected") { pushManualAlert("warn", `수동 주문 종료(취소/거부): ${mo.symbol} ${mo.side} 주문 ${mo.orderId}`); drop(); }
+      // pending → 유지(다음 폴)
+    } catch { /* 일시 오류 — 다음 폴 재시도 */ }
+  }
+}
+
 async function alertTick(): Promise<void> {
   try {
     const views = toBotViews(snapshot().bots);
@@ -766,6 +797,58 @@ export function startDashboard(port = 7788): Promise<{ url: string; port: number
         if (type === "limit" && !(price && price > 0)) return fail(400, "지정가 주문은 price>0 필요");
         // 서버는 클라가 보낸 가격/노셔널/env를 신뢰하지 않음 — placeOrder가 getPrice 재계산+checkLimits+게이트 강제.
         const r = await placeOrder({ broker, market, symbol, side, type, quantity, price, confirmToken });
+        // 지정가 접수(pending) 확정 시 체결 추적 등록(P1-20) — 30s 폴링으로 체결/취소 알림.
+        const rr = r as { ok?: boolean; phase?: string; result?: { orderId?: string; status?: string } };
+        if (rr.ok && rr.phase === "executed" && rr.result?.orderId && rr.result.status === "pending") {
+          _manualOrders.push({ broker, market, symbol, orderId: String(rr.result.orderId), side, at: Date.now() });
+        }
+        res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify(r));
+      }).catch((e) => { res.writeHead(400, { "content-type": "application/json" }); res.end(JSON.stringify({ ok: false, error: e instanceof Error ? e.message : "bad request" })); });
+      return;
+    }
+    if (u.pathname === "/api/trades") {
+      // 전 봇 체결 내역(audit P1-18). 기간 필터: ?days=1|7|30 (미지정=전체, 최대 500건).
+      if (req.method !== "GET") { res.writeHead(405).end("method not allowed"); return; }
+      const days = parseInt(u.searchParams.get("days") || "", 10);
+      const since = Number.isFinite(days) && days > 0 ? new Date(Date.now() - days * 86400_000).toISOString() : undefined;
+      try {
+        const trades = store.listTradesAll(500, since);
+        res.writeHead(200, { "content-type": "application/json" });
+        // 정직 고지: 수수료는 체결 응답에 미수집(거래소 명세서가 권위) — fee 열 없음.
+        res.end(JSON.stringify({ ok: true, trades, note: "수수료는 미수집(거래소 명세서 참조). pnl=평단 대비 실현손익." }));
+      } catch (e) { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify({ ok: false, error: e instanceof Error ? e.message : "err" })); }
+      return;
+    }
+    if (u.pathname === "/api/orders") {
+      // 미체결(상주) 주문 목록(audit P1-19). 봇 종목 + 수동주문 추적 종목을 합쳐 조회. 현재 Binance만(KR은 미지원 표기).
+      if (req.method !== "GET") { res.writeHead(405).end("method not allowed"); return; }
+      const bk = (u.searchParams.get("broker") || "binance") as Broker;
+      (async () => {
+        const market: "spot" | "futures" = "spot";
+        const syms = new Set<string>(store.listBots().filter((b) => b.broker === bk && !((store.getComposite(b.composite_strategy_id)?.root_node as { type?: string })?.type === "scanner")).map((b) => b.symbol.toUpperCase()));
+        for (const mo of _manualOrders) if (mo.broker === bk) syms.add(mo.symbol.toUpperCase());
+        const orders: unknown[] = []; let unsupported: string | null = null;
+        for (const sym of syms) {
+          const r = await getOpenOrders({ broker: bk, market, symbol: sym });
+          if (!r.ok) { unsupported = (r as { error?: string }).error ?? "조회 실패"; continue; }
+          for (const o of (r as { orders: { orderId: string; side: string; quantity: number; price: number; status: string; timestamp: unknown }[] }).orders) {
+            orders.push({ ...o, symbol: sym, broker: bk });
+          }
+        }
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true, broker: bk, orders, tracking: _manualOrders.length, unsupported }));
+      })().catch((e) => { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify({ ok: false, error: e instanceof Error ? e.message : "err" })); });
+      return;
+    }
+    if (u.pathname === "/api/orders/cancel") {
+      // 미체결 주문 개별 취소(audit P1-19) — live-handlers.cancelOrderById(감사로그 포함) 경유.
+      if (req.method !== "POST") { res.writeHead(405).end("method not allowed"); return; }
+      readJsonBody(req).then(async (body) => {
+        const broker = (typeof body.broker === "string" ? body.broker : "binance") as Broker;
+        const symbol = typeof body.symbol === "string" ? body.symbol.trim() : "";
+        const orderId = typeof body.orderId === "string" || typeof body.orderId === "number" ? String(body.orderId) : "";
+        if (!symbol || !orderId) { res.writeHead(400, { "content-type": "application/json" }); res.end(JSON.stringify({ ok: false, error: "symbol·orderId 필요" })); return; }
+        const r = await cancelOrderById({ broker, market: "spot", symbol, orderId });
         res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify(r));
       }).catch((e) => { res.writeHead(400, { "content-type": "application/json" }); res.end(JSON.stringify({ ok: false, error: e instanceof Error ? e.message : "bad request" })); });
       return;
@@ -822,6 +905,7 @@ export function startDashboard(port = 7788): Promise<{ url: string; port: number
       _state = { url, port: actualPort, token };
       _server = server;
       if (!_alertTimer) { _prevBotViews = toBotViews(snapshot().bots); _alertTimer = setInterval(() => { void alertTick(); }, 5000); _alertTimer.unref?.(); } // 알림 엔진 시동(기준선 선적재)
+      if (!_manualTimer) { _manualTimer = setInterval(() => { void manualOrderTick(); }, 30_000); _manualTimer.unref?.(); } // 수동주문 체결 추적(P1-20)
       resolve({ url, port: actualPort });
     });
   });
@@ -891,6 +975,8 @@ h1{font-size:18px;margin:0 0 2px}.sub{color:#8a94a6;font-size:12px;margin-bottom
 .sect-m{font-size:12px;color:#c9d2e3;text-align:right}
 @media(max-width:560px){.sect{flex-direction:column;gap:2px;align-items:flex-start}.sect-m{text-align:left}}
 .tfbar{display:flex;gap:6px;margin:2px 0 10px;flex-wrap:wrap}
+.htbl{width:100%;border-collapse:collapse;font-size:12px}.htbl th{color:#8a94a6;font-weight:600;text-align:left;padding:6px 8px;border-bottom:1px solid #222838;position:sticky;top:0;background:#141925}.htbl td{padding:6px 8px;border-bottom:1px solid #1a2030}
+.hsel{margin-left:auto;background:#0e1320;border:1px solid #222838;border-radius:6px;color:#e6e6e6;padding:4px 8px;font:12px system-ui,sans-serif}
 .tfb{font-size:12px;color:#8a94a6;background:#0e1320;border:1px solid #222838;border-radius:6px;padding:4px 10px;cursor:pointer;user-select:none}
 .tfb:hover{color:#e6e6e6}.tfb.on{background:#7aa2f7;color:#0b0e14;border-color:#7aa2f7;font-weight:700}
 .indbar{display:flex;gap:5px;margin:0 0 10px;flex-wrap:wrap;align-items:center}
@@ -931,6 +1017,7 @@ h1{font-size:18px;margin:0 0 2px}.sub{color:#8a94a6;font-size:12px;margin-bottom
 <h1>내 자동매매 현황 <span class="dot"></span></h1>
 <div class="sub">봇이 알아서 사고팔아요 · 실시간 시세 반영 <span id="upd" style="color:#8a94a6">—</span>
   <span class="gear" onclick="openManualOrder()">✋ 수동 주문</span>
+  <span class="gear" onclick="openHist()">📋 주문/체결</span>
   <span class="gear" onclick="toggleSettings()">⚙️ API 키 설정</span></div>
 <div class="card setpanel" id="setpanel" style="display:none">
   <div class="row"><div><b>거래소 API 키 입력</b> <span class="hint">실거래/모의거래를 하려면 키가 필요해요</span></div>
@@ -964,6 +1051,12 @@ h1{font-size:18px;margin:0 0 2px}.sub{color:#8a94a6;font-size:12px;margin-bottom
   <div class="cmhead"><b id="orderTitle">주문</b><span class="cmx" onclick="closeOrder()">닫기 ✕</span></div>
   <div id="orderBody"></div>
   <div class="setmsg" id="orderMsg"></div>
+</div></div>
+<div class="cmodal" id="histModal"><div class="cmbox" style="width:min(720px,96vw)">
+  <div class="cmhead"><b>📋 주문/체결</b><span class="cmx" onclick="closeHist()">닫기 ✕</span></div>
+  <div class="tfbar" id="histTabs"></div>
+  <div id="histBody" style="max-height:62vh;overflow:auto"></div>
+  <div class="setmsg" id="histMsg"></div>
 </div></div>
 <script>
 let bots=[];const prices=new Map();let ws=null;var accounts={};var realAccounts={}; // realAccounts[broker]=거래소 실계정 스냅샷(getAccount)
@@ -1309,6 +1402,48 @@ function cancelProtect(){if(!_protect)return;var msg=document.getElementById('pr
    if(d.ok){_protect.active=false;_protect.orderListId=null;msg.style.color='#10b981';msg.textContent='보호주문이 취소됐어요.';renderProtectBar();}
    else{msg.style.color='#f43f5e';msg.textContent='취소 실패: '+(d.error||'알 수 없음');}
   }).catch(function(e){msg.style.color='#f43f5e';msg.textContent='실패: '+e.message;});}
+// ── 주문/체결 내역 모달(audit P1-18/19): 체결 내역(전 봇) + 미체결 주문(조회·취소) ──
+var _histTab='trades';var _histDays=7;var _histBroker='binance';
+function openHist(){document.getElementById('histModal').style.display='flex';renderHistTabs();loadHist();}
+function closeHist(){document.getElementById('histModal').style.display='none';}
+function setHistTab(t){_histTab=t;renderHistTabs();loadHist();}
+function renderHistTabs(){var el=document.getElementById('histTabs');
+ el.innerHTML='<span class="tfb'+(_histTab==='trades'?' on':'')+'" data-t="trades" onclick="setHistTab(this.dataset.t)">체결 내역</span>'+
+  '<span class="tfb'+(_histTab==='orders'?' on':'')+'" data-t="orders" onclick="setHistTab(this.dataset.t)">미체결 주문</span>'+
+  (_histTab==='trades'
+   ?'<select class="hsel" onchange="_histDays=Number(this.value);loadHist()">'+[[1,'오늘'],[7,'7일'],[30,'30일'],[0,'전체']].map(function(o){return '<option value="'+o[0]+'"'+(_histDays===o[0]?' selected':'')+'>'+o[1]+'</option>'}).join('')+'</select>'
+   :'<select class="hsel" onchange="_histBroker=this.value;loadHist()">'+['binance','kiwoom','kis'].map(function(b){return '<option value="'+b+'"'+(_histBroker===b?' selected':'')+'>'+esc(brokerLabel(b))+'</option>'}).join('')+'</select>');}
+function loadHist(){var body=document.getElementById('histBody');var msg=document.getElementById('histMsg');msg.textContent='';body.innerHTML='<div class="hint" style="padding:12px">불러오는 중…</div>';
+ if(_histTab==='trades'){
+  fetch('/api/trades'+(_histDays>0?'?days='+_histDays:'')).then(function(r){return r.json()}).then(function(d){
+   if(!d.ok){body.innerHTML='';msg.className='setmsg err';msg.textContent='오류: '+(d.error||'');return;}
+   if(!d.trades.length){body.innerHTML='<div class="hint" style="padding:12px">기간 내 체결 없음</div>';return;}
+   var rows=d.trades.map(function(t){var ccy=/^\d{6}$/.test(String(t.symbol||''))?'KRW':'USD';
+    return '<tr><td>'+esc(String(t.ts).slice(0,16).replace('T',' '))+'</td><td>'+esc(t.bot_name||'-')+'</td><td>'+esc(coin(t.symbol||''))+'</td>'+
+     '<td class="'+(t.side==='buy'?'up':'dn')+'">'+(t.side==='buy'?'매수':'매도')+(t.is_paper?'':' <b>실</b>')+'</td>'+
+     '<td style="text-align:right">'+fmt(t.qty,4)+'</td><td style="text-align:right">'+fmt(t.price,ccy==='KRW'?0:2)+'</td>'+
+     '<td style="text-align:right" class="'+(t.pnl>=0?'up':'dn')+'">'+(t.side==='sell'?signed(t.pnl,ccy):'-')+'</td><td class="hint">'+esc(t.reason||'')+'</td></tr>';}).join('');
+   body.innerHTML='<table class="htbl"><thead><tr><th>시각</th><th>봇</th><th>종목</th><th>방향</th><th>수량</th><th>가격</th><th>실현손익</th><th>사유</th></tr></thead><tbody>'+rows+'</tbody></table>'+
+    '<div class="hint" style="padding:8px 12px">'+esc(d.note||'')+' 수동 주문 체결은 🔔 알림으로 통지돼요(봇 체결만 이 표에 기록).</div>';
+  }).catch(function(e){body.innerHTML='';msg.className='setmsg err';msg.textContent='실패: '+e.message;});
+ }else{
+  fetch('/api/orders?broker='+encodeURIComponent(_histBroker)).then(function(r){return r.json()}).then(function(d){
+   if(!d.ok){body.innerHTML='';msg.className='setmsg err';msg.textContent='오류: '+(d.error||'');return;}
+   var un=d.unsupported?'<div class="setmsg err" style="padding:8px 12px">'+esc(d.unsupported)+'</div>':'';
+   if(!d.orders.length){body.innerHTML=un+'<div class="hint" style="padding:12px">미체결 주문 없음'+(d.tracking?' · 체결 추적 중 '+d.tracking+'건':'')+'</div>';return;}
+   var rows=d.orders.map(function(o){
+    return '<tr><td>'+esc(coin(o.symbol))+'</td><td class="'+(o.side==='buy'?'up':'dn')+'">'+(o.side==='buy'?'매수':'매도')+'</td>'+
+     '<td style="text-align:right">'+fmt(o.quantity,4)+'</td><td style="text-align:right">'+fmt(o.price,2)+'</td><td>'+esc(o.status)+'</td>'+
+     '<td><span class="obtn sell" data-sym="'+esc(o.symbol)+'" data-oid="'+esc(o.orderId)+'" onclick="cancelOpenOrder(this)">취소</span></td></tr>';}).join('');
+   body.innerHTML=un+'<table class="htbl"><thead><tr><th>종목</th><th>방향</th><th>수량</th><th>가격</th><th>상태</th><th></th></tr></thead><tbody>'+rows+'</tbody></table>';
+  }).catch(function(e){body.innerHTML='';msg.className='setmsg err';msg.textContent='실패: '+e.message;});
+ }}
+function cancelOpenOrder(el){var msg=document.getElementById('histMsg');msg.className='setmsg';msg.textContent='취소 중…';
+ fetch('/api/orders/cancel',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({broker:_histBroker,symbol:el.dataset.sym,orderId:el.dataset.oid})})
+  .then(function(r){return r.json()}).then(function(d){
+   if(d.ok&&d.cancelled){msg.className='setmsg ok';msg.textContent='취소됐어요.';loadHist();}
+   else{msg.className='setmsg err';msg.textContent='취소 실패: '+(d.error||d.note||'이미 체결/취소됐을 수 있어요');loadHist();}
+  }).catch(function(e){msg.className='setmsg err';msg.textContent='실패: '+e.message;});}
 // ── 수동 주문(2단계: 미리보기→확정). 모든 안전판정은 서버 placeOrder가 수행, 클라는 입력·표시만. ──
 var _order=null; // {broker,market,symbol,ccy,side,quantity,type,price,confirmToken}
 function envBadge(env){var live=env==='live';return '<span class="envb '+(live?'live':'safe')+'">'+(live?'⚠ 실거래(LIVE)':String(env||'testnet').toUpperCase()+' 모의')+'</span>';}
@@ -1367,7 +1502,7 @@ function submitOrder(){if(!_order)return;var msg=document.getElementById('orderM
 function confirmOrder(){if(!_order||!_order.confirmToken)return;var msg=document.getElementById('orderMsg');msg.className='setmsg';msg.textContent='주문 전송 중…';
  fetch('/api/order',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({broker:_order.broker,market:_order.market,symbol:_order.symbol,side:_order.side,type:_order.type,quantity:_order.quantity,price:_order.price,confirmToken:_order.confirmToken})})
   .then(function(r){return r.json()}).then(function(d){
-   if(d.ok&&d.phase==='executed'){msg.className='setmsg ok';msg.textContent='✅ 주문 완료 ('+esc(d.env)+') · 주문번호 '+esc((d.result&&d.result.orderId)||'-');loadBalances();}
+   if(d.ok&&d.phase==='executed'){msg.className='setmsg ok';var pend=d.result&&d.result.status==='pending';msg.textContent='✅ 주문 '+(pend?'접수':'완료')+' ('+esc(d.env)+') · 주문번호 '+esc((d.result&&d.result.orderId)||'-')+(pend?' — 미체결 지정가는 📋 주문/체결에서 확인·취소, 체결되면 🔔 알림':'');loadBalances();}
    else{msg.className='setmsg err';msg.textContent='실패: '+(d.error||'알 수 없음')+' — 미리보기부터 다시 하세요.';_order.confirmToken=null;
     document.getElementById('orderBody').innerHTML=_order.manual?manualFormBody(_order):orderFormBody(_order.side,_order.quantity);} // 입력 폼 복원(막다른 골목 방지) — 수동주문은 브로커·종목까지 프리필
   }).catch(function(e){msg.className='setmsg err';msg.textContent='실패: '+e.message;});}
