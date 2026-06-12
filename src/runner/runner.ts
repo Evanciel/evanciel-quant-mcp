@@ -24,7 +24,11 @@ import { floorQty, quantizeQty } from "../core/position/qty.js";
 import type { PortfolioPosition } from "../core/risk/portfolio.js";
 
 /** 보호주문 동기화 연속 실패 한도 — 도달 시 비상 청산(fail-closed). 손절 없는 나체 라이브 포지션 방치 금지(P0-2). */
-const PROTECTIVE_MAX_FAILS = 3;
+// 보호주문 연속실패 한도(audit P1-9: env 조정 가능, 1..10 클램프, 기본 3). interval×한도 = 최대 나체 노출 시간.
+const PROTECTIVE_MAX_FAILS = (() => {
+  const n = parseInt((process.env.LIVE_PROTECTIVE_FAIL_LIMIT || "").trim(), 10);
+  return Number.isFinite(n) && n >= 1 && n <= 10 ? n : 3;
+})();
 
 /** reconcile 가짜보유 정정 한도(연속 거래소 부재 틱). 키움 지연체결로 방금 산 정상 포지션이 거래소에 잠시
  *  안 떠 빈배열로 보일 수 있어(adopt의 대칭 위험), 빈배열 1회를 곧장 '가짜보유'로 단정해 오삭제하지 않는다.
@@ -206,8 +210,8 @@ const krProtectiveWarned = new Set<string>();
  * posQty 0이면 desired=[] → 전부 취소(청산 정리). 트레일링은 peakPrice로 stopPrice 갱신 → 옛 주문 취소+새 주문.
  * 실패는 삼키지 않고 failed 수를 반환(P0-2) — 호출측이 연속 실패를 집계해 비상 청산으로 에스컬레이션.
  */
-async function syncBotProtective(bot: store.BotRow, posLive: boolean, symbol: string, posQty: number, entryAvg: number, peakPrice: number, risk: RiskCfg, restingIds: string[]): Promise<{ ids: string[]; failed: number }> {
-  if (!posLive) return { ids: restingIds, failed: 0 }; // 페이퍼 채널 → 보호주문 없음(엔진이 시뮬레이트)
+async function syncBotProtective(bot: store.BotRow, posLive: boolean, symbol: string, posQty: number, entryAvg: number, peakPrice: number, risk: RiskCfg, restingIds: string[]): Promise<{ ids: string[]; failed: number; slFailed: boolean }> {
+  if (!posLive) return { ids: restingIds, failed: 0, slFailed: false }; // 페이퍼 채널 → 보호주문 없음(엔진이 시뮬레이트)
   // KR 브로커(KIS/키움)는 거래소 상주 SL/TP 미지원(audit P0-3). 어댑터가 protective 타입을 명시 거절하므로
   // 시도 자체를 스킵 — 시도하면 매 틱 실패 집계 → PROTECTIVE_MAX_FAILS 비상청산 오발동. 경고는 봇당 1회(스팸 금지).
   // KR 포지션의 SL/TP는 봇 폴링 평가(소프트스톱)가 수행한다(봇 다운 시 손절 공백 — 문서·로그로 정직 고지).
@@ -216,25 +220,26 @@ async function syncBotProtective(bot: store.BotRow, posLive: boolean, symbol: st
       krProtectiveWarned.add(bot.id);
       store.insertLog(bot.id, "gate", `KR 브로커(${bot.broker})는 거래소 상주 보호주문(SL/TP) 미지원 — 봇 폴링 평가로만 손절/익절 동작. 봇/프로세스 다운 시 손절 공백(audit P0-3).`);
     }
-    return { ids: restingIds, failed: 0 };
+    return { ids: restingIds, failed: 0, slFailed: false };
   }
   const live = liveAdapterFor(bot);
   if (!live) {
     // 라이브 채널 포지션인데 게이트/어댑터 불가 = 보호 불능. 침묵하지 않고 실패로 집계(에스컬레이션 대상).
     if (posQty > 1e-9) store.insertLog(bot.id, "error", `상주 보호주문 불가(게이트/어댑터) — 라이브 포지션 ${symbol} 보호 없음`);
-    return { ids: restingIds, failed: posQty > 1e-9 ? 1 : 0 };
+    return { ids: restingIds, failed: posQty > 1e-9 ? 1 : 0, slFailed: posQty > 1e-9 }; // 어댑터 불능 = SL도 못 건 상태
   }
   const adapter = live.adapter as { placeOrder: (o: unknown) => Promise<{ orderId: string }>; cancelOrderByClientId?: (s: string, c: string) => Promise<boolean>; normalizeQuantity?: (s: string, q: number, p: number) => Promise<number> };
   const desired = posQty > 1e-9 && entryAvg > 0
     ? planProtectiveOrders({ botId: bot.id, symbol, positionSide: "long", qty: posQty, entryAvg, extremeSinceEntry: peakPrice, stopLossPercent: risk.stopLossPercent, takeProfitPercent: risk.takeProfitPercent, trailingStopPercent: risk.trailingStopPercent })
     : [];
+  let slFailed = false; // 손절(SL) leg 배치 실패 추적(audit P1-4) — TP만 걸리고 SL 없는 '편다리 보호'가 최악
   const res = await syncProtective(
     desired, restingIds,
-    async (o) => { try { const nq = adapter.normalizeQuantity ? await adapter.normalizeQuantity(symbol, o.quantity, o.stopPrice) : o.quantity; await adapter.placeOrder({ symbol, side: o.side, type: o.type, quantity: nq, stopPrice: o.stopPrice, reduceOnly: o.reduceOnly, clientOrderId: o.clientOrderId }); return o.clientOrderId; } catch (e) { store.insertLog(bot.id, "error", `보호주문 배치 실패(${o.kind} @${o.stopPrice}): ${e instanceof Error ? e.message : e}`); return null; } },
+    async (o) => { try { const nq = adapter.normalizeQuantity ? await adapter.normalizeQuantity(symbol, o.quantity, o.stopPrice) : o.quantity; await adapter.placeOrder({ symbol, side: o.side, type: o.type, quantity: nq, stopPrice: o.stopPrice, reduceOnly: o.reduceOnly, clientOrderId: o.clientOrderId }); return o.clientOrderId; } catch (e) { if (o.kind === "stop_loss") slFailed = true; store.insertLog(bot.id, "error", `보호주문 배치 실패(${o.kind} @${o.stopPrice}): ${e instanceof Error ? e.message : e}`); return null; } },
     async (cid) => { try { return adapter.cancelOrderByClientId ? await adapter.cancelOrderByClientId(symbol, cid) : false; } catch { return false; } },
   );
   if (res.placed || res.cancelled) store.insertLog(bot.id, "live", `[${live.env}] 상주 보호주문 ${symbol}: 배치 ${res.placed} / 취소 ${res.cancelled}${res.failed ? ` / 실패 ${res.failed}` : ""}`);
-  return { ids: res.restingIds, failed: res.failed };
+  return { ids: res.restingIds, failed: res.failed, slFailed };
 }
 
 export interface PaperPosition {
@@ -636,7 +641,6 @@ export async function tickBot(botId: string): Promise<{ action: "buy" | "sell" |
     }
     const buyQty = gate.qty;                          // 캡 적용 후 실제 매수 델타(미설정=plan.qty 그대로)
     const scaled = buyQty < plan.qty;                 // MDD 디리스킹으로 축소됐는가
-    const actualWantQty = scaled ? curQty + buyQty : plan.wantQty; // 축소 시 실제 도달 넷(엔진 목표 아님 → 다음 틱 재매수 폭주 방지)
     // 신규 진입 또는 추가매수(스케일인/피라미딩). entryAvg는 엔진 가중평단(want.entryAvg)으로 갱신.
     //   채널: 신규 진입=미정(undefined → 라이브 시도, 명확실패만 페이퍼) / 추가매수=기존 포지션 채널 고정.
     const fill = await fillOrder(bot, "buy", buyQty, price, bot.symbol, { posLive: curQty > 1e-9 ? curLive : undefined, barIso: lastIso });
@@ -645,29 +649,35 @@ export async function tickBot(botId: string): Promise<{ action: "buy" | "sell" |
       store.setBotPositionState(botId, cur);
       return { action: "hold", detail: `라이브 매수 실패 — 동결(${fill.note})` };
     }
+    // 부분체결(audit P1-1): 장부는 '의도 수량'이 아니라 '실제 체결 수량'으로 기록 — 거래소 진실과 일치.
+    //   페이퍼는 전량 체결 가정(filledQty 부재 → buyQty). 라이브 부분체결이면 정직 고지(침묵 금지).
+    const gotQty = fill.live && fill.filledQty != null && fill.filledQty > 0 ? fill.filledQty : buyQty;
+    const partialFill = fill.live && gotQty < buyQty - 1e-12;
+    if (partialFill) store.insertLog(botId, "live", `⚠️ 부분체결: 매수 의도 ${buyQty} 중 ${gotQty}만 체결 — 장부는 체결분만 기록`);
+    const actualWantQty = (scaled || partialFill) ? curQty + gotQty : plan.wantQty; // 축소/부분체결 시 실제 도달 넷(다음 틱 재매수 폭주 방지)
     const reason = plan.partial ? "추가매수(스케일인/피라미딩)" : "전략 진입";
-    // 평단: 미축소면 엔진 가중평단 그대로(기존 동작 동일). 축소면 기존보유+부분추가의 가중평균(엔진 목표 미도달이라 직접 산출).
-    const entryAvg = scaled
-      ? (curQty + buyQty > 0 ? (curQty * (cur?.entryAvg ?? fill.price) + buyQty * fill.price) / (curQty + buyQty) : fill.price)
+    // 평단: 미축소·전량체결이면 엔진 가중평단 그대로(기존 동작 동일). 축소/부분체결이면 기존보유+실체결분의 가중평균.
+    const entryAvg = (scaled || partialFill)
+      ? (curQty + gotQty > 0 ? (curQty * (cur?.entryAvg ?? fill.price) + gotQty * fill.price) / (curQty + gotQty) : fill.price)
       : (want.entryAvg > 0 ? want.entryAvg : fill.price);
     const peakPrice = Math.max(cur?.peakPrice ?? entryAvg, price);
     const nextLive = curQty > 1e-9 ? curLive : fill.live; // 채널은 진입 체결로 고정(추가매수는 기존 채널 유지)
     const openedAt = cur?.openedAt ?? new Date().toISOString();
     // 체결 기록+장부 갱신 원자화(P1-21): 보호주문 동기화(async)는 tx 밖 후속 — 사이 크래시여도 장부는 이미 일관.
     const t = store.tx(() => {
-      const t0 = store.insertTrade({ bot_id: botId, side: "buy", price: fill.price, qty: buyQty, pnl: 0, is_paper: fill.live ? 0 : 1, reason, idempotency_key: idem("buy") });
+      const t0 = store.insertTrade({ bot_id: botId, side: "buy", price: fill.price, qty: gotQty, pnl: 0, is_paper: fill.live ? 0 : 1, reason, idempotency_key: idem("buy") });
       if (t0) store.setBotPositionState(botId, { status: "open", entryAvg, qty: actualWantQty, openedAt, live: nextLive, peakPrice, protectiveIds: cur?.protectiveIds ?? [], protFails: cur?.protFails ?? 0 } satisfies PaperPosition, true, true);
       return t0;
     });
     if (t) {
       // 라이브 채널: 거래소 상주 보호주문(SL/TP/트레일링) 배치/갱신. 페이퍼 채널: no-op(엔진이 시뮬레이트).
       const ps = await syncBotProtective(bot, nextLive, bot.symbol, actualWantQty, entryAvg, peakPrice, risk, cur?.protectiveIds ?? []);
-      const protFails = ps.failed > 0 ? (cur?.protFails ?? 0) + 1 : 0;
+      const protFails = nextProtFails(cur?.protFails, ps, (risk.stopLossPercent != null || risk.trailingStopPercent != null));
       if (ps.failed > 0) noteProtectiveFailure(botId, protFails);
       store.setBotPositionState(botId, { status: "open", entryAvg, qty: actualWantQty, openedAt, live: nextLive, peakPrice, protectiveIds: ps.ids, protFails } satisfies PaperPosition, true, true);
       const capNote = scaled ? ` [포트폴리오 캡 ×축소 ${plan.qty}→${buyQty}]` : "";
-      store.insertLog(botId, "buy", `[${fill.live ? "실거래" : "페이퍼"}] ${reason} +${buyQty} → 보유 ${actualWantQty} @ ${fill.price}(평단 ${entryAvg.toFixed(2)})${capNote}`);
-      return { action: "buy", detail: `${reason} +${buyQty} (보유 ${actualWantQty}, ${fill.note})${capNote}` };
+      store.insertLog(botId, "buy", `[${fill.live ? "실거래" : "페이퍼"}] ${reason} +${gotQty} → 보유 ${actualWantQty} @ ${fill.price}(평단 ${entryAvg.toFixed(2)})${capNote}`);
+      return { action: "buy", detail: `${reason} +${gotQty} (보유 ${actualWantQty}, ${fill.note})${capNote}` };
     }
     return { action: "hold", detail: "매수 중복 스킵" };
   }
@@ -682,25 +692,31 @@ export async function tickBot(botId: string): Promise<{ action: "buy" | "sell" |
       return { action: "hold", detail: `라이브 매도 실패 — 동결(${fill.note})` };
     }
     const refAvg = cur?.entryAvg ?? fill.price;
-    const realPnl = (fill.price - refAvg) * plan.qty;
+    // 부분체결(audit P1-1): 실현손익·잔여 수량을 '실제 체결분' 기준으로 — 의도수량 기록은 거래소와 발산.
+    const soldQty = fill.live && fill.filledQty != null && fill.filledQty > 0 ? fill.filledQty : plan.qty;
+    const partialSell = fill.live && soldQty < plan.qty - 1e-12;
+    if (partialSell) store.insertLog(botId, "live", `⚠️ 부분체결: 매도 의도 ${plan.qty} 중 ${soldQty}만 체결 — 잔여 보유 유지(다음 틱 재평가)`);
+    const remainQty = partialSell ? Math.max(0, curQty - soldQty) : plan.wantQty;
+    const stillOpen = remainQty > 1e-9;
+    const realPnl = (fill.price - refAvg) * soldQty;
     const reason = plan.partial ? "부분 익절(라더)" : "전략 청산";
-    const peakPrice = plan.partial ? Math.max(cur?.peakPrice ?? refAvg, price) : 0;
+    const peakPrice = stillOpen ? Math.max(cur?.peakPrice ?? refAvg, price) : 0;
     const openedAt = cur?.openedAt ?? new Date().toISOString();
     // 체결 기록+장부 갱신 원자화(P1-21). 보호주문 재동기화(async)는 tx 밖 후속(멱등 — clientOrderId 기준).
     const t = store.tx(() => {
-      const t0 = store.insertTrade({ bot_id: botId, side: "sell", price: fill.price, qty: plan.qty, pnl: realPnl, is_paper: fill.live ? 0 : 1, reason, idempotency_key: idem("sell") });
-      if (t0) store.setBotPositionState(botId, plan.partial ? { status: "open", entryAvg: refAvg, qty: plan.wantQty, openedAt, live: curLive, peakPrice, protectiveIds: cur?.protectiveIds ?? [], protFails: cur?.protFails ?? 0 } satisfies PaperPosition : null, true, true);
+      const t0 = store.insertTrade({ bot_id: botId, side: "sell", price: fill.price, qty: soldQty, pnl: realPnl, is_paper: fill.live ? 0 : 1, reason, idempotency_key: idem("sell") });
+      if (t0) store.setBotPositionState(botId, stillOpen ? { status: "open", entryAvg: refAvg, qty: remainQty, openedAt, live: curLive, peakPrice, protectiveIds: cur?.protectiveIds ?? [], protFails: cur?.protFails ?? 0 } satisfies PaperPosition : null, true, true);
       return t0;
     });
     if (t) {
       // 부분이면 줄어든 수량으로 보호주문 재동기화, 전량 청산이면 desired=[]→전부 취소(고아주문 0).
-      const ps = await syncBotProtective(bot, curLive, bot.symbol, plan.wantQty, refAvg, peakPrice, risk, cur?.protectiveIds ?? []);
-      const protFails = ps.failed > 0 ? (cur?.protFails ?? 0) + 1 : 0;
+      const ps = await syncBotProtective(bot, curLive, bot.symbol, remainQty, refAvg, peakPrice, risk, cur?.protectiveIds ?? []);
+      const protFails = nextProtFails(cur?.protFails, ps, (risk.stopLossPercent != null || risk.trailingStopPercent != null));
       if (ps.failed > 0) noteProtectiveFailure(botId, protFails);
-      const next: PaperPosition | null = plan.partial ? { status: "open", entryAvg: refAvg, qty: plan.wantQty, openedAt, live: curLive, peakPrice, protectiveIds: ps.ids, protFails } : null;
+      const next: PaperPosition | null = stillOpen ? { status: "open", entryAvg: refAvg, qty: remainQty, openedAt, live: curLive, peakPrice, protectiveIds: ps.ids, protFails } : null;
       store.setBotPositionState(botId, next, true, true);
-      store.insertLog(botId, "sell", `[${fill.live ? "실거래" : "페이퍼"}] ${reason} -${plan.qty} → 보유 ${plan.wantQty} @ ${fill.price} pnl=${realPnl.toFixed(2)}`);
-      return { action: "sell", detail: `${reason} -${plan.qty} (보유 ${plan.wantQty}, pnl=${realPnl.toFixed(2)}, ${fill.note})` };
+      store.insertLog(botId, "sell", `[${fill.live ? "실거래" : "페이퍼"}] ${reason} -${soldQty} → 보유 ${remainQty} @ ${fill.price} pnl=${realPnl.toFixed(2)}`);
+      return { action: "sell", detail: `${reason} -${soldQty} (보유 ${remainQty}, pnl=${realPnl.toFixed(2)}, ${fill.note})` };
     }
     return { action: "hold", detail: "매도 중복 스킵" };
   }
@@ -709,13 +725,23 @@ export async function tickBot(botId: string): Promise<{ action: "buy" | "sell" |
   if (curQty > 1e-9 && cur) {
     const peakPrice = Math.max(cur.peakPrice ?? cur.entryAvg, price);
     const ps = await syncBotProtective(bot, curLive, bot.symbol, curQty, cur.entryAvg, peakPrice, risk, cur.protectiveIds ?? []);
-    const protFails = ps.failed > 0 ? (cur.protFails ?? 0) + 1 : 0;
+    const protFails = nextProtFails(cur.protFails, ps, (risk.stopLossPercent != null || risk.trailingStopPercent != null));
     if (ps.failed > 0) noteProtectiveFailure(botId, protFails);
     store.setBotPositionState(botId, { ...cur, peakPrice, protectiveIds: ps.ids, protFails });
     return { action: "hold", detail: `보유중 ${curQty} @ ${price}` };
   }
   store.setBotPositionState(botId, cur);
   return { action: "hold", detail: `관망 @ ${price}` };
+}
+
+/**
+ * 보호주문 연속실패 카운터 갱신(audit P1-4/P1-9). 성공=0 리셋. SL leg 실패 + 손절 설정 포지션이면
+ * 한도로 즉시 점프 — 'TP만 걸리고 SL 없는 편다리'를 3틱(기본 180초) 들고 있지 않고 다음 틱에 비상 청산.
+ */
+function nextProtFails(prev: number | undefined, ps: { failed: number; slFailed: boolean }, hasStop: boolean): number {
+  if (ps.failed <= 0) return 0;
+  if (ps.slFailed && hasStop) return PROTECTIVE_MAX_FAILS;
+  return (prev ?? 0) + 1;
 }
 
 /** 보호주문 동기화 실패 기록(P0-2) — 연속 실패 수를 로그+감사. PROTECTIVE_MAX_FAILS 도달 시 다음 틱에 비상 청산. */

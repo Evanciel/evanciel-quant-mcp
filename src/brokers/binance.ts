@@ -24,7 +24,7 @@ import type {
   OrderRequest,
   OrderResult,
 } from "./types.js";
-import { BaseBrokerAdapter } from "./base.js";
+import { BaseBrokerAdapter, withRetry } from "./base.js";
 
 // ─────────────────── 거래소 응답 런타임 검증(Zod, fail-closed) ───────────────────
 // 머니패스 임계 응답(주문/체결/잔고/포지션)만 안전필드를 safeParse 한다. 목적: Binance가 HTTP 200 +
@@ -237,32 +237,38 @@ export class BinanceBrokerAdapter extends BaseBrokerAdapter {
     path: string,
     options?: { method?: string; signed?: boolean; params?: Record<string, string> },
   ): Promise<T> {
-    const params = new URLSearchParams(options?.params || {});
-
-    if (options?.signed) {
-      if (!this.apiKey) {
-        throw new Error("Binance API key가 설정되지 않았습니다.");
+    const method = options?.method || "GET";
+    const attempt = async (): Promise<T> => {
+      // 서명은 시도마다 새로(timestamp 신선도 — 재시도 시 stale timestamp로 -1021 나는 것 방지).
+      const params = new URLSearchParams(options?.params || {});
+      if (options?.signed) {
+        if (!this.apiKey) {
+          throw new Error("Binance API key가 설정되지 않았습니다.");
+        }
+        params.set("timestamp", Date.now().toString());
+        params.set("signature", this.sign(params.toString()));
       }
-      params.set("timestamp", Date.now().toString());
-      params.set("signature", this.sign(params.toString()));
-    }
-
-    const qs = params.toString();
-    const url = `${this.baseUrl}${path}${qs ? `?${qs}` : ""}`;
-
-    const res = await fetch(url, {
-      method: options?.method || "GET",
-      headers: { "X-MBX-APIKEY": this.apiKey },
-      signal: AbortSignal.timeout(TIMEOUT_MS),
-    });
-
-    if (!res.ok) {
-      // 본문에 Binance 에러 코드(-2013 등)가 들어오므로 reconcile 분기를 위해 포함하되,
-      // 서명/시크릿은 URL이 아닌 헤더·쿼리에만 있으므로 본문에는 노출되지 않는다.
-      const body = await res.text().catch(() => "");
-      throw new Error(`Binance API error: ${res.status} ${res.statusText} ${body}`.trim());
-    }
-    return (await res.json()) as T;
+      const qs = params.toString();
+      const url = `${this.baseUrl}${path}${qs ? `?${qs}` : ""}`;
+      const res = await fetch(url, {
+        method,
+        headers: { "X-MBX-APIKEY": this.apiKey },
+        signal: AbortSignal.timeout(TIMEOUT_MS),
+      });
+      if (!res.ok) {
+        // 본문에 Binance 에러 코드(-2013 등)가 들어오므로 reconcile 분기를 위해 포함하되,
+        // 서명/시크릿은 URL이 아닌 헤더·쿼리에만 있으므로 본문에는 노출되지 않는다.
+        // [http:N]/[retry-after:S] 마커: base.withRetry의 분류 근거(429/418/5xx 재시도, Retry-After 존중).
+        const body = await res.text().catch(() => "");
+        const retryAfter = res.headers.get("retry-after");
+        const markers = `[http:${res.status}]${retryAfter && /^\d+$/.test(retryAfter.trim()) ? ` [retry-after:${retryAfter.trim()}]` : ""}`;
+        throw new Error(`Binance API error: ${res.status} ${res.statusText} ${body} ${markers}`.trim());
+      }
+      return (await res.json()) as T;
+    };
+    // P1-3: GET(읽기, 멱등)만 transport 재시도 — 429/5xx/타임아웃에 지수백오프. POST/DELETE(주문·취소)는
+    //   첫 시도가 실제 반영됐을 수 있어 transport 재시도 금지(주문 재시도는 상위 clientOrderId reconcile 담당).
+    return method === "GET" ? withRetry(attempt) : attempt();
   }
 
   // ── 수량 정규화(LOT_SIZE / MIN_NOTIONAL) ──
@@ -548,10 +554,10 @@ export class BinanceBrokerAdapter extends BaseBrokerAdapter {
       params.newClientOrderId = o.clientOrderId;
     }
 
-    // 시장가는 체결 결과를 즉시 받는다(지정가는 미체결 NEW가 정상이라 미적용).
-    if (o.type === "market") {
-      params.newOrderRespType = "RESULT";
-    }
+    // 모든 주문 타입에 RESULT 응답 요청(status/executedQty 포함). 비-시장가의 기본 응답(ACK)엔 status가
+    // 없어 parseOrderAck가 fail-closed로 거부 → 현물 상주 스톱(STOP_LOSS) 배치가 전부 실패하던 실버그
+    // (2026-06-12 testnet E2E ③ 실측, Sprint 3에서 색출). RESULT는 모든 타입에서 지원되는 공식 파라미터.
+    params.newOrderRespType = "RESULT";
 
     const raw = await this.request<Record<string, unknown>>(this.paths.order, {
       method: "POST",
@@ -561,13 +567,23 @@ export class BinanceBrokerAdapter extends BaseBrokerAdapter {
     // fail-closed: 에러바디/형식변형/미지 상태는 여기서 throw → runner가 reconcile/동결(유령 pending 기록 차단).
     const data = parseOrderAck(raw, "주문");
 
+    const statusU = String(data.status ?? "").toUpperCase();
+    const executedQty = parseFloat(String(data.executedQty ?? "0"));
+    const origQty = parseFloat(String(data.origQty ?? o.quantity ?? 0));
+    let status = this.mapStatus(statusU);
+    // 부분체결 후 종료(audit P1-1): 시장가가 유동성 부족으로 일부만 체결되고 EXPIRED로 끝나면 체결분은 '사실'이다.
+    //   이를 rejected로 둔갑시키면 장부엔 0, 거래소엔 실보유 → 발산. 체결분>0인 종료 상태는 filled(부분)로 정직 반환.
+    if ((statusU === "EXPIRED" || statusU === "EXPIRED_IN_MATCH" || statusU === "CANCELED") && executedQty > 0) {
+      status = "filled";
+    }
     return {
       orderId: String(data.orderId ?? ""),
       symbol: o.symbol,
       side: o.side,
-      quantity: parseFloat(String(data.executedQty ?? o.quantity ?? 0)),
+      quantity: parseFloat(String(data.executedQty ?? o.quantity ?? 0)), // 기존 의미 유지(체결수량, 부재 시 요청수량)
+      executedQty, origQty, // 분리 노출(P1-1) — 호출측이 의도수량 대신 체결수량으로 장부 기록
       price: this.fillPriceFrom(data, o.type === "limit" ? Number(o.price ?? 0) : 0),
-      status: this.mapStatus(String(data.status ?? "")),
+      status,
       timestamp: new Date(Number(data.transactTime ?? data.updateTime ?? Date.now())),
     };
   }
@@ -604,6 +620,8 @@ export class BinanceBrokerAdapter extends BaseBrokerAdapter {
       symbol,
       side: String(ack.side ?? "").toUpperCase() === "SELL" ? "sell" : "buy",
       quantity: parseFloat(String(ack.executedQty ?? ack.origQty ?? "0")),
+      executedQty: parseFloat(String(ack.executedQty ?? "0")),
+      origQty: parseFloat(String(ack.origQty ?? "0")),
       price: this.fillPriceFrom(ack),
       status: this.mapStatus(String(ack.status ?? "")),
       timestamp: new Date(Number(ack.updateTime ?? ack.time ?? Date.now())),
@@ -702,6 +720,12 @@ export class BinanceBrokerAdapter extends BaseBrokerAdapter {
         timestamp: new Date(Number(ack.transactTime ?? Date.now())),
       };
     });
+    // 양다리 상태 검증(audit P1-4): leg가 REJECTED/CANCELED/EXPIRED면 '부분 성공 OCO'(편다리 보호) —
+    //   SL 없는 TP만 남는 케이스가 최악. 2-leg 존재만으론 부족, 거부 leg가 있으면 전체를 실패로 throw.
+    const badLeg = orders.find((o) => o.status === "rejected");
+    if (badLeg) {
+      throw new Error(`Binance OCO leg 거부(orderId=${badLeg.orderId || "?"}) — 부분 성공 OCO 금지(fail-closed). 양다리(NEW) 확인 실패.`);
+    }
     return { orderListId: listId, orders };
   }
 

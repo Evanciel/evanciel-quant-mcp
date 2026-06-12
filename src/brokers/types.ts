@@ -56,6 +56,10 @@ export interface OrderResult {
   price: number;
   status: "filled" | "pending" | "rejected";
   timestamp: Date;
+  /** 실제 체결 수량(부분체결 구분, audit P1-1). 미지원 브로커는 부재(quantity로 폴백). */
+  executedQty?: number;
+  /** 원 주문 수량. executedQty < origQty 면 부분체결. */
+  origQty?: number;
 }
 
 export interface MarketPrice {

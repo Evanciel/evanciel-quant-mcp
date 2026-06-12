@@ -129,28 +129,25 @@ describe("P0-1 채널 고정: 라이브 실패의 조용한 페이퍼 기록 금
 });
 
 describe("P0-2 보호주문 연속 실패 → 비상 청산(fail-closed)", () => {
-  it("보호주문 배치가 계속 실패하면 protFails 누적 → 3회 도달 후 비상 청산", async () => {
+  // 2026-06 audit P1-4 의도적 동작 변경: 손절(SL) leg 배치 실패 + 손절 설정 포지션이면 protFails가
+  // 한도(기본 3)로 '즉시 점프' — TP만 걸린 편다리/나체 포지션을 3틱(180초) 들고 있지 않고 다음 틱에 비상 청산.
+  it("SL 배치 실패 시 protFails 즉시 한도 점프 → 다음 틱 비상 청산(3틱 대기 금지)", async () => {
     reset(); calls.mode = "throwProtective"; // 시장가는 체결, 보호주문만 실패
     const id = mkLiveBot("p02-escalate", 5); // 손절 5% 설정(보호를 원한 포지션)
     klinesMock.mockResolvedValue(barsAt(50, () => 90)); // 진입 후 계속 보유
-    const r1 = await tickBot(id); // 진입 + 보호주문 실패(1회)
+    const r1 = await tickBot(id); // 진입 + SL 배치 실패 → 한도 즉시 점프
     expect(r1.action).toBe("buy");
-    expect((store.getBot(id)?.position_state as PaperPosition).protFails).toBe(1);
-    const r2 = await tickBot(id); // 보유 재동기화 실패(2회)
-    expect(r2.action).toBe("hold");
-    expect((store.getBot(id)?.position_state as PaperPosition).protFails).toBe(2);
-    await tickBot(id); // 3회 — 한도 도달
-    expect((store.getBot(id)?.position_state as PaperPosition).protFails).toBe(3);
-    const r4 = await tickBot(id); // 비상 청산 발동
-    expect(r4.action).toBe("sell");
-    expect(r4.detail).toContain("비상 청산");
+    expect((store.getBot(id)?.position_state as PaperPosition).protFails).toBe(3); // 1→2→3 점증 아님(즉시)
+    const r2 = await tickBot(id); // 비상 청산 발동(나체 노출 최대 1틱)
+    expect(r2.action).toBe("sell");
+    expect(r2.detail).toContain("비상 청산");
     expect(store.getBot(id)?.position_state).toBeNull(); // 나체 포지션 해소
     const sells = store.recentTrades(id, 10).filter((t) => t.side === "sell");
     expect(sells).toHaveLength(1);
     expect(sells[0].reason).toContain("비상 청산");
     expect(sells[0].is_paper).toBe(0); // 라이브 채널이므로 실청산
-    // 보호주문 배치가 실제로 여러 번 시도(swallow 아님 — 매 틱 재시도 후 에스컬레이션)됐는지
-    expect(calls.placed.filter((o) => o.type === "stop_market").length).toBeGreaterThanOrEqual(3);
+    // SL 배치가 실제로 시도됐는지(swallow 아님)
+    expect(calls.placed.filter((o) => o.type === "stop_market").length).toBeGreaterThanOrEqual(1);
   });
 });
 
