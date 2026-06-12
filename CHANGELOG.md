@@ -5,6 +5,33 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] — 2026-06-12 full-audit upgrade (Sprints 1–6)
+
+Driven by the adversarially-verified full audit (`docs/03-analysis/full-audit-2026-06-12.md`).
+All four P0s and 17 of 24 P1s resolved. Tests 364 → 448.
+
+### Fixed (real-money safety)
+- **KIS KRX tick alignment** (P0-4): limit prices now rounded via shared `krx-tick.ts` — removes predictable RC4003 rejections.
+- **KR protective-order silent mutation** (P0-3): KIS/Kiwoom now explicitly *reject* stop/take-profit order types instead of silently sending them as plain limits; runner skips exchange-resident protective sync for KR with a one-time honest warning; dashboard discloses the gap.
+- **Boot position seed** (P0-1): on restart (even with the live gate OFF) a one-shot read-only reconcile restores exchange truth — guarded by the bot's own live-trade ledger so manual holdings are never adopted.
+- **Resident stop orders were silently failing** (latent bug found via testnet): non-market order ACK responses lack `status`, tripping the fail-closed parser — all orders now request `newOrderRespType=RESULT`. Verified by a 5-step testnet moneypath (buy → reconcile → resident stop accepted → cancel → close).
+- **Partial fills** (P1-1): executed-vs-intended quantity split (`executedQty`/`origQty`); ledger records actual fills; partial-then-EXPIRED no longer masquerades as `rejected`.
+- **Ladder average-price parity** (P1-11): scale-in/pyramid averaging now uses the slippage-adjusted executed price, so engine state ≡ recorded trades ≡ live `derivePosition`.
+
+### Added (operations & control)
+- **24/7 headless daemon** (`npm run daemon`) + `Dockerfile` + unauthenticated `/healthz` — bots no longer die with the MCP client (P0-2). Container-restart scenario not yet exercised (local Docker engine was offline).
+- **Telegram remote control** (`/status` `/halt` `/forceexit` `/resume`) with mandatory chat-id allowlist and 6-digit single-use confirm codes (P1-14); crash alerts + optional heartbeat (P1-15).
+- **Global kill switch** `LIVE_TRADING_HALT` + `emergencyStopAll` (stop all bots, optionally market-close live positions through the existing safe order path) (P1-17).
+- **Order observability**: MCP tools `get_open_orders` / `get_order_status` (25 → 27 tools), dashboard trade-history + open-orders panel with cancel, manual limit-order fill tracking with alerts (P1-16/18/19/20).
+- **Common retry layer** for 429/5xx/timeouts with Retry-After support — GET-only; order POSTs are never transport-retried (idempotency stays with clientOrderId reconcile) (P1-3).
+- **SQLite hardening**: WAL, atomic trade+position transactions, daily `VACUUM INTO` backups (P1-21); duplicate live bots per symbol+broker blocked at start and auto-halted at runtime (P1-8).
+- **Backtest `gapHandling: "worst"`** option — stop-loss judged on bar low, filled at min(open, stop level) (P1-12); `weighted` trees refused for live bots until capital-split execution exists (P1-13).
+- **Manual-order UX**: free-form symbol order modal, quote/balance/holdings lookup, 25/50/Max presets, oversell guard, one-click close-all per bot card.
+
+### Known gaps (honest)
+- KIS mock-server E2E script ready but **not run** (awaiting KIS sandbox keys).
+- Docker restart scenario unverified locally; ladder-path `gapHandling`, KR open-order query, scanner-bot live reconcile, and symbol autocomplete remain follow-ups.
+
 ## [0.1.0] — unreleased
 
 First open-source (MIT) release. The portable quant core was extracted from a parent
