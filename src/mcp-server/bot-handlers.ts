@@ -81,6 +81,11 @@ export function startBot(a: { botId: string }) {
     if (comp && hasWeighted(comp.root_node)) {
       return { ok: false, error: "weighted(자본분할) 모드는 라이브 미지원 — 백테스트는 자식별 자본을 분할하지만 라이브는 단일 포지션으로 실행되어 backtest≡live가 깨집니다(audit P1-13). priority 모드로 바꾸거나 페이퍼로 운용하세요." };
     }
+    // 스캐너 봇 라이브 거절(audit P1-23): 멀티심볼 심볼맵에 체결 reconcile이 미구현 → 부분체결/지연체결 시
+    //   가짜보유가 거래소와 발산. 조용한 페이퍼 폴백(fail-closed 위반) 대신 명시 거절. 페이퍼는 허용.
+    if (comp && (comp.root_node as { type?: string })?.type === "scanner") {
+      return { ok: false, error: "스캐너(자동선별) 봇은 라이브 미지원 — 멀티심볼 체결 reconcile 미구현으로 부분체결 시 장부-거래소 발산 위험(audit P1-23). 페이퍼로 운용하거나 단일 종목 봇으로 전환하세요." };
+    }
   }
   runner().start(a.botId);
   // 표시 라벨은 봇 mode를 그대로 반영(라이브 봇을 '페이퍼'로 거짓 표기하지 않음). 실제 실주문 여부는 러너의 게이트가 통제.

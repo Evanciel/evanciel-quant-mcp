@@ -829,9 +829,16 @@ async function tickScanner(bot: store.BotRow, node: ScannerNode, riskSizing?: Ba
     // 채널 고정(P0-1): 라이브로 연 심볼은 라이브로만 청산(실패=보유 유지+재시도), 페이퍼 심볼은 실주문 없이 페이퍼 청산.
     const fill = await fillOrder(bot, "sell", pos.qty, price, sym, { posLive: pos.live ?? false, barIso: barIso(sym) });
     if (fill.failed) { store.insertLog(bot.id, "error", `${sym} 라이브 청산 실패 — 보유 유지(${fill.note}), 다음 틱 재시도`); continue; }
-    const realPnl = (fill.price - pos.entryAvg) * pos.qty;
-    const t = store.insertTrade({ bot_id: bot.id, side: "sell", price: fill.price, qty: pos.qty, pnl: realPnl, is_paper: fill.live ? 0 : 1, reason: `스캐너 청산(${sym})`, idempotency_key: `${bot.id}:${sym}:${barIso(sym)}:sell` });
-    if (t) { delete positions[sym]; closes++; store.insertLog(bot.id, "sell", `[${fill.live ? "실거래" : "페이퍼"}] ${sym} 청산 qty=${pos.qty} @ ${fill.price} pnl=${realPnl.toFixed(2)}`); }
+    // 부분체결(audit P1-23): 실제 체결분만 차감(단일봇 경로와 동일). 의도수량으로 기록하면 장부=0/거래소=실보유 발산.
+    const soldQty = fill.live && fill.filledQty != null && fill.filledQty > 0 ? fill.filledQty : pos.qty;
+    const partialSell = fill.live && soldQty < pos.qty - 1e-12;
+    const realPnl = (fill.price - pos.entryAvg) * soldQty;
+    const t = store.insertTrade({ bot_id: bot.id, side: "sell", price: fill.price, qty: soldQty, pnl: realPnl, is_paper: fill.live ? 0 : 1, reason: `스캐너 청산(${sym})`, idempotency_key: `${bot.id}:${sym}:${barIso(sym)}:sell` });
+    if (t) {
+      if (partialSell) { positions[sym] = { ...pos, qty: pos.qty - soldQty }; store.insertLog(bot.id, "live", `⚠️ ${sym} 부분 청산: 의도 ${pos.qty} 중 ${soldQty}만 체결 — 잔여 ${pos.qty - soldQty} 보유 유지`); }
+      else delete positions[sym];
+      closes++; store.insertLog(bot.id, "sell", `[${fill.live ? "실거래" : "페이퍼"}] ${sym} 청산 qty=${soldQty} @ ${fill.price} pnl=${realPnl.toFixed(2)}`);
+    }
   }
   // 신규 진입
   for (const sym of toOpen) {
@@ -849,8 +856,11 @@ async function tickScanner(bot: store.BotRow, node: ScannerNode, riskSizing?: Ba
     const buyQty = gate.qty;
     const fill = await fillOrder(bot, "buy", buyQty, price, sym, { barIso: barIso(sym) });
     if (fill.failed) { store.insertLog(bot.id, "error", `${sym} 라이브 진입 실패 — 스킵(${fill.note})`); continue; } // 모호실패=기록 금지(P0-1)
-    const t = store.insertTrade({ bot_id: bot.id, side: "buy", price: fill.price, qty: buyQty, pnl: 0, is_paper: fill.live ? 0 : 1, reason: `스캐너 진입(${sym}, ${node.rank.metric} 상위)`, idempotency_key: `${bot.id}:${sym}:${barIso(sym)}:buy` });
-    if (t) { positions[sym] = { status: "open", entryAvg: fill.price, qty: buyQty, openedAt: new Date().toISOString(), live: fill.live }; opens++; store.insertLog(bot.id, "buy", `[${fill.live ? "실거래" : "페이퍼"}] ${sym} 진입 qty=${buyQty} @ ${fill.price}${buyQty < qty ? ` [포트폴리오 캡 ×축소 ${qty}→${buyQty}]` : ""}`); }
+    // 부분체결(audit P1-23): 실제 체결분만 장부 기록(의도수량 기록 시 거래소와 발산).
+    const gotQty = fill.live && fill.filledQty != null && fill.filledQty > 0 ? fill.filledQty : buyQty;
+    if (fill.live && gotQty < buyQty - 1e-12) store.insertLog(bot.id, "live", `⚠️ ${sym} 부분체결: 의도 ${buyQty} 중 ${gotQty}만 체결 — 체결분만 기록`);
+    const t = store.insertTrade({ bot_id: bot.id, side: "buy", price: fill.price, qty: gotQty, pnl: 0, is_paper: fill.live ? 0 : 1, reason: `스캐너 진입(${sym}, ${node.rank.metric} 상위)`, idempotency_key: `${bot.id}:${sym}:${barIso(sym)}:buy` });
+    if (t) { positions[sym] = { status: "open", entryAvg: fill.price, qty: gotQty, openedAt: new Date().toISOString(), live: fill.live }; opens++; store.insertLog(bot.id, "buy", `[${fill.live ? "실거래" : "페이퍼"}] ${sym} 진입 qty=${gotQty} @ ${fill.price}${gotQty < qty ? ` [축소/부분 ${qty}→${gotQty}]` : ""}`); }
   }
 
   store.setBotPositionState(bot.id, positions, true, opens + closes > 0);
