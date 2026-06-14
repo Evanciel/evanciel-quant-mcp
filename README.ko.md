@@ -10,7 +10,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Node](https://img.shields.io/badge/node-%3E%3D22-green.svg)](package.json)
 [![MCP](https://img.shields.io/badge/MCP-stdio-blue.svg)](https://modelcontextprotocol.io)
-[![tests](https://img.shields.io/badge/tests-448%20passing-brightgreen.svg)](test)
+[![tests](https://img.shields.io/badge/tests-465%20passing-brightgreen.svg)](test)
 [![keys](https://img.shields.io/badge/data-keyless%20(Binance%20public)-orange.svg)](src/data/binance-public.ts)
 
 [English](README.md) · **한국어**

@@ -64,3 +64,25 @@ E2E 결과: 연결(토큰/잔고5억/현재가/보유) PASS + 주문(지정가 �
 검증 스크립트: `scripts/verify-kiwoom-mock-connection.ts`(읽기전용), `scripts/verify-kiwoom-mock-order-e2e.ts`(매수→취소).
 
 **남은 한계**: 시장가 체결→보유종목 populate→매도 회수의 "체결 사이클"은 모의 시장시간/체결 시뮬 의존이라 미확정(지정가 접수+취소는 확정). 한투(KIS) 모의 E2E는 KIS 모의키 받으면 동일 절차. KR 상주손절(거래소 SL/TP)은 여전히 공백(소프트스톱 후속).
+
+## KR 미체결 조회 tr_id 리서치 (2026-06-14, audit P1-10) — 엔드포인트·tr_id 확정 / 응답필드 E2E 대기
+
+P1-10(KR 체결 즉시 reconcile)의 차단 요인이던 **미체결 조회 공식 tr_id를 공식 출처로 확정**. 단, 응답 필드명은 공식 문서에 미공개라 **모의 E2E 전 구현 보류**(키움 E2E-1/2/3 전례: 스펙만으론 런타임 버그 못 잡음).
+
+### KIS — 정정취소가능주문조회 (미체결 = 정정/취소 가능 주문)
+- **엔드포인트**: `GET /uapi/domestic-stock/v1/trading/inquire-psbl-rvsecncl`
+- **tr_id**: 실전 `TTTC0084R` / 모의 `VTTC0084R`(V-prefix, 기존 TR_IDS 규약과 일치 — 단 모의값 E2E 확인 필요)
+- **요청**: `CANO`, `ACNT_PRDT_CD`, `INQR_DVSN_1`(0=주문/1=종목), `INQR_DVSN_2`(0=전체/1=매도/2=매수), `CTX_AREA_FK100`, `CTX_AREA_NK100`(연속조회)
+- **응답 output 필드**: 공식 LLM 예제에 미문서화(`odno`/`psbl_qty`/`ord_qty`/`pdno` 추정) → **E2E로 확정 필수**
+- 출처: github.com/koreainvestment/open-trading-api `examples_llm/domestic_stock/inquire_psbl_rvsecncl`
+
+### 키움 — 미체결요청
+- **api-id**: `ka10075`(미체결요청), 보조 `ka10076`(체결요청). 경로는 계좌 조회 계열(`/api/dostk/acnt` 또는 `/api/dostk/ordr` 계열 — E2E 확인)
+- **요청 바디(추정)**: `stk_cd`(종목, 선택), `trde_tp`(매매구분), `all_stk_tp`(전체/종목) — **필드명 E2E 확정 필요**
+- **응답 배열 키(추정)**: `oso`(미체결) 등 — **E2E 확정 필요**
+- 출처: openapi.kiwoom.com REST 가이드, github.com/younghwan91/kiwoom-rest-api(`unfilled_orders`), github.com/dongbin300/KiwoomRestApi.Net(`GetUnfilledOrdersAsync`)
+
+### 판단(정직)
+- **이번 세션 구현 안 함**: 엔드포인트/tr_id/요청은 확정이나 **응답 필드명 미확정** → 검증 안 된 파싱을 reconcile에 넣으면 키움 E2E-1/2/3과 동형 런타임 버그 위험(불변 원칙: KR 응답 스펙은 모의 E2E로 확정).
+- **다음 단계**: KIS 모의키(`KIS_APPKEY/APPSECRET/ACCOUNT`) + 키움 모의키 확보 → `scripts/verify-kiwoom-mock-order-e2e.ts` 패턴으로 ka10075/inquire-psbl-rvsecncl 응답 필드 확정 → `getOpenOrders`(KR) 구현 → reconcileLivePosition KR 분기에 체결 즉시 확인 배선. 위 확정 스펙으로 요청부는 바로 작성 가능.
+- **타입가드 점검 결과(정정)**: reconcileLivePosition의 `getOrderByClientId !== undefined` 가드는 **의도대로 정상**(Binance=보유→skip, KR=미보유→reconcile 진입). 역전 아님 — 변경 금지.

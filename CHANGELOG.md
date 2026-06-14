@@ -28,6 +28,17 @@ All four P0s and 17 of 24 P1s resolved. Tests 364 → 448.
 - **Backtest `gapHandling: "worst"`** option — stop-loss judged on bar low, filled at min(open, stop level) (P1-12); `weighted` trees refused for live bots until capital-split execution exists (P1-13).
 - **Manual-order UX**: free-form symbol order modal, quote/balance/holdings lookup, 25/50/Max presets, oversell guard, one-click close-all per bot card.
 
+### Added — P1 follow-ups (2026-06-14, audit-driven)
+- **Per-currency daily-loss circuit** (P1-6): USDT vs KRW tracked independently (a KRW loss no longer trips the USDT circuit). Priority: split env > single env > per-currency default.
+- **Audit fail-closed + halt** (P1-24): the daily-loss query now returns negative infinity on error (was `0`, fail-open) so a query failure can never hide a loss; `AUDIT_FAILURE_HALT` blocks live orders on repeated audit-write failures; `live_status.auditStatus` + dashboard `/api/audit-health`.
+- **Scanner partial-fill fix + live reject** (P1-23): scanner bots now record executed (not intended) quantity on partial fills; `mode:live` scanner bots are rejected (symbol-map reconcile unimplemented) instead of silently falling back to paper.
+- **Candle retry + integrity** (P1-22): `fetchKlines` retries on 429/5xx/timeout; `validateCandleContiguity` rejects interval mismatch / missing bars before evaluation (crypto strict, KR median — weekend-gap safe); KIS candle path fails closed instead of a silent empty hold.
+- **Unknown-result forced reconcile** (P1-2): repeated ambiguous order results trigger a forced `getPositions` reconcile (bypassing the Binance skip-guard) to converge with exchange truth; conservative (adopt-only, no clear).
+
+### Deferred (honest)
+- **Live limit-order entry** (P1-5): deferred — no pending-order state machine or backtest timeout model yet; shipping it would break backtest≡live parity.
+- **KR fill reconcile** (P1-10): endpoints/tr_ids confirmed (KIS `inquire-psbl-rvsecncl` TTTC0084R, Kiwoom `ka10075`) but response field names are undocumented; implementation waits for mock-server E2E (project rule: no unverified KR response parsing).
+
 ### Known gaps (honest)
 - KIS mock-server E2E script ready but **not run** (awaiting KIS sandbox keys).
 - Docker restart scenario unverified locally; ladder-path `gapHandling`, KR open-order query, scanner-bot live reconcile, and symbol autocomplete remain follow-ups.
