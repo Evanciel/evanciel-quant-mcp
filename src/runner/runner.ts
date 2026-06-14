@@ -58,7 +58,13 @@ function invalidateReconCache(broker: string, env: string): void { _reconPosCach
 /** 테스트 전용: reconcile 계좌 캐시 초기화(모듈 스코프라 테스트 간 누수 방지). 프로덕션 경로 미사용. */
 export function __clearReconCache(): void { _reconPosCache.clear(); _reconPosInflight.clear(); }
 
-type FillResult = { live: boolean; price: number; orderId?: string; note: string; filledQty?: number; failed?: boolean };
+type FillResult = { live: boolean; price: number; orderId?: string; note: string; filledQty?: number; failed?: boolean; unknown?: boolean };
+
+// 주문 결과불명(unknown verdict) 누적 → 강제 reconcile 임계(audit P1-2). env LIVE_UNKNOWN_MAX_COUNT(1~20, 기본5).
+const UNKNOWN_MAX_COUNT = (() => {
+  const n = parseInt((process.env.LIVE_UNKNOWN_MAX_COUNT || "").trim(), 10);
+  return Number.isFinite(n) && n >= 1 && n <= 20 ? n : 5;
+})();
 
 /**
  * 봇 체결: mode=live + 게이트 통과면 실주문(어댑터), 아니면 페이퍼. 자율봇이라 2단계토큰 없음
@@ -183,7 +189,7 @@ async function fillOrder(bot: store.BotRow, side: "buy" | "sell", qty: number, p
     // 결과 불명: 주문이 나갔을 수 있다 → 페이퍼 기록 금지(이중 장부 = 발산). 동결 후 다음 틱 재시도.
     //   binance는 다음 시도에서 같은 cid pre-check로 입양. cid 미지원 브로커(키움)는 수동 확인 경고.
     store.insertLog(bot.id, "error", `실주문 결과 불명(${e instanceof Error ? e.message : e}) → 동결(기록 없음). ${got.adapter.getOrderByClientId ? "다음 틱 동일 cid로 입양 시도" : "⚠️ 주문조회 미지원 브로커 — 거래소에서 수동 확인 필요"}`);
-    return { live: false, price, note: "실주문 결과 불명", failed: true };
+    return { live: false, price, note: "실주문 결과 불명", failed: true, unknown: true };
   }
 }
 
@@ -251,6 +257,7 @@ export interface PaperPosition {
   peakPrice?: number;        // 진입 후 고점(롱)/저점(숏) — 트레일링 스탑 기준(planProtectiveOrders extremeSinceEntry)
   protFails?: number;        // 보호주문 동기화 연속 실패 수 — PROTECTIVE_MAX_FAILS 도달 시 비상 청산(P0-2)
   reconMisses?: number;      // reconcile 시 라이브 포지션이 거래소에 연속 부재한 틱 수 — RECON_CLEAR_MISSES 도달 시 가짜보유 정정(지연체결 오삭제 방지, 라이브 채널만)
+  unknownCount?: number;     // 주문 결과불명(unknown verdict) 연속 누적(audit P1-2) — UNKNOWN_MAX_COUNT 도달 시 강제 getPositions reconcile로 수렴(단일봇 전용)
 }
 
 /** 폴링 주기(초) → Binance kline 타임프레임. 인트라데이 봉이라야 시간대(hour) 조건이 의미. */
@@ -457,6 +464,38 @@ async function bootSeedLivePosition(bot: store.BotRow, cur: PaperPosition | null
   return cur;
 }
 
+/**
+ * unknown 누적 강제 reconcile(audit P1-2). 주문 결과불명(unknown)이 UNKNOWN_MAX_COUNT 연속 누적되면
+ * reconcileLivePosition의 브로커 가드(바이낸스 skip)를 우회해 getPositions로 거래소 진실을 1회 강제 조회·수렴한다.
+ *
+ * 보수성(fail-closed): **adopt(거래소 보유>0)·in_sync만 반영하고 clear(장부>0·거래소0)는 하지 않는다** —
+ *   unknown은 '주문이 나갔을 수도'라 거래소에 곧 뜰 수 있어 즉시 삭제는 위험(reconMisses 정상 경로에 위임).
+ *   조회 실패=유지(다음 틱 재시도, 카운터 유지). 어느 경우든 성공 조회면 unknownCount=0 리셋(폭주 방지).
+ */
+async function forceReconcileOnUnknown(bot: store.BotRow, cur: PaperPosition | null): Promise<PaperPosition | null> {
+  const live = liveAdapterFor(bot);
+  if (!live) return cur; // 게이트 미통과 → 다음 틱
+  const adapter = live.adapter as { getPositions?: () => Promise<ExchangePos[]> };
+  if (typeof adapter.getPositions !== "function") return cur;
+  let exPos: ExchangePos[];
+  try { exPos = await getReconcilePositions(bot.broker, live.env, () => (adapter.getPositions as () => Promise<ExchangePos[]>)()); }
+  catch (e) { store.insertLog(bot.id, "error", `[${live.env}] unknown 누적 강제 reconcile 조회 실패(${e instanceof Error ? e.message : e}) → 유지(다음 틱)`); return cur; }
+  audit({ event: "fill_unknown_reconcile_triggered", botId: bot.id, env: live.env, symbol: bot.symbol, count: cur?.unknownCount ?? 0 });
+  const curQty = cur && cur.status === "open" ? cur.qty : 0;
+  let rec = reconcilePositionFromExchange(curQty > 1e-9 ? { qty: curQty } : null, exPos, bot.symbol);
+  if (rec.action === "no_exchange_pos" && bot.broker === "binance") rec = reconcilePositionFromExchange(curQty > 1e-9 ? { qty: curQty } : null, exPos, baseAsset(bot.symbol));
+  if (rec.action === "adopt" && rec.next) {
+    const entryAvg = rec.next.entryAvg > 0 ? rec.next.entryAvg : (cur?.entryAvg ?? 0);
+    const adopted: PaperPosition = { status: "open", entryAvg, qty: rec.next.qty, openedAt: cur?.openedAt ?? new Date().toISOString(), live: true, peakPrice: Math.max(cur?.peakPrice ?? entryAvg, entryAvg), protectiveIds: cur?.protectiveIds ?? [], protFails: cur?.protFails ?? 0, reconMisses: 0, unknownCount: 0 };
+    store.setBotPositionState(bot.id, adopted, true, false);
+    store.insertLog(bot.id, "live", `[${live.env}] unknown 누적 → 강제 reconcile 채택: ${bot.symbol} 장부 ${curQty}→${rec.next.qty}(평단 ${entryAvg})`);
+    return adopted;
+  }
+  // in_sync / no_exchange_pos: 장부 변경 없이 카운터만 리셋(조회 성공=수렴 시도 완료). clear는 reconMisses 정상 경로에 위임.
+  if (cur) { const next = { ...cur, unknownCount: 0 }; store.setBotPositionState(bot.id, next, true, false); return next; }
+  return cur;
+}
+
 // ── 포트폴리오 레벨 캡(opt-in) — 러너측 스냅샷 + 진입 게이트 적용 ──
 // 러너가 position_state 모양(단일 PaperPosition / 스캐너 심볼맵)을 알므로 노출 추출은 여기서 한다.
 // 게이트 자체는 safety.portfolioGate(순수). env 미설정이면 buildPortfolioSnapshot도 호출 안 됨 → 오버헤드/거동 변화 0.
@@ -597,6 +636,9 @@ export async function tickBot(botId: string): Promise<{ action: "buy" | "sell" |
   //    페이퍼(mode!=live)·게이트OFF는 미진입 → getPositions 미호출 → 거동·오버헤드 0(회귀 0). 스캐너 경로는 별도(아래).
   cur = await bootSeedLivePosition(bot, cur); // P0-1: 재시작 첫 틱 1회, 게이트 무관 read-only 복원
   cur = await reconcileLivePosition(bot, cur, lastIso);
+  // P1-2: 주문 결과불명(unknown)이 임계 누적 → 강제 getPositions reconcile(바이낸스 가드 우회)로 1회 수렴.
+  //   reconcileLivePosition(KR 전용)이 못 덮는 바이낸스 발산을 보완. 스캐너는 별도 경로(여기 미도달).
+  if ((cur?.unknownCount ?? 0) >= UNKNOWN_MAX_COUNT) cur = await forceReconcileOnUnknown(bot, cur);
 
   const curQty = cur && cur.status === "open" ? cur.qty : 0;
   // 체결 채널: 라이브로 연 포지션인가. 레거시 상태(live 필드 없음)는 페이퍼로 보수 처리(실주문 안 나감 — 안전측).
@@ -698,7 +740,10 @@ export async function tickBot(botId: string): Promise<{ action: "buy" | "sell" |
     const fill = await fillOrder(bot, "sell", plan.qty, price, bot.symbol, { posLive: curLive, barIso: lastIso });
     if (fill.failed) {
       // P0-1 핵심: 실매도 실패를 페이퍼로 기록하면 장부=청산/거래소=실보유(손절 없는 고아 포지션)로 발산 → 동결.
-      store.setBotPositionState(botId, cur);
+      // P1-2: 결과불명(unknown)이면 누적 카운트 — 임계 도달 시 다음 틱에 강제 reconcile로 수렴(보유 장부에만 기록 가능).
+      const frozen: PaperPosition | null = fill.unknown && cur && cur.status === "open" ? { ...cur, unknownCount: (cur.unknownCount ?? 0) + 1 } : cur;
+      if (fill.unknown && frozen && frozen !== cur) { store.insertLog(botId, "error", `매도 결과불명 누적 ${frozen.unknownCount}/${UNKNOWN_MAX_COUNT} — 임계 시 강제 reconcile`); audit({ event: "fill_unknown_accumulated", botId, count: frozen.unknownCount }); }
+      store.setBotPositionState(botId, frozen);
       return { action: "hold", detail: `라이브 매도 실패 — 동결(${fill.note})` };
     }
     const refAvg = cur?.entryAvg ?? fill.price;
