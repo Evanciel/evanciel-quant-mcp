@@ -58,8 +58,20 @@ npx quant-mcp setup
    LIVE_TRADING_ENABLED=true           # ★ 마스터 스위치 — 이게 없으면 메인넷 차단(페이퍼 폴백)
    LIVE_MAX_NOTIONAL=200               # 주문당 최대 금액(USDT) — 사고 방지
    LIVE_SYMBOL_ALLOWLIST=BTCUSDT,ETHUSDT   # 허용 종목만
-   LIVE_DAILY_LOSS_LIMIT=100          # 일일 실현손실 이 금액 넘으면 자동 거래중단(서킷)
+   LIVE_DAILY_LOSS_LIMIT_USDT=50      # (권장) Binance 일일 실현손실 한도(달러)
+   # LIVE_DAILY_LOSS_LIMIT=100        # (하위호환) 통화 무관 단일값 — 분리값 미설정 시 통화별로 각각 적용
    ```
+
+   **일일손실 서킷 통화 분리(audit P1-6):** 키움/KIS(KRW)와 Binance(USDT)를 같이 돌리면 손실이 통화별로
+   따로 집계됩니다. 우선순위는 **분리값(`LIVE_DAILY_LOSS_LIMIT_USDT`/`_KRW`) > 단일값(`LIVE_DAILY_LOSS_LIMIT`)
+   > 통화 기본값(USDT 50 / KRW 75,000)**. 기존에 단일값만 쓰던 설정은 그대로 동작하되 이제 통화별로 각각
+   적용됩니다(미설정 시 기본값으로 자동 무해화 — 마이그레이션 불필요).
+
+   **감사 무결성(audit P1-24):** 감사로그 기록이 계속 실패하면 `live_status.auditStatus` / 대시보드
+   `/api/audit-health`에 실패 카운트가 뜹니다. 감사 무결성이 절대적이면 `AUDIT_FAILURE_HALT=true`
+   (임계 `AUDIT_FAILURE_HALT_MAX`, 기본 10)로 누적 실패 시 주문을 차단하세요. 손실 조회가 실패하면
+   서킷은 fail-closed(차단)로 동작합니다 — 조회 실패가 손실을 숨기지 않습니다.
+
 3. **수동 주문(`place_order`)은 2단계**: 1차 호출=프리뷰+`confirmToken` 반환 → 검토 → 동일 인자 + `confirmToken`으로 2차 호출해야 실제 주문(5분 TTL, 단일사용). 토큰 없이는 **절대 실행 안 됨(fail-closed)**.
 4. **자율 봇(`create_bot mode=live`)**은 사전승인 모델: 마스터 스위치 + 하드리밋 + 멱등으로 통제(봇은 2단계 토큰 없이 돌되, 게이트/리밋이 막음).
 

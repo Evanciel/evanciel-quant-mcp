@@ -25,7 +25,7 @@ import { computePositionDrift } from "../core/execution/reconcile.js"; // 페이
 import { detectAlerts, Debouncer, AlertBuffer, type BotAlertView } from "../core/alerts/alerts.js"; // 봇 이벤트 알림 엔진(순수)
 import { sendWebhook, validateWebhookUrl } from "../core/alerts/webhook.js"; // Slack/Discord 배달(SSRF 게이트)
 import { alertSettingsStatus } from "../setup/credentials.js";
-import { orderHash, mintToken, consumeToken, audit, type Broker } from "../brokers/safety.js"; // /api/live 2단계 — 머니패스와 동일 토큰 골격 재사용(신규 안전로직 0)
+import { orderHash, mintToken, consumeToken, audit, auditFailureCount, lastAuditError, type Broker } from "../brokers/safety.js"; // /api/live 2단계 — 머니패스와 동일 토큰 골격 재사용(신규 안전로직 0)
 import { sma, ema, rsi, macd, bollingerBands, stochastic, adx, atr, williamsR, stochasticRsi, cci, supertrend, vwap, mfi, parabolicSar, ichimoku, roc, obv, donchian } from "../core/strategy/indicators.js";
 
 /** POST 본문을 안전하게 읽어 JSON 파싱(상한 64KB, 자격증명 폼은 작음). */
@@ -804,6 +804,13 @@ export function startDashboard(port = 7788): Promise<{ url: string; port: number
         }
         res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify(r));
       }).catch((e) => { res.writeHead(400, { "content-type": "application/json" }); res.end(JSON.stringify({ ok: false, error: e instanceof Error ? e.message : "bad request" })); });
+      return;
+    }
+    if (u.pathname === "/api/audit-health") {
+      // 감사로그 무결성 모니터(audit P1-24, 읽기전용). 시크릿 0 — 실패 카운트·마지막 에러만.
+      if (req.method !== "GET") { res.writeHead(405).end("method not allowed"); return; }
+      res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
+      res.end(JSON.stringify({ ok: true, failures: auditFailureCount(), lastError: lastAuditError() || null, haltEnforced: (process.env.AUDIT_FAILURE_HALT || "").trim() === "true", timestamp: new Date().toISOString() }));
       return;
     }
     if (u.pathname === "/api/quote") {

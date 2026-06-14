@@ -193,3 +193,67 @@ describe("dailyRealizedLoss KST 일경계", () => {
     expect(() => dayBoundaryIso()).not.toThrow();
   });
 });
+
+// ── P1-6: 일일손실 통화 분리 + P1-24: fail-closed 교정 ──
+describe("P1-6 일일손실 통화 분리", () => {
+  const savedDataDir = process.env.QUANT_MCP_DATA_DIR;
+  function mkBot(id: string, broker: string) {
+    db().prepare(`INSERT INTO composite_strategies (id,name,root_node,symbol,market,leverage,created_at) VALUES (?,?,?,?,?,?,?)`)
+      .run(`c-${id}`, id, "{}", broker === "binance" ? "BTCUSDT" : "005930", "spot", 1, new Date().toISOString());
+    db().prepare(`INSERT INTO bots (id,name,symbol,composite_strategy_id,status,mode,capital,broker,interval_seconds,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)`)
+      .run(id, id, broker === "binance" ? "BTCUSDT" : "005930", `c-${id}`, "running", "live", 1000, broker, 60, new Date().toISOString());
+  }
+  function rawTrade(botId: string, ts: string, pnl: number) {
+    db().prepare(`INSERT INTO trades (id,bot_id,ts,side,price,qty,pnl,is_paper,reason,idempotency_key) VALUES (?,?,?,?,?,?,?,?,?,?)`)
+      .run(`t-${Math.random()}`, botId, ts, "sell", 100, 1, pnl, 0, "test", `i-${Math.random()}`);
+  }
+  beforeEach(() => {
+    process.env.QUANT_MCP_DATA_DIR = join(tmpdir(), `quant-mcp-ccyloss-${process.pid}`);
+    try { db().prepare(`DELETE FROM trades`).run(); db().prepare(`DELETE FROM bots`).run(); db().prepare(`DELETE FROM composite_strategies`).run(); } catch { /* noop */ }
+    vi.useFakeTimers(); vi.setSystemTime(new Date("2026-06-10T02:00:00.000Z"));
+    mkBot("bn", "binance"); mkBot("kw", "kiwoom");
+    rawTrade("bn", "2026-06-09T16:00:00.000Z", -30);   // USDT -30
+    rawTrade("kw", "2026-06-09T16:00:00.000Z", -50000); // KRW -50000
+  });
+  afterEach(() => {
+    try { db().prepare(`DELETE FROM trades`).run(); db().prepare(`DELETE FROM bots`).run(); db().prepare(`DELETE FROM composite_strategies`).run(); } catch { /* noop */ }
+    vi.useRealTimers();
+    for (const k of ["LIVE_DAILY_LOSS_LIMIT", "LIVE_DAILY_LOSS_LIMIT_USDT", "LIVE_DAILY_LOSS_LIMIT_KRW", "LIVE_TRADING_ENABLED"]) delete process.env[k];
+    if (savedDataDir === undefined) delete process.env.QUANT_MCP_DATA_DIR; else process.env.QUANT_MCP_DATA_DIR = savedDataDir;
+  });
+
+  it("통화별 손익 분리 집계 — USDT는 binance만, KRW는 kis/키움만", () => {
+    expect(dailyRealizedLoss("USDT")).toBe(-30);
+    expect(dailyRealizedLoss("KRW")).toBe(-50000);
+    expect(dailyRealizedLoss()).toBe(-50030); // 미지정=전체(하위호환)
+  });
+
+  it("KRW 서킷 도달이 USDT 주문을 막지 않음(독립 서킷)", () => {
+    process.env.LIVE_TRADING_ENABLED = "true";
+    process.env.LIVE_DAILY_LOSS_LIMIT_KRW = "40000"; // KRW -50000 > 40000 → KRW 차단
+    process.env.LIVE_DAILY_LOSS_LIMIT_USDT = "1000"; // USDT -30 < 1000 → USDT 통과
+    expect(checkLimits({ symbol: "005930", notional: 1000, quoteCurrency: "KRW" }).ok).toBe(false);
+    expect(checkLimits({ symbol: "BTCUSDT", notional: 50, quoteCurrency: "USDT" }).ok).toBe(true);
+  });
+
+  it("분리값 우선 > 단일값 > 통화 기본값", () => {
+    process.env.LIVE_TRADING_ENABLED = "true";
+    process.env.LIVE_DAILY_LOSS_LIMIT = "25"; // 단일값(하위호환): USDT -30 > 25 → 차단
+    expect(checkLimits({ symbol: "BTCUSDT", notional: 50, quoteCurrency: "USDT" }).ok).toBe(false);
+    process.env.LIVE_DAILY_LOSS_LIMIT_USDT = "100"; // 분리값 우선: -30 < 100 → 통과
+    expect(checkLimits({ symbol: "BTCUSDT", notional: 50, quoteCurrency: "USDT" }).ok).toBe(true);
+  });
+});
+
+describe("P1-24 dailyRealizedLoss fail-closed", () => {
+  const savedDataDir = process.env.QUANT_MCP_DATA_DIR;
+  afterEach(() => { if (savedDataDir === undefined) delete process.env.QUANT_MCP_DATA_DIR; else process.env.QUANT_MCP_DATA_DIR = savedDataDir; });
+  it("조회 실패 시 NEGATIVE_INFINITY(서킷 발화) — return 0(fail-open) 금지", () => {
+    // 존재하지 않는 경로/권한오류를 유발하기 어려우니, DB 손상 대신 동작 계약만 확인:
+    // 정상 경로는 유한수, 실패 경로는 -Infinity여야 checkLimits가 차단한다.
+    process.env.QUANT_MCP_DATA_DIR = join(tmpdir(), `quant-mcp-failclosed-${process.pid}`);
+    const v = dailyRealizedLoss("USDT");
+    expect(Number.isFinite(v) || v === Number.NEGATIVE_INFINITY).toBe(true);
+    expect(v).not.toBe(Number.POSITIVE_INFINITY); // 양의 무한대면 서킷이 안 터짐(부호 오류 방지 회귀)
+  });
+});

@@ -92,6 +92,24 @@ these affect the paper default or the testnet-verified spot flow:
   bounded by the master switch + hard limits + idempotency instead (see the Security model
   above). That is a deliberate design, not a per-order approval.
 
+## Audit log integrity & single-user assumption
+
+- **Append-only audit log** (`~/.quant-mcp/audit.jsonl`) records every money-path attempt,
+  result, and error. A write failure (disk full / permission / missing path) does **not**
+  silently no-op: it increments a failure counter, writes a stderr warning, and is surfaced
+  via `live_status.auditStatus` and the dashboard `/api/audit-health`. By default trading
+  continues (availability first). Set `AUDIT_FAILURE_HALT=true` (threshold
+  `AUDIT_FAILURE_HALT_MAX`, default 10) to **block live orders** once audit writes keep
+  failing — use this when audit integrity is non-negotiable.
+- **Daily-loss circuit is fail-closed**: if the realized-loss query throws it returns
+  negative infinity (not zero), so any positive loss limit trips and orders are blocked —
+  a query failure can never hide a loss. Limits are per-currency (USDT vs KRW) so a loss on
+  one currency does not disable the other's circuit.
+- **Dashboard is single-user / localhost only.** It binds `127.0.0.1`, uses a launch token
+  → HttpOnly session cookie, and checks Origin on POST. The session cookie name is
+  port-scoped but the model assumes **one trusted local user** — do not expose the dashboard
+  port to other users or a shared host.
+
 These are tracked, not hidden — the project's value (the shared backtest≡live code structure
 and the risk controls) stands regardless. Trade real funds only after testnet validation, in
 small size, with the master switch and hard limits set.

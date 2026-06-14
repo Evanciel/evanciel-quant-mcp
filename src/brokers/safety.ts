@@ -50,6 +50,15 @@ export function liveGate(broker: Broker, market: "spot" | "futures" = "spot"): {
   if (trim(process.env.LIVE_TRADING_HALT) === "true") {
     return { allowed: false, env: c.env, reason: "LIVE_TRADING_HALT=true — 글로벌 킬스위치 작동(모든 주문 차단). 해제: 환경변수 제거." };
   }
+  // 감사로그 누적 실패 차단(audit P1-24, opt-in). 기본 OFF(가용성 보호) — 감사 무결성이 절대적인 운영에서만 켠다.
+  //   임계 초과 시 주문 차단(fail-closed). 임계 기본 10회, AUDIT_FAILURE_HALT_MAX로 조정(1..1000).
+  if (trim(process.env.AUDIT_FAILURE_HALT) === "true") {
+    const maxRaw = parseInt(trim(process.env.AUDIT_FAILURE_HALT_MAX) || "10", 10);
+    const max = Number.isFinite(maxRaw) && maxRaw >= 1 && maxRaw <= 1000 ? maxRaw : 10;
+    if (auditFailureCount() > max) {
+      return { allowed: false, env: c.env, reason: `감사로그 누적 기록 실패 ${auditFailureCount()}회 > ${max} → 주문 차단(AUDIT_FAILURE_HALT). 디스크/권한 점검 후 재시작.` };
+    }
+  }
   const masterOn = trim(process.env.LIVE_TRADING_ENABLED) === "true";
   if (c.env === "live") {
     if (!masterOn) return { allowed: false, env: "live", reason: "메인넷 키지만 LIVE_TRADING_ENABLED!=true → 차단(마스터 OFF). 페이퍼로 유지." };
@@ -88,10 +97,17 @@ export function checkLimits(order: { symbol: string; notional: number; quoteCurr
   const allow = trim(process.env.LIVE_SYMBOL_ALLOWLIST);
   if (allow && !allow.split(",").map((s) => s.trim().toUpperCase()).includes(order.symbol.toUpperCase()))
     return { ok: false, reason: `${order.symbol} 미허용(LIVE_SYMBOL_ALLOWLIST)` };
-  const dl = dailyRealizedLoss();
-  const explicitCircuit = Number(trim(process.env.LIVE_DAILY_LOSS_LIMIT) || "0");
-  const circuit = explicitCircuit || (liveActive ? def.dailyLoss : 0);
-  if (circuit > 0 && dl <= -Math.abs(circuit)) return { ok: false, reason: `일일 손실 ${dl} ≤ 서킷 -${circuit}(LIVE_DAILY_LOSS_LIMIT${explicitCircuit ? "" : " 기본값"}) → 거래중단` };
+  // 일일손실 서킷 — 통화 분리(audit P1-6). dl은 주문 통화의 실거래 손익만 집계(KRW+USDT 합산 비교 버그 제거).
+  //   서킷 우선순위: ① 통화별 분리 env(LIVE_DAILY_LOSS_LIMIT_USDT/_KRW) → ② 하위호환 단일 env(LIVE_DAILY_LOSS_LIMIT)
+  //   → ③ 통화별 안전 기본값. dl=-Infinity(조회 실패 fail-closed)면 어떤 양수 서킷에도 걸려 차단.
+  const ccyU = (order.quoteCurrency || DEFAULT_CCY).toUpperCase();
+  const dl = dailyRealizedLoss(order.quoteCurrency);
+  const sepEnv = ccyU === "KRW" ? process.env.LIVE_DAILY_LOSS_LIMIT_KRW : process.env.LIVE_DAILY_LOSS_LIMIT_USDT;
+  const explicitSep = Number(trim(sepEnv) || "0");
+  const explicitSingle = Number(trim(process.env.LIVE_DAILY_LOSS_LIMIT) || "0");
+  const circuit = explicitSep || explicitSingle || (liveActive ? def.dailyLoss : 0);
+  const circuitSrc = explicitSep ? `LIVE_DAILY_LOSS_LIMIT_${ccyU}` : explicitSingle ? "LIVE_DAILY_LOSS_LIMIT" : `${ccyU} 기본값`;
+  if (circuit > 0 && dl <= -Math.abs(circuit)) return { ok: false, reason: `${ccyU} 일일 손실 ${dl} ≤ 서킷 -${circuit}(${circuitSrc}) → 거래중단` };
   return { ok: true, reason: "ok" };
 }
 
@@ -228,10 +244,29 @@ export function dayBoundaryIso(nowMs: number = Date.now()): string {
   const localMidUTC = Date.UTC(shifted.getUTCFullYear(), shifted.getUTCMonth(), shifted.getUTCDate());
   return new Date(localMidUTC - offsetMin * ms).toISOString(); // 로컬 자정을 실제 UTC 인스턴트로 되빼기
 }
-/** 스토어의 '오늘'(일경계=KST 기본, dayBoundaryIso) 실거래(is_paper=0) pnl 합. 음수=손실. export=단위테스트용(머니패스 무변경). */
-export function dailyRealizedLoss(): number {
+/**
+ * 스토어의 '오늘'(일경계=KST 기본, dayBoundaryIso) 실거래(is_paper=0) pnl 합. 음수=손실.
+ * quoteCurrency(audit P1-6): 'USDT'/'USD'=binance 봇만, 'KRW'=kis/키움 봇만, 미지정=전체(하위호환).
+ *   trades→bots 조인으로 broker→통화 추론(통화별 서킷 독립 — KRW 손실이 USDT 서킷을 끄지 않게).
+ * 조회 실패(audit P1-24, fail-closed 교정): 종전 `return 0`은 손실을 0으로 숨겨 서킷을 무력화(fail-open)했다.
+ *   이제 NEGATIVE_INFINITY 반환 → 양수 서킷이면 무조건 발화(주문 차단) + stderr 경고. ⚠️ POSITIVE_INFINITY가
+ *   아님: checkLimits 비교가 `dl <= -circuit`이라 양의 무한대는 차단 안 됨(계획 부호 오류 교정).
+ */
+export function dailyRealizedLoss(quoteCurrency?: string): number {
   try {
-    const r = db().prepare(`SELECT COALESCE(SUM(pnl),0) s FROM trades WHERE is_paper=0 AND ts >= ?`).get(dayBoundaryIso()) as { s: number } | undefined;
+    const since = dayBoundaryIso();
+    const ccy = quoteCurrency ? quoteCurrency.toUpperCase() : null;
+    let r: { s: number } | undefined;
+    if (ccy === "USDT" || ccy === "USD") {
+      r = db().prepare(`SELECT COALESCE(SUM(t.pnl),0) s FROM trades t JOIN bots b ON b.id=t.bot_id WHERE t.is_paper=0 AND t.ts >= ? AND b.broker='binance'`).get(since) as { s: number } | undefined;
+    } else if (ccy === "KRW") {
+      r = db().prepare(`SELECT COALESCE(SUM(t.pnl),0) s FROM trades t JOIN bots b ON b.id=t.bot_id WHERE t.is_paper=0 AND t.ts >= ? AND b.broker IN ('kis','kiwoom')`).get(since) as { s: number } | undefined;
+    } else {
+      r = db().prepare(`SELECT COALESCE(SUM(pnl),0) s FROM trades WHERE is_paper=0 AND ts >= ?`).get(since) as { s: number } | undefined;
+    }
     return r?.s ?? 0;
-  } catch { return 0; }
+  } catch (e) {
+    try { process.stderr.write(`[quant-mcp] dailyRealizedLoss 조회 실패 → 서킷 안전 발화(fail-closed): ${e instanceof Error ? e.message : e}\n`); } catch { /* stderr 실패 무시 */ }
+    return Number.NEGATIVE_INFINITY; // fail-closed: 손실 불명 → 무한 손실로 간주해 서킷 차단
+  }
 }

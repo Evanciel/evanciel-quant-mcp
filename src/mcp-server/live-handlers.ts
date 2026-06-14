@@ -4,7 +4,7 @@
  * 키 넣으면 testnet 즉시거래, 메인넷은 LIVE_TRADING_ENABLED + 2단계토큰 필수.
  */
 import { getAdapter, configuredBrokers } from "../brokers/index.js";
-import { liveGate, checkLimits, orderHash, mintToken, consumeToken, audit, type Broker } from "../brokers/safety.js";
+import { liveGate, checkLimits, orderHash, mintToken, consumeToken, audit, auditFailureCount, lastAuditError, type Broker } from "../brokers/safety.js";
 
 export async function getPositions(a: { broker?: Broker; market?: "spot" | "futures" }) {
   const broker = a.broker || "binance", market = a.market || "spot";
@@ -99,6 +99,14 @@ export function liveStatus() {
       maxNotional: process.env.LIVE_MAX_NOTIONAL || "무제한(미설정)",
       symbolAllowlist: process.env.LIVE_SYMBOL_ALLOWLIST || "전체(미설정)",
       dailyLossLimit: process.env.LIVE_DAILY_LOSS_LIMIT || "없음(미설정)",
+      dailyLossLimitUSDT: process.env.LIVE_DAILY_LOSS_LIMIT_USDT || "통화 기본값",
+      dailyLossLimitKRW: process.env.LIVE_DAILY_LOSS_LIMIT_KRW || "통화 기본값",
+    },
+    // 감사로그 무결성(audit P1-24) — 누적 실패/마지막 에러/HALT 강제 여부.
+    auditStatus: {
+      failures: auditFailureCount(),
+      lastError: lastAuditError() || null,
+      haltEnforced: (process.env.AUDIT_FAILURE_HALT || "").trim() === "true",
     },
     note: "testnet/mock 키만 있으면 즉시 거래(가짜돈). 메인넷은 env=live + LIVE_TRADING_ENABLED=true + 주문별 2단계 확인토큰 필요.",
   };
