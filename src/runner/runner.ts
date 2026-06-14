@@ -7,6 +7,7 @@
 import type { StrategyNode, ScannerNode, BacktestConfig } from "../core/types/strategy.js";
 import { runCompositeBacktest } from "../core/backtest/engine.js";
 import { fetchKlines, buildAuxSeries, type Bar } from "../data/binance-public.js";
+import { validateCandleContiguity } from "../util/candle.js";
 import { collectSpreadSymbols } from "../core/strategy/spread-symbols.js";
 import { collectMtfConditions, buildMtfSeries, collectMtfRegimeConditions, buildMtfRegimeSeries, type MtfBar } from "../core/strategy/mtf.js";
 import { collectEventCalendars, buildEventCalendars } from "../core/calendar/calendars.js";
@@ -544,14 +545,23 @@ export async function tickBot(botId: string): Promise<{ action: "buy" | "sell" |
   let fetched: Bar[];
   if (dataBroker === "binance") {
     fetched = await fetchKlines(bot.symbol, interval, 300);
-  } else {
+  } else if (dataBroker === "kiwoom") {
     const da = getAdapter(dataBroker, "spot")?.adapter as { getCandles?: (s: string, i: string, c: number) => Promise<Bar[]> } | undefined;
     fetched = da?.getCandles ? await da.getCandles(bot.symbol, interval, 300) : [];
+  } else {
+    // KIS 캔들 API 미연동(audit P1-22) — 조용한 빈배열 hold(데이터 부족으로 위장) 대신 명시 고지 후 hold(fail-closed honesty).
+    store.insertLog(botId, "error", `${dataBroker} 캔들 데이터 미지원 — 현재 Binance 공개 데이터만 사용 가능(이 봇은 평가 불가). 종목/브로커 확인 필요.`);
+    store.setBotPositionState(botId, bot.position_state);
+    return { action: "hold", detail: `${dataBroker} 캔들 미지원 — 평가 불가` };
   }
   // 마지막 봉은 '형성 중'(미완결) → 백테스트는 닫힌 봉만 보므로 제거(backtest≡live). 닫힌 봉마다 최대 1회 정착 행동
   //  → 같은 형성봉의 재틱마다 넷이 다단계로 변해 멱등키가 충돌·드롭되던 문제(2차 동일방향 델타 누락) 제거.
   const data = fetched.length > 1 ? fetched.slice(0, -1) : fetched;
   if (data.length < 30) { store.setBotPositionState(botId, bot.position_state); return { action: "hold", detail: `데이터 부족(${data.length})` }; }
+  // 캔들 무결성(audit P1-22): interval 불일치(요청≠응답 주기) / 봉 누락(데이터 깨짐) 시 신호 평가 금지(hold).
+  //   crypto=24/7 엄격 연속, KR=중앙값 기반(주말/공휴일 갭 허용). backtest도 동일 fetch라 양쪽 일관(패리티 보존).
+  const contig = validateCandleContiguity(data, interval, dataBroker === "binance" ? "crypto" : "kr");
+  if (!contig.valid) { store.insertLog(botId, "error", `캔들 무결성 실패 → 평가 보류(${contig.reason})`); store.setBotPositionState(botId, bot.position_state); return { action: "hold", detail: `캔들 무결성 실패: ${contig.reason}` }; }
   const price = data[data.length - 1].close;
 
   // 스프레드 조건이 있으면 상대심볼(symbolB)을 동일 봉에 정렬해 주입 → 라이브에서도 spread 평가(backtest≡live).
@@ -778,7 +788,13 @@ async function tickScanner(bot: store.BotRow, node: ScannerNode, riskSizing?: Ba
     try { const raw = await fetchKlines(sym, interval, 300); const bars = raw.length > 1 ? raw.slice(0, -1) : raw; return { symbol: sym, bars }; } // 형성 중 봉 제거(닫힌 봉 기준)
     catch { return null; }
   }));
-  const entries = fetched.filter((x): x is { symbol: string; bars: Bar[] } => !!x && x.bars.length >= 30);
+  // 캔들 무결성(audit P1-22): 봉 누락/interval 불일치 심볼은 랭킹·평가에서 제외(crypto 유니버스 → 엄격 연속).
+  const entries = fetched.filter((x): x is { symbol: string; bars: Bar[] } => {
+    if (!x || x.bars.length < 30) return false;
+    const c = validateCandleContiguity(x.bars, interval, "crypto");
+    if (!c.valid) { store.insertLog(bot.id, "gate", `${x.symbol} 캔들 무결성 실패 → 랭킹 제외(${c.reason})`); return false; }
+    return true;
+  });
   const positions: ScannerPositions = (bot.position_state as ScannerPositions | null) || {};
   const held = Object.keys(positions);
   if (entries.length < 2) { store.setBotPositionState(bot.id, positions); return { action: "hold", detail: `유니버스 데이터 부족(${entries.length})` }; }

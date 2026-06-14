@@ -133,7 +133,8 @@ describe("P0-5 키움 체결 미확인 → 보유 기록 금지(fail-closed)", (
 
   it("(3) 회귀-크립토: 바이낸스 시장가 filled(price>0) → 정상 보유 기록(priceConfirmed 경로 불변)", async () => {
     klinesMock.mockResolvedValue(
-      Array.from({ length: 50 }, (_, i) => { const iso = new Date(Date.UTC(2025, 0, 1) + i * 3600000).toISOString(); return { date: iso.slice(0, 10), datetime: iso, open: 90, high: 90.5, low: 89.5, close: 90, volume: 1000 }; }),
+      // 봉 간격은 봇 interval(86400s=1d)과 일치해야 함(audit P1-22 캔들 무결성 게이트). 일봉 간격(86400000ms).
+      Array.from({ length: 50 }, (_, i) => { const iso = new Date(Date.UTC(2025, 0, 1) + i * 86400000).toISOString(); return { date: iso.slice(0, 10), datetime: iso, open: 90, high: 90.5, low: 89.5, close: 90, volume: 1000 }; }),
     );
     const id = mkBot("bn-ok", "binance", "BTCUSDT");
     const r = await tickBot(id);

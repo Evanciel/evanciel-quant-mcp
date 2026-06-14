@@ -2,6 +2,7 @@
  * binance-public.ts — Binance 공개 REST 데이터(키 불필요). v1의 유일한 데이터 출처.
  * stock-autotrade/scripts/agent-cli.ts 의 fetchKlines 페이지네이션을 그대로 이식(verbatim).
  */
+import { withRetry } from "../brokers/base.js";
 // datetime = 봉 오픈 전체 ISO(시각 포함) → 시간대(time-of-day/session) 조건 평가용. date(YYYY-MM-DD)는 하위호환.
 export interface Bar { date: string; datetime: string; open: number; high: number; low: number; close: number; volume: number }
 
@@ -22,9 +23,17 @@ export async function fetchKlinePage(symbol: string, interval: string, limit: nu
   u.searchParams.set("interval", interval);
   u.searchParams.set("limit", String(Math.min(1000, Math.max(20, limit))));
   if (endTime !== undefined) u.searchParams.set("endTime", String(endTime));
-  const res = await fetch(u, { signal: AbortSignal.timeout(20000) });
-  if (!res.ok) throw new Error(`klines ${res.status} (symbol=${symbol})`);
-  return (await res.json()) as (string | number)[][];
+  // 네트워크 재시도(audit P1-22): 단발 실패로 부분/빈 데이터가 통과해 백테스트가 조용히 잘리던 위험 제거.
+  //   GET=멱등 → withRetry 안전(429/5xx/타임아웃만 지수백오프). [http:N]/[retry-after:S] 마커로 base가 분류.
+  return withRetry(async () => {
+    const res = await fetch(u, { signal: AbortSignal.timeout(20000) });
+    if (!res.ok) {
+      const ra = res.headers.get("retry-after");
+      const markers = `[http:${res.status}]${ra && /^\d+$/.test(ra.trim()) ? ` [retry-after:${ra.trim()}]` : ""}`;
+      throw new Error(`klines ${res.status} (symbol=${symbol}) ${markers}`);
+    }
+    return (await res.json()) as (string | number)[][];
+  });
 }
 
 /**
