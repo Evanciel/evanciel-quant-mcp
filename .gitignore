@@ -6,3 +6,5 @@ dist/
 credentials.env
 .quant-mcp/
 .git-commit-msg.txt
+
+scripts/_proposals.json
