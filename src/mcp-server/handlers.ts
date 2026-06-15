@@ -20,6 +20,7 @@ import { collectMtfConditions, buildMtfSeries, collectMtfRegimeConditions, build
 import { collectEventCalendars, buildEventCalendars, BUILTIN_CALENDARS } from "../core/calendar/calendars.js";
 import { rankUniverse, computeRankMetric, type RankBar, type RankMetric } from "../core/scanner/rank.js";
 import { fetchKlines, fetchDerivatives, buildAuxSeries, type Bar } from "../data/binance-public.js";
+import { validateCandleContiguity } from "../util/candle.js";
 
 const cfg = (d: Bar[], symbol: string, interval: string, auxSeries?: Record<string, number[]>, mtfSeries?: Record<string, number[]>, eventCalendars?: Record<string, number[]>, mtfRegimeSeries?: Record<string, MtfRegimeSeries>): BacktestConfig => ({
   strategyId: "quant-mcp", symbol, startDate: d[0].date, endDate: d[d.length - 1].date,
@@ -43,6 +44,18 @@ const statOf = (r: ReturnType<typeof runCompositeBacktest>) => ({
   totalReturnPercent: +r.totalReturnPercent.toFixed(3), maxDrawdownPercent: +r.maxDrawdown.toFixed(3),
   winRate: +r.winRate.toFixed(1), totalTrades: r.totalTrades, profitFactor: +r.profitFactor.toFixed(3), sharpeRatio: +r.sharpeRatio.toFixed(3),
 });
+
+/**
+ * 백테스트용 캔들 페치 + 무결성 검증(audit P1-22-02). 라이브 러너(runner.ts tickBot)가 동일 fetch를 contiguity
+ * 게이트로 막으므로 백테스트도 동일하게 거부 → backtest≡live 패리티 보존(간극/형식깨짐 데이터로 신호 생성 금지).
+ * 데이터=binance-public(crypto, 24/7) → mode 'crypto'(엄격 연속). 무효 시 throw(상위 guard가 에러로 변환).
+ */
+async function fetchKlinesChecked(symbol: string, interval: string, days: number): Promise<Bar[]> {
+  const data = await fetchKlines(symbol, interval, days);
+  const contig = validateCandleContiguity(data, interval, "crypto");
+  if (!contig.valid) throw new Error(`캔들 무결성 실패(${symbol} ${interval}): ${contig.reason}`);
+  return data;
+}
 
 // ── 1. validate_strategy ──
 export function validateStrategy(args: { tree: unknown }) {
@@ -118,7 +131,7 @@ export async function backtest(args: { tree: StrategyNode; symbol?: string; inte
   const err = validateRootNode(args.tree);
   if (err) return { ok: false, error: `검증 실패: ${err}` };
   const symbol = args.symbol || "BTCUSDT", interval = args.interval || "1d", days = Number(args.days || 200);
-  const data = await fetchKlines(symbol, interval, days);
+  const data = await fetchKlinesChecked(symbol, interval, days);
   if (data.length < 30) return { ok: false, error: `데이터 부족(${data.length}봉)` };
   // 스프레드/MTF 조건이 있으면 상대심볼·상위TF를 동일 봉에 정렬해 주입(전체→슬라이스). 없으면 undefined(기존 동작).
   const spreadSyms = collectSpreadSymbols(args.tree);
@@ -157,7 +170,7 @@ export async function backtestShort(args: { tree: StrategyNode; symbol?: string;
   const err = validateRootNode(args.tree);
   if (err) return { ok: false, error: `검증 실패: ${err}` };
   const symbol = args.symbol || "BTCUSDT", interval = args.interval || "1d", days = Number(args.days || 200);
-  const data = await fetchKlines(symbol, interval, days);
+  const data = await fetchKlinesChecked(symbol, interval, days);
   if (data.length < 30) return { ok: false, error: `데이터 부족(${data.length}봉)` };
   const res = runShortBacktest(args.tree, data, cfg(data, symbol, interval), args.risk ?? {});
   return {
@@ -236,7 +249,7 @@ export async function strategyFactory(args: {
       const sym = c.symbol || symbol0, tf = c.interval || interval0, days = Number(c.days || days0);
       const key = `${sym}|${tf}|${days}`;
       let data = klineCache.get(key);
-      if (!data) { data = await fetchKlines(sym, tf, days); klineCache.set(key, data); }
+      if (!data) { data = await fetchKlinesChecked(sym, tf, days); klineCache.set(key, data); }
       if (data.length < 60) { rows.push({ id, valid: true, error: `데이터부족(${data.length})` }); continue; }
       const split = Math.floor(data.length * 0.7);
       const tr = runCompositeBacktest(c.tree, data.slice(0, split), cfg(data.slice(0, split), sym, tf));

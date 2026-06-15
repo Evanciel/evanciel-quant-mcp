@@ -243,6 +243,23 @@ describe("P1-6 일일손실 통화 분리", () => {
     process.env.LIVE_DAILY_LOSS_LIMIT_USDT = "100"; // 분리값 우선: -30 < 100 → 통과
     expect(checkLimits({ symbol: "BTCUSDT", notional: 50, quoteCurrency: "USDT" }).ok).toBe(true);
   });
+
+  // ── P1-24 후속: 음수/garbage env가 서킷·캡을 조용히 무력화하지 않는다(posNum 정화) ──
+  it("음수 일일손실 env(typo)는 서킷을 무력화하지 않고 통화 기본값으로 폴백해 차단", () => {
+    process.env.LIVE_TRADING_ENABLED = "true";
+    rawTrade("bn", "2026-06-09T16:00:00.000Z", -40); // USDT 추가 손실 → 총 -70 (기본서킷 50 초과)
+    process.env.LIVE_DAILY_LOSS_LIMIT_USDT = "-50";  // 음수 typo: 이전엔 circuit=-50 → `>0` 거짓 → 서킷 무력화(미차단 버그)
+    // 수정 후: posNum(-50)=0 → 통화 기본값(서킷 50)으로 폴백 → -70 ≤ -50 → 차단.
+    expect(checkLimits({ symbol: "BTCUSDT", notional: 50, quoteCurrency: "USDT" }).ok).toBe(false);
+  });
+
+  it("음수 LIVE_MAX_NOTIONAL(typo)는 노셔널 캡을 무력화하지 않고 기본 캡으로 폴백해 차단", () => {
+    process.env.LIVE_TRADING_ENABLED = "true";
+    process.env.LIVE_MAX_NOTIONAL = "-100"; // 음수 typo: 이전엔 cap=-100 → `>0` 거짓 → 캡 무력화
+    // 수정 후: posNum→0 → 통화 기본 캡(USDT 100)으로 폴백 → 노셔널 500 > 100 → 차단.
+    expect(checkLimits({ symbol: "BTCUSDT", notional: 500, quoteCurrency: "USDT" }).ok).toBe(false);
+    delete process.env.LIVE_MAX_NOTIONAL;
+  });
 });
 
 describe("P1-24 dailyRealizedLoss fail-closed", () => {

@@ -468,9 +468,12 @@ async function bootSeedLivePosition(bot: store.BotRow, cur: PaperPosition | null
  * unknown 누적 강제 reconcile(audit P1-2). 주문 결과불명(unknown)이 UNKNOWN_MAX_COUNT 연속 누적되면
  * reconcileLivePosition의 브로커 가드(바이낸스 skip)를 우회해 getPositions로 거래소 진실을 1회 강제 조회·수렴한다.
  *
- * 보수성(fail-closed): **adopt(거래소 보유>0)·in_sync만 반영하고 clear(장부>0·거래소0)는 하지 않는다** —
- *   unknown은 '주문이 나갔을 수도'라 거래소에 곧 뜰 수 있어 즉시 삭제는 위험(reconMisses 정상 경로에 위임).
- *   조회 실패=유지(다음 틱 재시도, 카운터 유지). 어느 경우든 성공 조회면 unknownCount=0 리셋(폭주 방지).
+ * 보수성(fail-closed): adopt(거래소 보유>0)·in_sync는 즉시 반영. no_exchange_pos(장부>0·거래소0)는 지연체결
+ *   오삭제 방지를 위해 즉시 삭제하지 않고 reconMisses를 누적해 RECON_CLEAR_MISSES 연속 부재 시에만 clear한다.
+ *   ※ 이 clear는 reconcileLivePosition의 clear 경로가 도달 불가한 바이낸스(getOrderByClientId 보유→reconcile skip)
+ *     에서만 적용(KR은 reconcileLivePosition이 처리 — 중복 카운트 방지). 유령 포지션 영구 잔존 버그 수정(audit P1-2 후속).
+ *   조회 실패=유지(다음 틱 재시도). adopt/in_sync에서 unknownCount=0 리셋(폭주 방지). no_exchange_pos 누적 중에는
+ *   unknownCount를 ≥MAX로 유지해 다음 틱에도 재호출→reconMisses 확정 누적(3틱 clear).
  */
 async function forceReconcileOnUnknown(bot: store.BotRow, cur: PaperPosition | null): Promise<PaperPosition | null> {
   const live = liveAdapterFor(bot);
@@ -491,7 +494,27 @@ async function forceReconcileOnUnknown(bot: store.BotRow, cur: PaperPosition | n
     store.insertLog(bot.id, "live", `[${live.env}] unknown 누적 → 강제 reconcile 채택: ${bot.symbol} 장부 ${curQty}→${rec.next.qty}(평단 ${entryAvg})`);
     return adopted;
   }
-  // in_sync / no_exchange_pos: 장부 변경 없이 카운터만 리셋(조회 성공=수렴 시도 완료). clear는 reconMisses 정상 경로에 위임.
+  // no_exchange_pos + 라이브 보유: 거래소 부재(주문 미발행 또는 외부청산). reconcileLivePosition의 clear 경로는
+  //   바이낸스(getOrderByClientId 보유 → reconcile skip, runner.ts:323)에서 도달 불가 → 유령 포지션이 영구 잔존하던
+  //   버그(audit P1-2 후속). 여기서 동일한 보수적 reconMisses 누적·정정을 수행한다. KR은 reconcileLivePosition이
+  //   이미 처리하므로 중복 카운트 방지 위해 'getOrderByClientId 보유 어댑터'(=바이낸스)에서만 적용.
+  const adapterHasOrderQuery = (live.adapter as { getOrderByClientId?: unknown }).getOrderByClientId !== undefined;
+  const curLive = curQty > 1e-9 ? (cur?.live ?? false) : false;
+  if (rec.action === "no_exchange_pos" && adapterHasOrderQuery && curLive && cur && curQty > 1e-9) {
+    const misses = (cur.reconMisses ?? 0) + 1;
+    if (misses >= RECON_CLEAR_MISSES) {
+      store.setBotPositionState(bot.id, null, true, false);
+      store.insertLog(bot.id, "live", `[${live.env}] unknown 누적 강제 reconcile: ${bot.symbol} 거래소 ${RECON_CLEAR_MISSES}틱 연속 부재 → 장부 ${curQty}→0(거래소 진실 채택, audit P1-2)`);
+      audit({ event: "reconcile_clear", botId: bot.id, env: live.env, symbol: bot.symbol, localQty: curQty, misses });
+      return null;
+    }
+    // unknownCount는 리셋하지 않음(≥MAX 유지) → 다음 틱 line 641 재호출로 reconMisses 확정 누적(3틱 clear).
+    const next: PaperPosition = { ...cur, reconMisses: misses };
+    store.setBotPositionState(bot.id, next, true, false);
+    store.insertLog(bot.id, "gate", `[${live.env}] unknown 누적 강제 reconcile: ${bot.symbol} 거래소 부재(${misses}/${RECON_CLEAR_MISSES}틱) — 보유 유지(지연체결 가능성)`);
+    return next;
+  }
+  // in_sync / 거래소 보유 정상: 장부 변경 없이 카운터만 리셋(조회 성공=수렴 시도 완료).
   if (cur) { const next = { ...cur, unknownCount: 0 }; store.setBotPositionState(bot.id, next, true, false); return next; }
   return cur;
 }
@@ -598,7 +621,7 @@ export async function tickBot(botId: string): Promise<{ action: "buy" | "sell" |
   const data = fetched.length > 1 ? fetched.slice(0, -1) : fetched;
   if (data.length < 30) { store.setBotPositionState(botId, bot.position_state); return { action: "hold", detail: `데이터 부족(${data.length})` }; }
   // 캔들 무결성(audit P1-22): interval 불일치(요청≠응답 주기) / 봉 누락(데이터 깨짐) 시 신호 평가 금지(hold).
-  //   crypto=24/7 엄격 연속, KR=중앙값 기반(주말/공휴일 갭 허용). backtest도 동일 fetch라 양쪽 일관(패리티 보존).
+  //   crypto=24/7 엄격 연속, KR=중앙값 기반(주말/공휴일 갭 허용). 백테스트 핸들러도 fetchKlinesChecked로 동일 검증(handlers.ts) → 간극 시 양쪽 거부(패리티 보존, audit P1-22-02).
   const contig = validateCandleContiguity(data, interval, dataBroker === "binance" ? "crypto" : "kr");
   if (!contig.valid) { store.insertLog(botId, "error", `캔들 무결성 실패 → 평가 보류(${contig.reason})`); store.setBotPositionState(botId, bot.position_state); return { action: "hold", detail: `캔들 무결성 실패: ${contig.reason}` }; }
   const price = data[data.length - 1].close;

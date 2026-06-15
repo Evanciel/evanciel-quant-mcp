@@ -81,4 +81,20 @@ describe("P1-2 unknown 누적 → 강제 reconcile", () => {
     expect(ps.unknownCount).toBe(1);
     expect(ps.qty).toBeCloseTo(0.01); // 거래소 진실 유지(adopt, 매도 실패로 보유 지속)
   });
+
+  it("거래소 부재(exchangeQty=0) + unknown 누적 → 강제 reconcile가 유령 포지션 정리(null)", async () => {
+    // 유령 라이브 보유: 장부엔 0.01, 거래소엔 0(이미 청산/외부청산). 바이낸스는 reconcileLivePosition이 skip되므로
+    //   forceReconcileOnUnknown이 RECON_CLEAR_MISSES 연속 부재 후 정리해야 한다(audit P1-2 후속: 영구 잔존 버그).
+    //   회귀 전: no_exchange_pos를 버리고 unknownCount만 리셋 → 장부 영구 잔존(거래소 flat인데 유령 보유).
+    store.setBotPositionState(botId, { status: "open", entryAvg: 100, qty: 0.01, openedAt: new Date().toISOString(), live: true }, true, false);
+    calls.exchangeQty = 0; // 거래소 부재
+
+    let cleared = false;
+    for (let i = 0; i < 12; i++) {
+      await tickBot(botId);
+      if (store.getBot(botId)?.position_state == null) { cleared = true; break; }
+    }
+    expect(cleared).toBe(true); // 유령 포지션이 결국 null로 정리(이전: 영구 잔존)
+    calls.exchangeQty = 0.01; // 다른 테스트 영향 방지(공유 mock 복원)
+  });
 });

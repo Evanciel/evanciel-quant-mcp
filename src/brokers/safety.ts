@@ -90,8 +90,12 @@ export const DEFAULT_LIVE_MAX_NOTIONAL = LIVE_DEFAULTS_BY_CCY.USDT.cap;
 export function checkLimits(order: { symbol: string; notional: number; quoteCurrency?: string }): { ok: boolean; reason: string } {
   const liveActive = trim(process.env.LIVE_TRADING_ENABLED) === "true";
   const def = ccyDefaults(order.quoteCurrency);
+  // env 숫자 파서: 유한 양수만 채택. 음수/garbage는 0 → 아래 `||` 체인이 통화별 안전 기본값으로 폴백.
+  //   (audit P1-24 후속: 음수 typo[예: -50]가 truthy라 circuit/cap으로 채택되고 `>0` 가드에 걸러져 서킷/캡이
+  //    조용히 무력화 + 일일손실 조회실패 -Infinity 폴백까지 가려지던 구멍 차단. 정상 양수 경로는 불변.)
+  const posNum = (v?: string) => { const n = Number(trim(v)); return Number.isFinite(n) && n > 0 ? n : 0; };
   // 명시 캡 우선. 라이브 마스터 ON인데 미설정이면 통화별 안전 기본 캡(무제한 금지). 페이퍼/testnet 마스터 OFF면 0(캡 없음).
-  const explicitCap = Number(trim(process.env.LIVE_MAX_NOTIONAL) || "0");
+  const explicitCap = posNum(process.env.LIVE_MAX_NOTIONAL);
   const cap = explicitCap || (liveActive ? def.cap : 0);
   if (cap > 0 && order.notional > cap) return { ok: false, reason: `노셔널 ${order.notional} > 캡 ${cap}(LIVE_MAX_NOTIONAL${explicitCap ? "" : ` ${order.quoteCurrency || DEFAULT_CCY} 기본값`})` };
   const allow = trim(process.env.LIVE_SYMBOL_ALLOWLIST);
@@ -103,8 +107,8 @@ export function checkLimits(order: { symbol: string; notional: number; quoteCurr
   const ccyU = (order.quoteCurrency || DEFAULT_CCY).toUpperCase();
   const dl = dailyRealizedLoss(order.quoteCurrency);
   const sepEnv = ccyU === "KRW" ? process.env.LIVE_DAILY_LOSS_LIMIT_KRW : process.env.LIVE_DAILY_LOSS_LIMIT_USDT;
-  const explicitSep = Number(trim(sepEnv) || "0");
-  const explicitSingle = Number(trim(process.env.LIVE_DAILY_LOSS_LIMIT) || "0");
+  const explicitSep = posNum(sepEnv);
+  const explicitSingle = posNum(process.env.LIVE_DAILY_LOSS_LIMIT);
   const circuit = explicitSep || explicitSingle || (liveActive ? def.dailyLoss : 0);
   const circuitSrc = explicitSep ? `LIVE_DAILY_LOSS_LIMIT_${ccyU}` : explicitSingle ? "LIVE_DAILY_LOSS_LIMIT" : `${ccyU} 기본값`;
   if (circuit > 0 && dl <= -Math.abs(circuit)) return { ok: false, reason: `${ccyU} 일일 손실 ${dl} ≤ 서킷 -${circuit}(${circuitSrc}) → 거래중단` };
