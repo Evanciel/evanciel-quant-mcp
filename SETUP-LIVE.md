@@ -85,7 +85,22 @@ npx quant-mcp setup
 - [ ] **사전점검(GO/NO-GO, 주문 0건)**: `npx tsx scripts/verify-mainnet-readiness.ts` → 🟢 GO 확인. env=live·마스터·키유효·**출금권한 OFF**·하드리밋을 한 번에 검사하고, 하드리밋이 실제로 막는지 자가검증.
 - [ ] 봇 1개·소액·`stop_loss_percent` 설정으로 시작 → `open_dashboard`로 모니터 + 거래소 앱에서 상주 스톱 확인.
 - [ ] 며칠 관찰 후 점진 확대. `audit.jsonl` + `testnet-cleanup-orders.ts`(심볼만 바꿔 메인넷 점검)로 고아주문 0 확인.
-- [ ] ⚠️ **현물만 라이브 지원**(선물 보호주문은 미지원). **지정가 라이브는 v2**(현재 시장가 체결).
+- [ ] ⚠️ **현물만 라이브 지원**(선물 보호주문은 미지원). 봇 진입은 기본 시장가, **지정가 진입(Binance 전용)은 아래 참조**.
+
+### 봇 지정가 진입(audit P1-5, Binance 전용)
+복합전략에 `entry_execution`을 주면 봇 진입을 maker-first **지정가**로 낸다(미설정=시장가, 기존 동작). 슬리피지 통제용 — 알파 아님.
+```jsonc
+entry_execution: {
+  type: "limit",          // 미설정/"market"=시장가(레거시)
+  limitOffsetPct: -0.1,   // 매수 지정가 = 현재가×(1+offset/100), maker는 ≤0. clamp -5..0(기본 0)
+  timeoutBars: 3,         // N 닫힌봉 미체결 시 시장가 폴백. clamp 1..50(기본 3)
+  maxSlippagePct: 0.5     // 폴백 시장가 슬리피지 캡(%). 초과 시 freeze(주문 안 냄, 잔량 드롭). clamp 0..5(기본 0.5)
+}
+```
+- **동작**: 신호 봉에 지정가 배치 → 체결되면 개시 / `timeoutBars` 닫힌봉 내 미체결이면 취소 후 **캡 이내**에서 시장가 폴백(캡 초과면 진입 포기). 크래시 후 재시작해도 `cid`로 같은 주문을 추적(중복 주문 방지).
+- **정직(체결 빈도)**: 백테스트는 봉이 지정가를 통과하면 maker 체결을 가정하나, 라이브는 호가 큐 위치로 체결을 **놓칠 수 있다**(라이브가 더 적게 진입 = 보수적). 진입가 자체는 백테 ≥ 라이브(절대 더 낙관 아님, 증명: `docs/02-design/p1-5-limit-entry-design.md`).
+- **재검증 필수**: 지정가 봇은 `backtest({ entryExecution })`로 OOS/DSR을 **다시 검증**하라(시장가 베이스라인 무효). 시장가 봇은 영향 0.
+- **KR 미지원**: KIS/키움은 미체결 체결확인 미배선이라 지정가 진입 라이브 거절(fail-closed). 시장가로 운용.
 
 ## 3. 라이브 — 한국투자증권(KIS, 한투)
 1. KIS Developers(apiportal.koreainvestment.com)에서 앱키/시크릿 + **모의투자** 신청

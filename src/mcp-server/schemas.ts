@@ -8,6 +8,15 @@ const symbol = z.string().default("BTCUSDT").describe("거래쌍 (예: BTCUSDT, 
 const interval = z.string().default("1d").describe("봉 주기 (1m,5m,15m,1h,4h,1d 등)");
 const days = z.number().int().positive().default(200).describe("백테스트 봉 수(과거)");
 
+// 봇 지정가 진입(audit P1-5). 미지정=시장가(레거시). limit은 Binance 봇 한정(KR은 start_bot서 fail-closed 거절).
+//   리스크 통제(슬리피지 캡)지 알파 아님. clamp 범위 검증(엔진 resolveEntryFill이 런타임 재클램프=방어).
+export const entryExecutionSchema = z.object({
+  type: z.enum(["market", "limit"]),
+  limitOffsetPct: z.number().min(-5).max(0).optional().describe("매수 지정가 오프셋(현재가 대비 %, maker는 ≤0). 기본 0"),
+  timeoutBars: z.number().int().min(1).max(50).optional().describe("N 닫힌봉 미체결 시 시장가 폴백. 기본 3"),
+  maxSlippagePct: z.number().min(0).max(5).optional().describe("폴백 시장가 슬리피지 캡(%, 초과 시 freeze). 기본 0.5"),
+});
+
 export const validateStrategyShape = {
   tree: z.unknown().describe("복합 전략 트리(leaf/composite/condition 노드). validateRootNode로 검증됨."),
 };
@@ -16,6 +25,7 @@ export const backtestShape = {
   tree: z.unknown().describe("검증·백테스트할 전략 트리"),
   symbol, interval, days,
   gapHandling: z.enum(["close", "worst"]).optional().describe("손절 갭 모델(audit P1-12). close(기본)=종가 판정 — 갭다운 손실 과소평가 가능. worst=봉 저가 터치 발동+min(시가,손절선) 체결(실거래 상주 STOP_MARKET에 근접한 보수 모델)."),
+  entryExecution: entryExecutionSchema.optional().describe("봇 지정가 진입 모델(audit P1-5). limit이면 maker-first 지정가+N봉 타임아웃→시장가(캡) 폴백을 백테에 반영 → 라이브와 동일 체결모델로 OOS/DSR 검증(미설정=시장가). 라이브 limit 봇은 이 모델로 재검증 필수."),
 };
 
 export const backtestShortShape = {
@@ -111,15 +121,6 @@ export const riskSizingSchema = z.discriminatedUnion("method", [
   atrSizingSchema,
   kellySizingSchema,
 ]);
-
-// 봇 지정가 진입(audit P1-5). 미지정=시장가(레거시). limit은 Binance 봇 한정(KR은 start_bot서 fail-closed 거절).
-//   리스크 통제(슬리피지 캡)지 알파 아님. clamp 범위 검증(엔진 resolveEntryFill이 런타임 재클램프=방어).
-export const entryExecutionSchema = z.object({
-  type: z.enum(["market", "limit"]),
-  limitOffsetPct: z.number().min(-5).max(0).optional().describe("매수 지정가 오프셋(현재가 대비 %, maker는 ≤0). 기본 0"),
-  timeoutBars: z.number().int().min(1).max(50).optional().describe("N 닫힌봉 미체결 시 시장가 폴백. 기본 3"),
-  maxSlippagePct: z.number().min(0).max(5).optional().describe("폴백 시장가 슬리피지 캡(%, 초과 시 freeze). 기본 0.5"),
-});
 
 // ── v2: 봇/전략/대시보드 (로컬 스토어 + 페이퍼 러너) ──
 export const saveCompositeShape = {

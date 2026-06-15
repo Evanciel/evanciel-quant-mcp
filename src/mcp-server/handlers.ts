@@ -3,7 +3,7 @@
  * 커맨드 바디를 그대로 이식 → backtest≡live 의미 보존. 각 핸들러는 plain object 반환(서버가 JSON 직렬화).
  * 데이터=binance-public(키 불필요), 계산=core 순수함수. 부수효과 0(네트워크 fetch만).
  */
-import type { StrategyNode, BacktestConfig } from "../core/types/strategy.js";
+import type { StrategyNode, BacktestConfig, EntryExecution } from "../core/types/strategy.js";
 import { runCompositeBacktest } from "../core/backtest/engine.js";
 import { runShortBacktest } from "../core/backtest/short-engine.js";
 import { calcReturnMoments } from "../core/backtest/metrics.js";
@@ -127,7 +127,7 @@ export async function scanUniverse(args: { universe: string[]; metric?: RankMetr
 }
 
 // ── 2. backtest (70/30 hold-out OOS + PSR) ── 단일 홀드아웃 분할(롤링/확장 워크포워드 아님: split=floor(len*0.7), train=앞 70%, test=뒤 30%).
-export async function backtest(args: { tree: StrategyNode; symbol?: string; interval?: string; days?: number; gapHandling?: "close" | "worst" }) {
+export async function backtest(args: { tree: StrategyNode; symbol?: string; interval?: string; days?: number; gapHandling?: "close" | "worst"; entryExecution?: EntryExecution }) {
   const err = validateRootNode(args.tree);
   if (err) return { ok: false, error: `검증 실패: ${err}` };
   const symbol = args.symbol || "BTCUSDT", interval = args.interval || "1d", days = Number(args.days || 200);
@@ -144,13 +144,13 @@ export async function backtest(args: { tree: StrategyNode; symbol?: string; inte
   // 이벤트 캘린더는 절대 epoch 타임스탬프 → 윈도우 슬라이스 불필요(엔진이 각 봉 시각을 전체 이벤트와 대조).
   const calNames = collectEventCalendars(args.tree);
   const ev = calNames.length ? buildEventCalendars(calNames) : undefined;
-  const full = runCompositeBacktest(args.tree, data, { ...cfg(data, symbol, interval, aux, mtf, ev, mtfReg), gapHandling: args.gapHandling ?? "worst" });
+  const full = runCompositeBacktest(args.tree, data, { ...cfg(data, symbol, interval, aux, mtf, ev, mtfReg), gapHandling: args.gapHandling ?? "worst", entryExecution: args.entryExecution });
   let oos: Record<string, unknown> | null = null;
   const split = Math.floor(data.length * 0.7);
   if (split >= 30 && data.length - split >= 20) {
     const train = data.slice(0, split), test = data.slice(split);
-    const tr = runCompositeBacktest(args.tree, train, { ...cfg(train, symbol, interval, sliceAux(aux, 0, split), sliceAux(mtf, 0, split), ev, sliceMtfRegime(mtfReg, 0, split)), gapHandling: args.gapHandling ?? "worst" });
-    const te = runCompositeBacktest(args.tree, test, { ...cfg(test, symbol, interval, sliceAux(aux, split, data.length), sliceAux(mtf, split, data.length), ev, sliceMtfRegime(mtfReg, split, data.length)), gapHandling: args.gapHandling ?? "worst" });
+    const tr = runCompositeBacktest(args.tree, train, { ...cfg(train, symbol, interval, sliceAux(aux, 0, split), sliceAux(mtf, 0, split), ev, sliceMtfRegime(mtfReg, 0, split)), gapHandling: args.gapHandling ?? "worst", entryExecution: args.entryExecution });
+    const te = runCompositeBacktest(args.tree, test, { ...cfg(test, symbol, interval, sliceAux(aux, split, data.length), sliceAux(mtf, split, data.length), ev, sliceMtfRegime(mtfReg, split, data.length)), gapHandling: args.gapHandling ?? "worst", entryExecution: args.entryExecution });
     const m = calcReturnMoments(te.equityCurve);
     const psr = probabilisticSharpe(m.perBarSharpe, m.n, m.skewness, m.kurtosis, 0);
     oos = {

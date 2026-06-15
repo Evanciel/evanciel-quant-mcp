@@ -30,7 +30,7 @@ export function buildServer(): McpServer {
 
   server.registerTool("backtest", {
     title: "백테스트 + 홀드아웃 OOS",
-    description: `전략을 Binance 공개 데이터로 백테스트. 전체 통계 + 70/30 hold-out OOS + PSR(운으로 설명될 확률). oosRobust=과적합 아님 신호. indicator·regime 조건 모두 timeframe 지정 가능(상위TF 평가, 예: 1h 추세 레짐 게이트 + 5m 진입). ${DISCLAIMER}`,
+    description: `전략을 Binance 공개 데이터로 백테스트. 전체 통계 + 70/30 hold-out OOS + PSR(운으로 설명될 확률). oosRobust=과적합 아님 신호. indicator·regime 조건 모두 timeframe 지정 가능(상위TF 평가, 예: 1h 추세 레짐 게이트 + 5m 진입). 봇을 지정가 진입(entry_execution.type=limit)으로 운용할 거면 entryExecution을 같이 넘겨 동일 체결모델로 OOS/DSR 재검증(audit P1-5). ${DISCLAIMER}`,
     inputSchema: S.backtestShape,
   }, guard((a) => H.backtest(a as Parameters<typeof H.backtest>[0])));
 
