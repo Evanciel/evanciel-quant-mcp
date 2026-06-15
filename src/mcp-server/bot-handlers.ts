@@ -90,6 +90,11 @@ export function startBot(a: { botId: string }) {
     if (comp && (comp.root_node as { type?: string })?.type === "scanner") {
       return { ok: false, error: "스캐너(자동선별) 봇은 라이브 미지원 — 멀티심볼 체결 reconcile 미구현으로 부분체결 시 장부-거래소 발산 위험(audit P1-23). 페이퍼로 운용하거나 단일 종목 봇으로 전환하세요." };
     }
+    // 지정가 진입 KR 거절(audit P1-5 Q3): KIS/키움은 getOrderByClientId 부재로 미체결 확인/타임아웃 불가 → 라이브 안전추적 불가.
+    //   fail-closed 거절(무음 시장가 강등 금지). 지정가 진입은 binance 한정.
+    if (comp && (comp.entry_execution as { type?: string } | null)?.type === "limit" && (b.broker === "kis" || b.broker === "kiwoom")) {
+      return { ok: false, error: `KR 브로커(${b.broker})는 지정가 진입(entry_execution.type=limit) 라이브 미지원 — 미체결 체결확인 미배선(audit P1-5). 시장가(type=market)로 바꾸거나 Binance 봇으로 운용하세요.` };
+    }
   }
   runner().start(a.botId);
   // 표시 라벨은 봇 mode를 그대로 반영(라이브 봇을 '페이퍼'로 거짓 표기하지 않음). 실제 실주문 여부는 러너의 게이트가 통제.

@@ -4,8 +4,9 @@
  * mode=live는 fillOrder가 liveGate 통과 시 어댑터로 실주문(미통과 시 페이퍼 폴백). 봇 라이브는 주문별 2단계 토큰이 아니라
  * 게이트 + 하드리밋 + 멱등으로 통제(2단계 토큰은 수동 place_order/place_protective 전용). 메인넷은 마스터스위치 전까지 OFF.
  */
-import type { StrategyNode, ScannerNode, BacktestConfig } from "../core/types/strategy.js";
+import type { StrategyNode, ScannerNode, BacktestConfig, EntryExecution } from "../core/types/strategy.js";
 import { runCompositeBacktest } from "../core/backtest/engine.js";
+import { elapsedClosedBars, checkSlippageCap, computeLimitPrice, clampTimeoutBars, clampMaxSlippagePct } from "../core/execution/entry.js"; // 봇 지정가 진입(audit P1-5)
 import { fetchKlines, buildAuxSeries, type Bar } from "../data/binance-public.js";
 import { validateCandleContiguity } from "../util/candle.js";
 import { collectSpreadSymbols } from "../core/strategy/spread-symbols.js";
@@ -333,6 +334,7 @@ export function derivePosition(trades: { action: string; price: number; quantity
  */
 async function reconcileLivePosition(bot: store.BotRow, cur: PaperPosition | null, lastIso: string): Promise<PaperPosition | null> {
   if (bot.mode !== "live") return cur;
+  if (cur?.pendingEntry) return cur; // audit P1-5 Q7: 지정가 대기 중엔 reconcile 미진입(resolvePendingEntry 전담, 이중입양 방지)
   const live = liveAdapterFor(bot);
   if (!live) return cur; // 게이트 미통과/어댑터 없음 → reconcile 불가(페이퍼처럼 동작, 회귀 0)
   const adapter = live.adapter as {
@@ -441,6 +443,7 @@ function baseAsset(symbol: string): string {
  */
 async function bootSeedLivePosition(bot: store.BotRow, cur: PaperPosition | null): Promise<PaperPosition | null> {
   if (bot.mode !== "live" || bootSeeded.has(bot.id)) return cur;
+  if (cur?.pendingEntry) return cur; // audit P1-5 Q7: 지정가 대기 중엔 부트시드 미진입(resolvePendingEntry 전담)
   bootSeeded.add(bot.id);
   if (cur && cur.status === "open") return cur; // 장부 존재 → 주기 reconcile 책임(여긴 null 갭 전용)
   const ledger = store.liveOpenLedger(bot.id);
@@ -496,6 +499,7 @@ async function bootSeedLivePosition(bot: store.BotRow, cur: PaperPosition | null
  *   unknownCount를 ≥MAX로 유지해 다음 틱에도 재호출→reconMisses 확정 누적(3틱 clear).
  */
 async function forceReconcileOnUnknown(bot: store.BotRow, cur: PaperPosition | null): Promise<PaperPosition | null> {
+  if (cur?.pendingEntry) return cur; // audit P1-5 Q7: 지정가 대기 중엔 강제 reconcile 미진입(resolvePendingEntry 전담)
   const live = liveAdapterFor(bot);
   if (!live) return cur; // 게이트 미통과 → 다음 틱
   const adapter = live.adapter as { getPositions?: () => Promise<ExchangePos[]> };
@@ -537,6 +541,97 @@ async function forceReconcileOnUnknown(bot: store.BotRow, cur: PaperPosition | n
   // in_sync / 거래소 보유 정상: 장부 변경 없이 카운터만 리셋(조회 성공=수렴 시도 완료).
   if (cur) { const next = { ...cur, unknownCount: 0 }; store.setBotPositionState(bot.id, next, true, false); return next; }
   return cur;
+}
+
+// ── 지정가 진입 대기(pendingEntry) 상태머신 (audit P1-5, binance 라이브 한정) ──
+// 신호 봉에 LIMIT 배치 → 매 틱 resolvePendingEntry로 추적: 체결→개시 / 타임아웃→취소+캡게이트 시장가 폴백 / 거절→해제 / 조회실패→유지.
+// backtest≡live: 백테 게이트(handlers.backtest)가 동일 worse-of 모델 검증. 라이브 체결가(limit 또는 캡 시장가) ≤ 게이트 모델 → never-optimistic.
+// 모든 상태변경은 함수 내부에서 영속(setBotPositionState). 호출측(tickBot)은 hold 반환만.
+
+/** 지정가 체결분으로 포지션 개시(base=null=신규) 또는 base에 가중평균 추가. 매수 분기 개시와 동형(insertTrade+상태 원자화+보호주문). */
+async function bookEntryFill(bot: store.BotRow, fillPrice: number, qty: number, lastIso: string, risk: RiskCfg, base: PaperPosition | null, idemSfx: string, reason: string): Promise<{ cur: PaperPosition | null; detail: string }> {
+  const baseQty = base && base.status === "open" ? base.qty : 0;
+  const newQty = baseQty + qty;
+  const entryAvg = newQty > 0 ? (baseQty * (base?.entryAvg ?? fillPrice) + qty * fillPrice) / newQty : fillPrice;
+  const openedAt = base?.openedAt ?? new Date().toISOString();
+  const peakPrice = Math.max(base?.peakPrice ?? entryAvg, fillPrice);
+  const t = store.tx(() => {
+    const t0 = store.insertTrade({ bot_id: bot.id, side: "buy", price: fillPrice, qty, pnl: 0, is_paper: 0, reason, idempotency_key: `${bot.id}:${lastIso}:${idemSfx}` });
+    if (t0) store.setBotPositionState(bot.id, { status: "open", entryAvg, qty: newQty, openedAt, live: true, peakPrice, protectiveIds: base?.protectiveIds ?? [], protFails: base?.protFails ?? 0 } satisfies PaperPosition, true, true);
+    return t0;
+  });
+  if (!t) return { cur: base, detail: "지정가 체결 기록 중복 스킵" };
+  const ps = await syncBotProtective(bot, true, bot.symbol, newQty, entryAvg, peakPrice, risk, base?.protectiveIds ?? []);
+  const protFails = nextProtFails(base?.protFails, ps, (risk.stopLossPercent != null || risk.trailingStopPercent != null));
+  if (ps.failed > 0) noteProtectiveFailure(bot.id, protFails);
+  const opened: PaperPosition = { status: "open", entryAvg, qty: newQty, openedAt, live: true, peakPrice, protectiveIds: ps.ids, protFails };
+  store.setBotPositionState(bot.id, opened, true, true);
+  store.insertLog(bot.id, "buy", `[실거래] ${reason} +${qty} → 보유 ${newQty} @${fillPrice}(평단 ${entryAvg.toFixed(2)})`);
+  return { cur: opened, detail: `${reason} +${qty}(보유 ${newQty})` };
+}
+
+/** 지정가 타임아웃 시장가 폴백: 캡 게이트(현재가 vs 지정가) 통과 시에만 시장가 — 초과면 freeze(주문 안 냄, 잔량 드롭). base=부분체결 포지션(없으면 null). */
+async function fillMarketFallback(bot: store.BotRow, remaining: number, limitPrice: number, maxSlippagePct: number, lastIso: string, risk: RiskCfg, base: PaperPosition | null): Promise<{ cur: PaperPosition | null; detail: string }> {
+  const live = liveAdapterFor(bot);
+  const adapter = live?.adapter;
+  let quote = Number.POSITIVE_INFINITY; // 조회 실패 시 캡 통과 불가(보수적 freeze)
+  try { if (adapter?.getPrice) { const p = await adapter.getPrice(bot.symbol); if (p.price > 0) quote = p.price; } } catch { /* quote=Inf 유지 */ }
+  const cap = checkSlippageCap(limitPrice, quote, maxSlippagePct);
+  if (!cap.ok) {
+    audit({ event: "entry_slippage_cap_exceeded", botId: bot.id, limitPrice, quote: Number.isFinite(quote) ? quote : -1, deviationPct: Number.isFinite(cap.deviationPct) ? +cap.deviationPct.toFixed(3) : -1, cap: maxSlippagePct });
+    store.insertLog(bot.id, "gate", `지정가 타임아웃 시장가 폴백 차단 — 슬리피지 ${Number.isFinite(cap.deviationPct) ? cap.deviationPct.toFixed(2) : "∞"}% > 캡 ${maxSlippagePct}%(잔량 ${remaining} 드롭, 다음 틱 재신호)`);
+    if (!base) store.setBotPositionState(bot.id, null, true, false); // 부분체결 없음 → flat(대기 해제)
+    return { cur: base, detail: `지정가 캡 초과 freeze(잔량 ${remaining} 드롭)` };
+  }
+  const fb = await fillOrder(bot, "buy", remaining, quote, bot.symbol, { posLive: true, barIso: lastIso }); // 시장가(entry 생략). cid=타임아웃봉 기준→placement cid와 구분.
+  if (fb.failed || !fb.live) {
+    store.insertLog(bot.id, "gate", `지정가 타임아웃 시장가 폴백 미체결(${fb.note}) — 잔량 ${remaining}(다음 틱)`);
+    if (!base) store.setBotPositionState(bot.id, null, true, false);
+    return { cur: base, detail: `시장가 폴백 미체결(${fb.note})` };
+  }
+  const gotQty = fb.filledQty && fb.filledQty > 0 ? fb.filledQty : remaining;
+  return bookEntryFill(bot, fb.price, gotQty, lastIso, risk, base, "limitfallback", "지정가 타임아웃 시장가 폴백");
+}
+
+/** 지정가 진입 대기 해소. tickBot 최상단에서 신호평가·reconcile보다 먼저 호출(한 틱 1상태변경, reconcile와 배타). */
+async function resolvePendingEntry(bot: store.BotRow, cur: PaperPosition, lastIso: string, risk: RiskCfg): Promise<{ cur: PaperPosition | null; detail: string }> {
+  const pe = cur.pendingEntry!;
+  const live = liveAdapterFor(bot);
+  if (!live) { store.setBotPositionState(bot.id, cur, true, false); return { cur, detail: "지정가 대기 — 게이트 미통과(다음 틱)" }; }
+  const adapter = live.adapter;
+  const getOrder = adapter.getOrderByClientId?.bind(adapter);
+  if (!getOrder) { store.setBotPositionState(bot.id, cur, true, false); return { cur, detail: "지정가 대기 — 조회 미지원(다음 틱)" }; }
+  let o: Awaited<ReturnType<typeof getOrder>>;
+  try { o = await getOrder(bot.symbol, pe.cid); }
+  catch (e) { store.insertLog(bot.id, "gate", `[${live.env}] 지정가 조회 실패(${e instanceof Error ? e.message : e}) → 대기 유지(cid 멱등, 다음 틱)`); store.setBotPositionState(bot.id, cur, true, false); return { cur, detail: "지정가 조회 실패 — 대기 유지" }; }
+  const verdict = classifyFillStatus(o);
+  if (verdict === "filled") {
+    const fillPrice = (o?.price && o.price > 0) ? o.price : pe.limitPrice;
+    const filledQty = (o?.executedQty && o.executedQty > 0) ? o.executedQty : ((o?.quantity && o.quantity > 0) ? o.quantity : pe.origQty);
+    audit({ event: "limit_entry_filled", botId: bot.id, env: live.env, fillPrice, filledQty });
+    return bookEntryFill(bot, fillPrice, filledQty, lastIso, risk, null, "limitfill", "지정가 진입 체결");
+  }
+  if (verdict === "open") {
+    const elapsed = elapsedClosedBars(pe.placedBarIso, lastIso, Math.max(1, bot.interval_seconds) * 1000);
+    if (elapsed < pe.timeoutBars) { store.setBotPositionState(bot.id, cur, true, false); return { cur, detail: `지정가 대기(${elapsed}/${pe.timeoutBars}봉)` }; }
+    // 타임아웃 → 취소 + (부분체결 개시) + 잔량 캡게이트 시장가 폴백.
+    if (adapter.cancelOrderByClientId) { try { await adapter.cancelOrderByClientId(bot.symbol, pe.cid); } catch (e) { store.insertLog(bot.id, "gate", `지정가 취소 실패(${e instanceof Error ? e.message : e}) — 폴백 진행`); } }
+    let executed = 0;
+    try { const re = await getOrder(bot.symbol, pe.cid); executed = (re?.executedQty && re.executedQty > 0) ? re.executedQty : 0; } catch { /* 재조회 실패 → 보수적 executed=0 */ }
+    audit({ event: "limit_entry_timeout", botId: bot.id, env: live.env, executed, origQty: pe.origQty });
+    let base: PaperPosition | null = null;
+    if (executed > 1e-9) base = (await bookEntryFill(bot, pe.limitPrice, executed, lastIso, risk, null, "limitpartial", "지정가 부분체결")).cur;
+    const remaining = Math.max(0, pe.origQty - executed);
+    if (remaining <= 1e-9) { if (!base) store.setBotPositionState(bot.id, null, true, false); return { cur: base, detail: `지정가 타임아웃 — 체결 ${executed}` }; }
+    return fillMarketFallback(bot, remaining, pe.limitPrice, pe.maxSlippagePct, lastIso, risk, base);
+  }
+  if (verdict === "rejected" || verdict === "not_placed") {
+    store.insertLog(bot.id, "gate", `[${live.env}] 지정가 주문 ${verdict} → 대기 해제(다음 틱 재평가)`);
+    store.setBotPositionState(bot.id, null, true, false);
+    return { cur: null, detail: `지정가 ${verdict} — 대기 해제` };
+  }
+  store.setBotPositionState(bot.id, cur, true, false); // unknown → 유지
+  return { cur, detail: "지정가 상태 불명 — 대기 유지" };
 }
 
 // ── 포트폴리오 레벨 캡(opt-in) — 러너측 스냅샷 + 진입 게이트 적용 ──
@@ -676,6 +771,14 @@ export async function tickBot(botId: string): Promise<{ action: "buy" | "sell" |
   let cur = bot.position_state as PaperPosition | null;
   const lastIso = data[data.length - 1].datetime;
 
+  // 지정가 진입 대기 해소(audit P1-5 Q7): pendingEntry 있으면 최우선 처리(신호평가·reconcile보다 먼저). 체결→개시 /
+  //   타임아웃→캡게이트 시장가 폴백 / 거절→해제. 대기 중이면 hold 반환 → bootSeed/reconcile/신호 전부 스킵(이중입양 방지).
+  if (cur?.pendingEntry) {
+    const peRisk: RiskCfg = { stopLossPercent: comp?.stop_loss_percent, takeProfitPercent: comp?.take_profit_percent, trailingStopPercent: comp?.trailing_stop_percent };
+    const pr = await resolvePendingEntry(bot, cur, lastIso, peRisk);
+    return { action: "hold", detail: pr.detail };
+  }
+
   // ── P0-4 체결 reconcile(라이브 전용, 신호평가 전): 키움/KIS는 주문 시점 체결확인 불가(getOrderByClientId 미지원)
   //    → 매수 시장가가 pending+price0로 동결(fail-closed)된 뒤 거래소가 지연체결하면 거래소엔 실보유·장부엔 0(역방향
   //    발산). 틱 시작 시 거래소 실보유(getPositions)를 조회해 봇 장부를 거래소 진실로 동기화한다. 이후 curQty/델타가
@@ -740,9 +843,24 @@ export async function tickBot(botId: string): Promise<{ action: "buy" | "sell" |
     }
     const buyQty = gate.qty;                          // 캡 적용 후 실제 매수 델타(미설정=plan.qty 그대로)
     const scaled = buyQty < plan.qty;                 // MDD 디리스킹으로 축소됐는가
+    // 지정가 진입(audit P1-5): 신규 진입(curQty 0·추가매수 아님) + binance + entry_execution.type==='limit'일 때만 LIMIT.
+    //   스케일인/피라미딩(추가매수)·KR·스캐너는 시장가 유지(단순·안전). 게이트는 시장가와 동일(liveGate/캡/사이징).
+    const ee = bot.broker === "binance" ? (comp?.entry_execution as EntryExecution | null | undefined) : undefined;
+    const useLimit = curQty < 1e-9 && !plan.partial && ee?.type === "limit";
+    const entryPlan: EntryExecPlan | undefined = useLimit && ee
+      ? { type: "limit", limitPrice: computeLimitPrice(price, ee.limitOffsetPct ?? 0), timeoutBars: clampTimeoutBars(ee.timeoutBars), maxSlippagePct: clampMaxSlippagePct(ee.maxSlippagePct) }
+      : undefined;
     // 신규 진입 또는 추가매수(스케일인/피라미딩). entryAvg는 엔진 가중평단(want.entryAvg)으로 갱신.
     //   채널: 신규 진입=미정(undefined → 라이브 시도, 명확실패만 페이퍼) / 추가매수=기존 포지션 채널 고정.
-    const fill = await fillOrder(bot, "buy", buyQty, price, bot.symbol, { posLive: curQty > 1e-9 ? curLive : undefined, barIso: lastIso });
+    const fill = await fillOrder(bot, "buy", buyQty, price, bot.symbol, { posLive: curQty > 1e-9 ? curLive : undefined, barIso: lastIso, entry: entryPlan });
+    // 지정가 접수(호가 등록) → pendingEntry 영속 + hold. 다음 틱부터 resolvePendingEntry가 체결/타임아웃 추적(크래시 생존, cid 멱등).
+    if (fill.pending && fill.cid && fill.limitPrice != null && entryPlan?.type === "limit") {
+      const marker: PaperPosition = { status: "open", entryAvg: 0, qty: 0, openedAt: cur?.openedAt ?? new Date().toISOString(), live: false,
+        pendingEntry: { cid: fill.cid, limitPrice: fill.limitPrice, origQty: buyQty, filledQty: 0, placedBarIso: lastIso, timeoutBars: entryPlan.timeoutBars, maxSlippagePct: entryPlan.maxSlippagePct } };
+      store.setBotPositionState(botId, marker, true, false);
+      store.insertLog(botId, "gate", `[지정가] 진입 호가 등록 @${fill.limitPrice}(${entryPlan.timeoutBars}봉 타임아웃, 캡 ${entryPlan.maxSlippagePct}%) — 체결 대기`);
+      return { action: "hold", detail: `지정가 진입 대기 @${fill.limitPrice}` };
+    }
     if (fill.failed) {
       // P0-1: 라이브 주문 실패/결과불명 → 페이퍼로 위장 기록하지 않고 동결(장부·상태 무변경). 다음 틱 재시도.
       store.setBotPositionState(botId, cur);
