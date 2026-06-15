@@ -28,7 +28,10 @@ export function loadCredentials(broker: Broker, market: "spot" | "futures" = "sp
   }
   if (broker === "kis") {
     const env = (trim(process.env.KIS_ENV) || "mock") as Env;
-    const appkey = trim(process.env.KIS_APPKEY), appsecret = trim(process.env.KIS_APPSECRET), account = trim(process.env.KIS_ACCOUNT);
+    // 표준명 KIS_APPKEY/APPSECRET/ACCOUNT + 흔한 변형(KIS_APP_KEY/APP_SECRET/ACCOUNT_NO) 둘 다 허용(설정 마찰 완화).
+    const appkey = trim(process.env.KIS_APPKEY) || trim(process.env.KIS_APP_KEY);
+    const appsecret = trim(process.env.KIS_APPSECRET) || trim(process.env.KIS_APP_SECRET);
+    const account = trim(process.env.KIS_ACCOUNT) || trim(process.env.KIS_ACCOUNT_NO);
     if (!appkey || !appsecret || !account) return null;
     return { env, appkey, appsecret, account };
   }

@@ -241,8 +241,11 @@ export class KisBrokerAdapter extends BaseBrokerAdapter {
     }
 
     if (!res.ok) {
-      // Do not echo the body — KIS error bodies can reflect request fields.
-      throw new Error(`KIS auth request failed: HTTP ${res.status}`);
+      // 원문 바디는 흘리지 않되, KIS 표준 OAuth 에러 사유 필드(error_description/msg1/코드)만 추출해 진단에 노출.
+      //   이 필드들은 고정 사유 문자열(예: '모의투자 미신청계좌')이라 appkey/secret을 반영하지 않음(시크릿 안전).
+      let reason = "";
+      try { const b = (await res.json()) as { error_description?: string; msg1?: string; error_code?: string; msg_cd?: string }; reason = b.error_description || b.msg1 || [b.error_code, b.msg_cd].filter(Boolean).join(" "); } catch { /* 바디 없음/비JSON */ }
+      throw new Error(`KIS auth request failed: HTTP ${res.status}${reason ? ` — ${reason}` : ""}`);
     }
 
     let data: TokenResponse;

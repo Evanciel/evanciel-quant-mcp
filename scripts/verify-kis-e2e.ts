@@ -13,8 +13,8 @@ for (const line of readFileSync(".env.local", "utf8").split(/\r?\n/)) {
   if (m && process.env[m[1]] === undefined) process.env[m[1]] = m[2].replace(/^["']|["']$/g, "");
 }
 if ((process.env.KIS_ENV || "mock") !== "mock") { console.error("❌ KIS_ENV=mock 아님 — 실거래 안전중단"); process.exit(1); }
-if (!process.env.KIS_APPKEY || !process.env.KIS_APPSECRET || !process.env.KIS_ACCOUNT) {
-  console.error("❌ KIS 모의투자 키 미설정(.env.local에 KIS_APPKEY/KIS_APPSECRET/KIS_ACCOUNT 필요) — E2E 실행 불가");
+if (!(process.env.KIS_APPKEY || process.env.KIS_APP_KEY) || !(process.env.KIS_APPSECRET || process.env.KIS_APP_SECRET) || !(process.env.KIS_ACCOUNT || process.env.KIS_ACCOUNT_NO)) {
+  console.error("❌ KIS 모의투자 키 미설정(KIS_APPKEY/KIS_APPSECRET/KIS_ACCOUNT 또는 변형 _APP_KEY/_APP_SECRET/_ACCOUNT_NO) — E2E 실행 불가");
   process.exit(1);
 }
 
