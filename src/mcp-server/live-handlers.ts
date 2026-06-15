@@ -46,13 +46,13 @@ export async function getQuote(a: { broker?: Broker; market?: "spot" | "futures"
   } catch (e) { return { ok: false, error: `시세 조회 실패 — 종목(${a.symbol}) 확인: ${e instanceof Error ? e.message : e}` }; }
 }
 
-/** 미체결(상주) 주문 목록(읽기전용, audit P1-16/19). KR 어댑터는 미구현 — 정직하게 미지원 반환. */
+/** 미체결(상주) 주문 목록(읽기전용, audit P1-16/19). Binance·키움 지원, KIS는 fail-closed throw(미지원). 미구현 어댑터는 정직하게 미지원 반환. */
 export async function getOpenOrders(a: { broker?: Broker; market?: "spot" | "futures"; symbol: string }) {
   const broker = a.broker || "binance", market = a.market || "spot";
   const got = getAdapter(broker, market);
   if (!got) return { ok: false, error: `${broker} 키 미설정(env). SETUP-LIVE.md 참고.` };
   if (typeof got.adapter.getOpenOrders !== "function") {
-    return { ok: false, error: `${broker} 어댑터는 미체결 조회 미구현(현재 Binance만, audit P2 — KIS/키움 후속). 거래소 앱에서 확인하세요.` };
+    return { ok: false, error: `${broker} 어댑터는 미체결 조회 미구현. 거래소 앱에서 확인하세요.` };
   }
   try { return { ok: true, broker, env: got.env, symbol: a.symbol, orders: await got.adapter.getOpenOrders(a.symbol) }; }
   catch (e) { return { ok: false, error: e instanceof Error ? e.message : String(e) }; }

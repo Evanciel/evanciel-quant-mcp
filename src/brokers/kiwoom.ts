@@ -14,7 +14,7 @@
  *   (process.env 직접 접근 금지 — caller가 env를 credentials로 주입). 시크릿/서명헤더 절대 로그 금지.
  *   베이스URL은 credentials.env로만 선택(메인넷 하드코딩 금지), env 누락 시 SAFE값(mock)으로 폴백.
  */
-import { BaseBrokerAdapter } from "./base.js";
+import { BaseBrokerAdapter, withRetry } from "./base.js";
 import { roundToKrxTick } from "./krx-tick.js";
 import type {
   BrokerType,
@@ -42,6 +42,8 @@ const API_ID = {
   cancel: "kt10003",
   balance: "kt00018",
   holdings: "ka10072",
+  // 미체결요청(/api/dostk/acnt). 모의 E2E로 확정: 배열키 'oso', stex_tp 필수(숫자). audit P1-10.
+  openOrders: "ka10075",
   // 주식 시세(현재가/호가) — 시세 단일종목 조회. KIS와 별개 경로(/api/dostk/mrkcond).
   quote: "ka10004",
 } as const;
@@ -206,12 +208,18 @@ export class KiwoomBrokerAdapter extends BaseBrokerAdapter {
         body: JSON.stringify(body),
         signal: AbortSignal.timeout(TIMEOUT_MS),
       });
-    } catch {
-      throw new Error("Kiwoom API request failed (network)");
+    } catch (e) {
+      // 타임아웃/네트워크 단절 — 원 에러명·메시지(시크릿 미포함 fetch 레이어 에러) 보존 →
+      //   withRetry의 classifyRetryableError가 TimeoutError/AbortError/fetch failed 등을 재시도 가능으로 분류(audit P1-22).
+      const detail = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
+      throw new Error(`Kiwoom API request failed (network) [${detail}]`);
     }
 
     if (!res.ok) {
-      throw new Error(`Kiwoom API error: ${res.status}`);
+      // [http:N]/[retry-after:S] 마커를 심어 base.classifyRetryableError가 429/5xx/408만 재시도하도록(4xx 비재시도). audit P1-22.
+      const ra = res.headers.get("retry-after");
+      const markers = `[http:${res.status}]${ra && /^\d+$/.test(ra.trim()) ? ` [retry-after:${ra.trim()}]` : ""}`;
+      throw new Error(`Kiwoom API error: ${res.status} ${markers}`);
     }
 
     const data = (await res.json().catch(() => ({}))) as KiwoomResponse;
@@ -372,7 +380,9 @@ export class KiwoomBrokerAdapter extends BaseBrokerAdapter {
     else if (iv === "1w" || iv === "1week") { apiId = "ka10082"; arrKey = "stk_stk_pole_chart_qry"; body = { stk_cd: stk, base_dt: today, upd_stkpc_tp: "1" }; }
     else if (iv === "1mo" || iv === "1month" || iv === "1M".toLowerCase()) { apiId = "ka10083"; arrKey = "stk_mth_pole_chart_qry"; body = { stk_cd: stk, base_dt: today, upd_stkpc_tp: "1" }; }
     else { apiId = "ka10081"; arrKey = "stk_dt_pole_chart_qry"; body = { stk_cd: stk, base_dt: today, upd_stkpc_tp: "1" }; }
-    const { data } = await this.post("/api/dostk/chart", apiId, body);
+    // 캔들은 라이브 틱 평가 경로(러너) → 단발 실패(타임아웃/429/5xx)로 틱 전체가 죽지 않도록 재시도(audit P1-22, Binance fetchKlines와 대칭).
+    //   GET-동등 멱등 읽기라 안전. 주문 POST(placeOrder/cancelOrder)는 절대 wrap 금지(비멱등).
+    const { data } = await withRetry(() => this.post("/api/dostk/chart", apiId, body), { attempts: 3, baseDelayMs: 400, maxDelayMs: 8000 });
     // 차트 응답도 return_code 누락 가능성 → 차트 배열 존재를 성공 증거로.
     this.assertOk(data, "getCandles", (d) => Array.isArray((d as Record<string, unknown>)[arrKey]));
     const rows = Array.isArray((data as Record<string, unknown>)[arrKey]) ? ((data as Record<string, unknown>)[arrKey] as Record<string, unknown>[]) : [];
@@ -497,6 +507,56 @@ export class KiwoomBrokerAdapter extends BaseBrokerAdapter {
         `Failed to cancel order ${orderId}: ${
           error instanceof Error ? error.message : "unknown error"
         }`,
+      );
+    }
+  }
+
+  /**
+   * 미체결(상주/접수) 주문 목록(ka10075 미체결요청, /api/dostk/acnt). audit P1-10 / P1-19.
+   * KR은 getOrderByClientId가 없어(주문 직후 즉시 체결확인 불가) '내 지정가가 아직 미체결로 떠 있나'를 이걸로 본다.
+   * 모의 E2E(probe-kiwoom-open-orders.ts / verify-kiwoom-mock-open-orders-e2e.ts)로 응답키 확정:
+   *   배열키 'oso', ord_no(주문번호) · oso_qty(미체결잔량) · io_tp_nm(±매수/매도=방향) · ord_pric(주문가) · ord_qty/cntr_qty(원/체결).
+   *   요청 stex_tp(숫자 "0"=통합) 필수 — dmst_stex_tp="KRX"는 거부됨(필수 파라미터 누락).
+   * ⚠️ getOrderByClientId/getOrderById는 추가하지 말 것 — runner reconcile 판별자(getOrderByClientId===undefined)가
+   *   KR을 포지션 reconcile 경로로 보내는 근거다(types.ts:88, runner.ts:323). 추가 시 KR reconcile이 꺼져 유령 포지션.
+   */
+  async getOpenOrders(symbol: string): Promise<OrderResult[]> {
+    try {
+      const stk = symbol ? this.normalizeSymbol(symbol) : "";
+      const { data } = await this.post("/api/dostk/acnt", API_ID.openOrders, {
+        all_stk_tp: stk ? "0" : "1", // 0=종목지정 / 1=전체
+        trde_tp: "0",                 // 0=전체 매매구분(매수+매도)
+        stk_cd: stk,                  // 종목코드(미지정 시 전체)
+        stex_tp: "0",                 // 0=통합(필수, 숫자). E2E 확인: stex_tp 누락 시 거부.
+      });
+      // return_code 부재를 성공으로 보지 않음 — 'oso' 배열 존재를 성공 증거로(getBalance 패턴, fail-closed).
+      this.assertOk(data, "getOpenOrders", (d) => Array.isArray(d.oso));
+      const rows = Array.isArray(data.oso) ? (data.oso as Record<string, unknown>[]) : [];
+      const out: OrderResult[] = [];
+      for (const r of rows) {
+        const orderId = String(r.ord_no ?? "");
+        const remain = toNum(r.oso_qty); // 미체결 잔량
+        if (!orderId || orderId === "0" || remain <= 0) continue; // 체결완료/무효 행 스킵
+        if (stk && this.normalizeSymbol(String(r.stk_cd ?? "")) !== stk) continue; // 요청 종목만(서버 폴백 방어)
+        const sideText = String(r.io_tp_nm ?? ""); // "+매수"/"-매도" (trde_tp=보통/시장가는 주문유형이라 방향 아님)
+        const side: "buy" | "sell" = sideText.includes("매도") ? "sell" : "buy";
+        out.push({
+          orderId,
+          symbol: this.normalizeSymbol(String(r.stk_cd ?? stk)),
+          side,
+          quantity: remain, // 미체결 잔량(패널·reconcile 관심 = 남은 수량)
+          price: Math.abs(toNum(r.ord_pric)), // 0=시장가 접수
+          status: "pending", // 미체결 = 접수/부분 → pending
+          executedQty: toNum(r.cntr_qty), // 체결분(부분체결 가시화)
+          origQty: toNum(r.ord_qty), // 원주문수량
+          timestamp: new Date(), // 키움 tm=HHMMSS(날짜없음) → now
+        });
+      }
+      return out;
+    } catch (error) {
+      // fail-closed: 조회 실패는 빈 배열 금지(silent empty = '미체결 없음'으로 둔갑). throw → live-handler가 ok:false 변환.
+      throw new Error(
+        `Failed to fetch open orders for ${symbol || "all"}: ${error instanceof Error ? error.message : "unknown error"}`,
       );
     }
   }

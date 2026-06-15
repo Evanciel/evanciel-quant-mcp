@@ -541,6 +541,18 @@ export class KisBrokerAdapter extends BaseBrokerAdapter {
     return Math.max(0, Math.trunc(quantity));
   }
 
+  /**
+   * 미체결(정정/취소가능) 주문 조회 — KIS 미구현(audit P1-10), fail-closed throw.
+   * 요청부(inquire-psbl-rvsecncl, TTTC0084R/모의 VTTC0084R)는 확정이나 응답 필드 + KIS 모의키·E2E 부재 →
+   * 검증 안 된 파싱을 넣으면 reconcile/패널이 거짓 '미체결 없음'을 신뢰. 빈 배열 반환 금지(silent empty=둔갑).
+   * ⚠️ getOrderByClientId는 추가하지 말 것 — reconcile 판별자 유지(runner.ts:323). KIS는 포지션 reconcile 경로.
+   */
+  async getOpenOrders(_symbol: string): Promise<OrderResult[]> {
+    throw new Error(
+      "KIS 미체결 조회 미지원 — KIS 모의 E2E로 응답필드 확정 후 구현(audit P1-10). 빈 배열 반환 금지(fail-closed).",
+    );
+  }
+
   // ----------------------------------------------------------------------------
   // Internal helpers
   // ----------------------------------------------------------------------------

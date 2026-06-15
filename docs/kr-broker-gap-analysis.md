@@ -86,3 +86,13 @@ P1-10(KR 체결 즉시 reconcile)의 차단 요인이던 **미체결 조회 공�
 - **이번 세션 구현 안 함**: 엔드포인트/tr_id/요청은 확정이나 **응답 필드명 미확정** → 검증 안 된 파싱을 reconcile에 넣으면 키움 E2E-1/2/3과 동형 런타임 버그 위험(불변 원칙: KR 응답 스펙은 모의 E2E로 확정).
 - **다음 단계**: KIS 모의키(`KIS_APPKEY/APPSECRET/ACCOUNT`) + 키움 모의키 확보 → `scripts/verify-kiwoom-mock-order-e2e.ts` 패턴으로 ka10075/inquire-psbl-rvsecncl 응답 필드 확정 → `getOpenOrders`(KR) 구현 → reconcileLivePosition KR 분기에 체결 즉시 확인 배선. 위 확정 스펙으로 요청부는 바로 작성 가능.
 - **타입가드 점검 결과(정정)**: reconcileLivePosition의 `getOrderByClientId !== undefined` 가드는 **의도대로 정상**(Binance=보유→skip, KR=미보유→reconcile 진입). 역전 아님 — 변경 금지.
+
+### 확정·구현 (2026-06-15) — 키움 ka10075 모의 E2E + getOpenOrders 구현
+
+키움 모의키로 **ka10075 실응답을 프로브**(`scripts/probe-kiwoom-open-orders.ts`)해 추정 필드를 실값으로 확정 → `getOpenOrders` 구현·E2E 8/8 PASS.
+
+- **확정 wire 스펙**(추정→실측): POST `/api/dostk/acnt`, api-id `ka10075`. 요청 바디 `{ all_stk_tp, trde_tp, stk_cd, stex_tp }` — **`stex_tp`(숫자 "0"=통합) 필수**(`dmst_stex_tp="KRX"` 전송 시 "필수 입력 값 누락[stex_tp]" 거부). `/api/dostk/ordr` 경로는 ka10075 미지원(거부).
+- **응답 배열키 `oso`**(확정). 행 필드: `ord_no`(주문번호=cancel orig_ord_no), `oso_qty`(미체결잔량), `ord_qty`/`cntr_qty`(원/체결), `ord_pric`(주문가), `io_tp_nm`("+매수"/"-매도"=**방향 소스**; `trde_tp`="보통"/"시장가"는 주문유형이라 방향 아님), `ord_stt`("접수").
+- **구현**: `kiwoom.ts getOpenOrders(symbol)` — `oso`→`OrderResult[]`(status=pending, quantity=미체결잔량, executedQty=체결분), 조회 실패는 **fail-closed throw**(빈 배열 둔갑 금지), `assertOk` 배열존재 가드. `kis.ts getOpenOrders` = **fail-closed throw 스텁**(KIS 키·E2E 부재). 기존 MCP `get_open_orders` 툴 + 대시보드 미체결 패널이 키움 실데이터 표출(어댑터 메서드만 부재였음).
+- **불변 보존**: `getOrderByClientId`는 키움·KIS 모두 undefined 유지(reconcile 판별자 runner.ts:323) — 단위테스트로 고정. 즉시 체결확인 reconcile 배선(주문직후 동일틱)은 **연기**(주문경로 고위험·이득=레이턴시뿐, 차틱 getPositions reconcile이 이미 fail-closed 커버).
+- **남음**: KIS 절반(모의키 확보 시 inquire-psbl-rvsecncl 응답필드 E2E → 본구현). 정정(modify) 미구현 유지.

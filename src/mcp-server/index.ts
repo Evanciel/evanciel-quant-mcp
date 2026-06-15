@@ -162,7 +162,7 @@ export function buildServer(): McpServer {
 
   server.registerTool("get_open_orders", {
     title: "미체결 주문 조회(BYOK)",
-    description: `심볼의 미체결(상주) 주문 목록 — 지정가 잔존·고아 주문 점검(audit P1-16). 읽기전용. 현재 Binance만(KIS/키움 후속). ${DISCLAIMER}`,
+    description: `심볼의 미체결(상주) 주문 목록 — 지정가 잔존·고아 주문 점검(audit P1-16/19). 읽기전용. Binance·키움 지원(KIS는 fail-closed 미지원). ${DISCLAIMER}`,
     inputSchema: S.getOpenOrdersShape, annotations: { readOnlyHint: true },
   }, guard((a) => L.getOpenOrders(a as Parameters<typeof L.getOpenOrders>[0])));
 
