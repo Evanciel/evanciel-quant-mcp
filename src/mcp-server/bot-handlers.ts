@@ -8,12 +8,15 @@ import { runner } from "../runner/runner.js";
 import { startDashboard } from "../dashboard/server.js";
 import { liveGate, type Broker } from "../brokers/safety.js";
 import type { RiskSizingConfig } from "../core/risk/order-sizing.js";
+import type { EntryExecution } from "../core/types/strategy.js";
 
 export function saveComposite(a: {
   name: string; tree: unknown; symbol?: string; market?: "spot" | "futures"; leverage?: number;
   stopLossPercent?: number; takeProfitPercent?: number; tpLadder?: unknown; scaleIn?: unknown; pyramid?: unknown; trailingStopPercent?: number;
   // 사이징 모드(opt-in). 리스크 통제(vol_target/atr/kelly) — 알파 아님. 미설정 시 기존 quantityPercent. 엔진·러너 공용(backtest≡live).
   riskSizing?: RiskSizingConfig;
+  // 진입 체결(opt-in, audit P1-5). limit=지정가+타임아웃→시장가 폴백. 미설정=시장가. PR-3에서 라이브 배선 + KR/start_bot fail-closed.
+  entryExecution?: EntryExecution;
 }) {
   const err = validateBotRoot(a.tree); // scanner 노드도 허용(validateScannerNode 분기)
   if (err) return { ok: false, error: `검증 실패: ${err}` };
@@ -24,6 +27,7 @@ export function saveComposite(a: {
     tp_ladder: a.tpLadder ?? null, scale_in: a.scaleIn ?? null, pyramid: a.pyramid ?? null,
     trailing_stop_percent: a.trailingStopPercent ?? null,
     risk_sizing: a.riskSizing ?? null,
+    entry_execution: a.entryExecution ?? null,
   });
   return { ok: true, compositeStrategyId: row.id, name: row.name, symbol: row.symbol };
 }

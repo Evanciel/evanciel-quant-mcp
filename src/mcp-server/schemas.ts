@@ -112,6 +112,15 @@ export const riskSizingSchema = z.discriminatedUnion("method", [
   kellySizingSchema,
 ]);
 
+// 봇 지정가 진입(audit P1-5). 미지정=시장가(레거시). limit은 Binance 봇 한정(KR은 start_bot서 fail-closed 거절).
+//   리스크 통제(슬리피지 캡)지 알파 아님. clamp 범위 검증(엔진 resolveEntryFill이 런타임 재클램프=방어).
+export const entryExecutionSchema = z.object({
+  type: z.enum(["market", "limit"]),
+  limitOffsetPct: z.number().min(-5).max(0).optional().describe("매수 지정가 오프셋(현재가 대비 %, maker는 ≤0). 기본 0"),
+  timeoutBars: z.number().int().min(1).max(50).optional().describe("N 닫힌봉 미체결 시 시장가 폴백. 기본 3"),
+  maxSlippagePct: z.number().min(0).max(5).optional().describe("폴백 시장가 슬리피지 캡(%, 초과 시 freeze). 기본 0.5"),
+});
+
 // ── v2: 봇/전략/대시보드 (로컬 스토어 + 페이퍼 러너) ──
 export const saveCompositeShape = {
   name: z.string().describe("전략 이름"),
@@ -126,6 +135,7 @@ export const saveCompositeShape = {
   pyramid: z.unknown().optional(),
   trailingStopPercent: z.number().optional(),
   riskSizing: riskSizingSchema.optional().describe("사이징 모드(리스크 통제, 알파 아님): vol_target=변동성 타게팅 / atr=ATR 트레이드당 리스크 고정 / kelly=fractional Kelly. 생략 시 기존 quantityPercent"),
+  entryExecution: entryExecutionSchema.optional().describe("봇 진입 체결(audit P1-5): limit=maker-first 지정가+타임아웃→시장가 폴백+슬리피지 캡(Binance 봇 한정). 생략 시 시장가. 슬리피지 통제지 알파 아님"),
 };
 export const createBotShape = {
   // 심층방어: 불신 입력(MCP 클라/LLM)을 입구에서 좁힘 — 대시보드는 String(s) esc()로 1차 차단하되, 스키마에서 길이·charset·enum까지 강제(저장형 XSS·DoS 표면 축소).

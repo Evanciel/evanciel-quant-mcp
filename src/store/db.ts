@@ -17,7 +17,7 @@ export interface CompositeRow {
   market: "spot" | "futures"; leverage: number;
   stop_loss_percent: number | null; take_profit_percent: number | null;
   tp_ladder: unknown | null; scale_in: unknown | null; pyramid: unknown | null;
-  trailing_stop_percent: number | null; risk_sizing: unknown | null; created_at: string;
+  trailing_stop_percent: number | null; risk_sizing: unknown | null; entry_execution: unknown | null; created_at: string;
 }
 export interface BotRow {
   id: string; name: string; symbol: string; composite_strategy_id: string;
@@ -52,6 +52,7 @@ export function db(): DatabaseSync {
       stop_loss_percent REAL, take_profit_percent REAL,
       tp_ladder TEXT, scale_in TEXT, pyramid TEXT, trailing_stop_percent REAL,
       risk_sizing TEXT,
+      entry_execution TEXT,
       created_at TEXT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS bots (
@@ -76,6 +77,7 @@ export function db(): DatabaseSync {
   `);
   // 기존 DB용 멱등 마이그레이션(additive). node:sqlite는 중복 컬럼에 throw → try/catch가 멱등.
   try { d.exec(`ALTER TABLE composite_strategies ADD COLUMN risk_sizing TEXT`); } catch { /* 이미 존재 */ }
+  try { d.exec(`ALTER TABLE composite_strategies ADD COLUMN entry_execution TEXT`); } catch { /* 이미 존재 — audit P1-5 봇 지정가 진입 */ }
   _db = d;
   return d;
 }
@@ -123,20 +125,21 @@ const J = (v: unknown) => (v == null ? null : JSON.stringify(v));
 const P = <T,>(v: unknown): T | null => (v == null ? null : JSON.parse(v as string) as T);
 
 // ── composite_strategies ──
-export function insertComposite(c: Omit<CompositeRow, "id" | "created_at" | "risk_sizing"> & { id?: string; risk_sizing?: unknown | null }): CompositeRow {
+export function insertComposite(c: Omit<CompositeRow, "id" | "created_at" | "risk_sizing" | "entry_execution"> & { id?: string; risk_sizing?: unknown | null; entry_execution?: unknown | null }): CompositeRow {
   const id = c.id ?? randomUUID();
   const created_at = now();
   const risk_sizing = c.risk_sizing ?? null; // additive opt-in: 미지정 봇은 null(=legacy 사이징)
-  db().prepare(`INSERT INTO composite_strategies (id,name,root_node,symbol,market,leverage,stop_loss_percent,take_profit_percent,tp_ladder,scale_in,pyramid,trailing_stop_percent,risk_sizing,created_at)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+  const entry_execution = c.entry_execution ?? null; // additive opt-in(audit P1-5): 미지정=시장가(레거시)
+  db().prepare(`INSERT INTO composite_strategies (id,name,root_node,symbol,market,leverage,stop_loss_percent,take_profit_percent,tp_ladder,scale_in,pyramid,trailing_stop_percent,risk_sizing,entry_execution,created_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
     id, c.name, JSON.stringify(c.root_node), c.symbol, c.market, c.leverage,
-    c.stop_loss_percent, c.take_profit_percent, J(c.tp_ladder), J(c.scale_in), J(c.pyramid), c.trailing_stop_percent, J(risk_sizing), created_at);
-  return { ...c, id, created_at, risk_sizing };
+    c.stop_loss_percent, c.take_profit_percent, J(c.tp_ladder), J(c.scale_in), J(c.pyramid), c.trailing_stop_percent, J(risk_sizing), J(entry_execution), created_at);
+  return { ...c, id, created_at, risk_sizing, entry_execution };
 }
 export function getComposite(id: string): CompositeRow | null {
   const r = db().prepare(`SELECT * FROM composite_strategies WHERE id=?`).get(id) as Record<string, unknown> | undefined;
   if (!r) return null;
-  return { ...r, root_node: JSON.parse(r.root_node as string), tp_ladder: P(r.tp_ladder), scale_in: P(r.scale_in), pyramid: P(r.pyramid), risk_sizing: P(r.risk_sizing) } as CompositeRow;
+  return { ...r, root_node: JSON.parse(r.root_node as string), tp_ladder: P(r.tp_ladder), scale_in: P(r.scale_in), pyramid: P(r.pyramid), risk_sizing: P(r.risk_sizing), entry_execution: P(r.entry_execution) } as CompositeRow;
 }
 
 // ── bots ──
