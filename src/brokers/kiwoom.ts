@@ -442,9 +442,11 @@ export class KiwoomBrokerAdapter extends BaseBrokerAdapter {
       }
       const rejected = data.return_code != null && Number(data.return_code) !== 0;
       if (rejected) {
-        // 사유는 콘솔에만(시크릿 미포함). 호출측엔 rejected 상태로 정상 반환.
+        // 사유는 콘솔에만(시크릿 미포함, return_msg=한국어 사유). 호출측엔 rejected 상태로 정상 반환.
         console.warn(
-          `[kiwoom] order rejected (return_code=${Number(data.return_code)})`,
+          `[kiwoom] order rejected (return_code=${Number(data.return_code)}${
+            data.return_msg ? `, msg=${data.return_msg}` : ""
+          })`,
         );
       }
 

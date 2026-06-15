@@ -63,6 +63,24 @@ export async function fetchKlines(symbol: string, interval: string, limit: numbe
   return sorted.slice(-want).map(mapKline);
 }
 
+// 현물 거래가능 심볼 목록 캐시(검색 자동완성용) — exchangeInfo는 크므로 1h 1회만 페치.
+let _symCache: { at: number; symbols: string[] } | null = null;
+const SYM_TTL_MS = 3_600_000;
+/** Binance 현물 거래가능(TRADING) 심볼 목록. 검색 자동완성 전용(읽기·키불필요). 실패 시 마지막 캐시 또는 빈 배열. */
+export async function fetchSpotSymbols(): Promise<string[]> {
+  if (_symCache && Date.now() - _symCache.at < SYM_TTL_MS) return _symCache.symbols;
+  try {
+    const r = await fetch("https://api.binance.com/api/v3/exchangeInfo?permissions=SPOT", { signal: AbortSignal.timeout(15000) });
+    if (!r.ok) throw new Error(`exchangeInfo ${r.status}`);
+    const j = (await r.json()) as { symbols?: { symbol: string; status: string }[] };
+    const symbols = (j.symbols ?? []).filter((s) => s.status === "TRADING").map((s) => s.symbol);
+    if (symbols.length) _symCache = { at: Date.now(), symbols };
+    return symbols;
+  } catch {
+    return _symCache?.symbols ?? [];
+  }
+}
+
 /**
  * 스프레드 조건용 auxSeries 구축: 각 symbolB를 mainBars와 동일 interval로 페치 후 봉 오픈시각(datetime)으로 정렬.
  * 정렬 키가 없으면 NaN(엔진이 fail-closed로 무거래 처리). 페치 실패 시도 전부 NaN. mainBars와 길이 동일 보장.

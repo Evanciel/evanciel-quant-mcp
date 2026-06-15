@@ -18,7 +18,7 @@ import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import * as store from "../store/db.js";
 import { BROKER_FIELDS, upsertCredentials, credentialStatus, credentialsPath, enableLive, disableLive, liveSettingsStatus, type BrokerKey } from "../setup/credentials.js";
-import { fetchKlines } from "../data/binance-public.js";
+import { fetchKlines, fetchSpotSymbols } from "../data/binance-public.js";
 import { getAdapter } from "../brokers/index.js";
 import { placeOrder, placeProtective, cancelProtective, getProtective, getAccount, getOpenOrders, getOrderStatus, cancelOrderById, getQuote } from "../mcp-server/live-handlers.js"; // 수동주문·OCO보호주문·실계정조회·미체결조회/취소 — 안전경로 재사용
 import { computePositionDrift } from "../core/execution/reconcile.js"; // 페이퍼 vs 거래소 실보유 드리프트(정보용)
@@ -515,6 +515,38 @@ async function candlesFor(botId: string, tf?: string, inds?: string[]): Promise<
   }
 }
 
+/** 임의 broker+symbol 차트(검색·워치리스트용). 봇/전략 무관 → 전략 오버레이·진입선·마커 없음, 차트 토글 지표만. 읽기전용.
+ *  클라가 openChart("sym:BROKER:SYMBOL")로 호출 → /api/candles 핸들러가 이 함수로 분기(차트 기계 전체 재사용). */
+async function candlesForSymbol(broker: string, symbol: string, tf?: string, inds?: string[]): Promise<{ ok: boolean; symbol?: string; broker?: string; ccy?: string; interval?: string; intraday?: boolean; bars?: { time: number; open: number; high: number; low: number; close: number }[]; overlays?: unknown[]; oscGroups?: unknown[]; priceLines?: unknown[]; markers?: unknown[]; error?: string }> {
+  const bk = broker === "kiwoom" || broker === "kis" ? broker : "binance";
+  const sym = bk === "binance" ? symbol.toUpperCase() : symbol.trim();
+  if (!sym) return { ok: false, error: "종목을 입력하세요" };
+  const toUnix = (s: string) => Math.floor(Date.parse(s.length === 10 ? s + "T00:00:00Z" : s) / 1000);
+  try {
+    const iv = (tf && /^(1m|5m|15m|30m|1h|4h|1d|1w|1mo)$/.test(tf)) ? tf : "1d";
+    const intraday = /m$/.test(iv) || /h$/.test(iv);
+    let raw: { date: string; datetime?: string; open: number; high: number; low: number; close: number; volume?: number }[] = [];
+    if (bk === "binance") {
+      raw = await fetchKlines(sym, TF_BINANCE[iv] ?? "1d", iv === "1mo" ? 120 : 200);
+    } else {
+      const ad = getAdapter(bk as Parameters<typeof getAdapter>[0], "spot")?.adapter as { getCandles?: (s: string, i: string, n: number) => Promise<{ date: string; datetime?: string; open: number; high: number; low: number; close: number; volume?: number }[]> } | undefined;
+      if (!ad?.getCandles) return { ok: false, error: `${bk} 차트 데이터 미지원(키 필요할 수 있음)` };
+      raw = await ad.getCandles(sym, iv, 200);
+    }
+    const bars = raw
+      .map((b) => ({ time: toUnix(b.datetime ?? b.date), open: b.open, high: b.high, low: b.low, close: b.close, volume: b.volume ?? 0 }))
+      .filter((b) => Number.isFinite(b.time) && b.close > 0)
+      .sort((a, b) => a.time - b.time)
+      .filter((b, i, arr) => i === 0 || b.time !== arr[i - 1].time);
+    if (!bars.length) return { ok: false, error: "차트 데이터 없음 — 종목코드를 확인하세요" };
+    const ccy = bk === "binance" ? "USD" : "KRW";
+    const ind = buildIndicators(bars, parseToggleInds(inds)); // 전략 없음 → 사용자가 켠 토글 지표만
+    return { ok: true, symbol: sym, broker: bk, ccy, interval: iv, intraday, bars, overlays: ind.overlays, oscGroups: ind.oscGroups, priceLines: [], markers: [] };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : "candles 실패" };
+  }
+}
+
 function snapshot() {
   const bots = store.listBots().map((b) => {
     const comp = store.getComposite(b.composite_strategy_id);
@@ -628,9 +660,28 @@ export function startDashboard(port = 7788): Promise<{ url: string; port: number
     if (u.pathname === "/api/candles") {
       const indParam = u.searchParams.get("ind"); // 토글로 켠 지표(쉼표구분: "bollinger,vwap,sma:50")
       const indList = indParam ? indParam.split(",").map((s) => s.trim()).filter(Boolean) : undefined;
-      candlesFor(u.searchParams.get("bot") || "", u.searchParams.get("tf") || undefined, indList).then((r) => {
+      const botParam = u.searchParams.get("bot") || "";
+      const tf = u.searchParams.get("tf") || undefined;
+      // 합성 ID "sym:BROKER:SYMBOL" → 임의 종목 차트(검색·워치리스트). 그 외 = 봇 차트(기존, 변경 없음).
+      const symM = /^sym:([a-z]+):(.+)$/i.exec(botParam);
+      const cp = symM ? candlesForSymbol(symM[1].toLowerCase(), symM[2], tf, indList) : candlesFor(botParam, tf, indList);
+      cp.then((r) => {
         res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify(r));
       }).catch((e) => { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify({ ok: false, error: e instanceof Error ? e.message : "err" })); });
+      return;
+    }
+    if (u.pathname === "/api/search") {
+      // 종목 검색 자동완성(읽기전용). binance=거래소 심볼 매칭, KR=종목코드 직접입력(심볼마스터 없음).
+      if (req.method !== "GET") { res.writeHead(405).end("method not allowed"); return; }
+      const sbk = (u.searchParams.get("broker") || "binance").toLowerCase();
+      const sq = (u.searchParams.get("q") || "").trim().toUpperCase();
+      if (sbk !== "binance") { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify({ ok: true, symbols: [], note: "한국주식은 종목코드(6자리) 직접 입력" })); return; }
+      fetchSpotSymbols().then((all) => {
+        let out: string[];
+        if (!sq) out = all.filter((s) => /USDT$/.test(s)).slice(0, 20);
+        else { const starts = all.filter((s) => s.startsWith(sq)); const incl = all.filter((s) => !s.startsWith(sq) && s.includes(sq)); out = [...starts, ...incl].slice(0, 20); }
+        res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify({ ok: true, symbols: out }));
+      }).catch((e) => { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify({ ok: false, symbols: [], error: e instanceof Error ? e.message : "err" })); });
       return;
     }
     if (u.pathname === "/api/balances") {
@@ -1030,12 +1081,30 @@ h1{font-size:18px;margin:0 0 2px}.sub{color:#8a94a6;font-size:12px;margin-bottom
 .lstat{font-size:12px;color:#c9d2e3;margin-top:8px;line-height:1.6}.lstat b{color:#e6e6e6}
 @media(max-width:560px){.fld{grid-template-columns:1fr}}
 @media(max-width:560px){.wrap{padding:14px}.hdr{grid-template-columns:1fr 1fr}.pos{grid-template-columns:1fr}.v{font-size:20px}.sym{font-size:14px}}
+.searchbar{display:flex;gap:8px;align-items:center;margin:10px 0 8px;flex-wrap:wrap}
+.searchbar select,.searchbar input{background:#0e1320;border:1px solid #222838;border-radius:6px;color:#e6e6e6;padding:8px 10px;font:13px system-ui,sans-serif}
+.searchbar input{flex:1;min-width:170px}
+.searchbar input:focus,.searchbar select:focus{outline:none;border-color:#7aa2f7}
+.searchbar .sbtn{background:#22d3ee;color:#0b0e14;border:0;border-radius:6px;padding:8px 14px;font-weight:700;font-size:13px;cursor:pointer;white-space:nowrap}.searchbar .sbtn:hover{background:#67e8f9}
+.watchstrip{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin:0 0 14px}
+.watchstrip .wlbl{font-size:11px;color:#6b7588;margin-right:2px}
+.wchip{display:inline-flex;align-items:center;gap:5px;background:#0e1320;border:1px solid #222838;border-radius:6px;padding:3px 7px}
+.wchip .wsym{font-size:12px;color:#c9d2e3;cursor:pointer;font-weight:600}.wchip .wsym:hover{color:#22d3ee}
+.wchip .wx{font-size:13px;color:#6b7588;cursor:pointer;line-height:1}.wchip .wx:hover{color:#f43f5e}
+#chartTrade{gap:8px;align-items:center}
 </style><script src="/vendor/lightweight-charts.standalone.js"></script></head><body><div class="wrap">
 <h1>내 자동매매 현황 <span class="dot"></span></h1>
 <div class="sub">봇이 알아서 사고팔아요 · 실시간 시세 반영 <span id="upd" style="color:#8a94a6">—</span>
   <span class="gear" onclick="openManualOrder()">✋ 수동 주문</span>
   <span class="gear" onclick="openHist()">📋 주문/체결</span>
   <span class="gear" onclick="toggleSettings()">⚙️ API 키 설정</span></div>
+<div class="searchbar">
+  <select id="qbroker" onchange="onQBroker()"><option value="binance">Binance(코인)</option><option value="kiwoom">키움(주식)</option><option value="kis">한투(주식)</option></select>
+  <input id="qsym" type="text" autocomplete="off" list="qsymlist" placeholder="종목 검색 — 예: BTCUSDT" oninput="qSuggest()" onkeydown="if(event.key==='Enter')searchChart()">
+  <datalist id="qsymlist"></datalist>
+  <button class="sbtn" onclick="searchChart()">🔍 차트 보기</button>
+</div>
+<div class="watchstrip" id="watchstrip" style="display:none"></div>
 <div class="card setpanel" id="setpanel" style="display:none">
   <div class="row"><div><b>거래소 API 키 입력</b> <span class="hint">실거래/모의거래를 하려면 키가 필요해요</span></div>
     <span class="gear" onclick="toggleSettings()">닫기 ✕</span></div>
@@ -1055,6 +1124,7 @@ h1{font-size:18px;margin:0 0 2px}.sub{color:#8a94a6;font-size:12px;margin-bottom
 <div class="card alertfeed" id="alertfeed" style="display:none"><div class="row"><div><b>🔔 알림</b> <span class="hint">봇 이벤트(진입·청산·오류) 실시간</span></div></div><div id="alertlist"></div></div>
 <div class="cmodal" id="chartModal"><div class="cmbox">
   <div class="cmhead"><b id="chartTitle">차트</b><span class="cmx" onclick="closeChart()">닫기 ✕</span></div>
+  <div class="indbar" id="chartTrade"></div>
   <div class="tfbar" id="chartTf"></div>
   <div class="indbar" id="chartInds"></div>
   <div class="indparams" id="chartIndParams"></div>
@@ -1290,6 +1360,27 @@ function toggleInd(k){var base=indBase(k);
  saveInds();openChart(_chartId,_chartTf);}
 // 거래량 히스토그램 데이터: 봉 상승/하락에 따라 색(가격패널 캔들색과 동일·반투명). bars[].volume는 서버가 이미 실어 보냄.
 function volData(bars){return (bars||[]).map(function(b){return {time:b.time,value:Number(b.volume)||0,color:(b.close>=b.open?'rgba(16,185,129,.45)':'rgba(244,63,94,.45)')};});}
+// ── 종목 검색 + 관심종목(워치리스트) + 차트 주문바 ──
+var _chartMeta=null,_qTimer=null;
+function onQBroker(){var bk=document.getElementById('qbroker').value;document.getElementById('qsymlist').innerHTML='';document.getElementById('qsym').placeholder=bk==='binance'?'종목 검색 — 예: BTCUSDT':'종목코드 — 예: 005930';}
+function qSuggest(){var bk=document.getElementById('qbroker').value;if(bk!=='binance')return;var q=document.getElementById('qsym').value.trim();if(_qTimer)clearTimeout(_qTimer);
+ _qTimer=setTimeout(function(){fetch('/api/search?broker=binance&q='+encodeURIComponent(q)).then(function(r){return r.json()}).then(function(d){if(!d||!d.ok)return;document.getElementById('qsymlist').innerHTML=(d.symbols||[]).map(function(s){return '<option value="'+esc(s)+'"></option>';}).join('');}).catch(function(){});},200);}
+function searchChart(){var bk=document.getElementById('qbroker').value;var sym=document.getElementById('qsym').value.trim();if(bk==='binance')sym=sym.toUpperCase();if(!sym)return;openChart('sym:'+bk+':'+sym);}
+function getWatch(){try{return JSON.parse(localStorage.getItem('qmWatch')||'[]')}catch(e){return [];}}
+function setWatch(w){try{localStorage.setItem('qmWatch',JSON.stringify(w))}catch(e){}}
+function isWatched(b,s){return getWatch().some(function(x){return x.b===b&&x.s===s;});}
+function toggleWatch(b,s){var w=getWatch();var i=-1;for(var k=0;k<w.length;k++)if(w[k].b===b&&w[k].s===s){i=k;break;}if(i>=0)w.splice(i,1);else w.push({b:b,s:s});setWatch(w);renderWatch();if(_chartMeta)renderChartTrade(_chartMeta.broker,_chartMeta.symbol,_chartMeta.ccy);}
+function renderWatch(){var el=document.getElementById('watchstrip');if(!el)return;var w=getWatch();if(!w.length){el.style.display='none';el.innerHTML='';return;}el.style.display='flex';
+ el.innerHTML='<span class="wlbl">⭐ 관심종목</span>'+w.map(function(x){return '<span class="wchip"><span class="wsym" data-b="'+esc(x.b)+'" data-s="'+esc(x.s)+'" onclick="openWatch(this)">'+esc(coin(x.s))+'</span><span class="wx" data-b="'+esc(x.b)+'" data-s="'+esc(x.s)+'" onclick="rmWatch(this)">×</span></span>';}).join('');}
+function openWatch(el){openChart('sym:'+el.dataset.b+':'+el.dataset.s);}
+function rmWatch(el){toggleWatch(el.dataset.b,el.dataset.s);}
+// 차트 상단 주문바: 현재 차트 종목으로 즉시 매수/매도(기존 주문모달·안전게이트 재사용) + 관심종목 토글. 봇·검색 차트 공용.
+function renderChartTrade(broker,symbol,ccy){_chartMeta=(broker&&symbol)?{broker:broker,symbol:symbol,ccy:ccy}:null;var bar=document.getElementById('chartTrade');if(!bar)return;
+ if(!broker||!symbol){bar.style.display='none';bar.innerHTML='';return;}
+ var w=isWatched(broker,symbol);bar.style.display='flex';
+ bar.innerHTML='<span class="obtn buy" data-side="buy" data-broker="'+esc(broker)+'" data-market="spot" data-sym="'+esc(symbol)+'" data-ccy="'+esc(ccy||'')+'" onclick="openOrder(this)">매수</span>'+
+  '<span class="obtn sell" data-side="sell" data-broker="'+esc(broker)+'" data-market="spot" data-sym="'+esc(symbol)+'" data-ccy="'+esc(ccy||'')+'" onclick="openOrder(this)">매도</span>'+
+  '<span class="ib'+(w?' on':'')+'" data-b="'+esc(broker)+'" data-s="'+esc(symbol)+'" onclick="toggleWatch(this.dataset.b,this.dataset.s)">'+(w?'★ 관심종목':'☆ 관심추가')+'</span>';}
 function openChart(id,tf){
  // 새 봇(또는 닫힌 뒤 재오픈) 진입 시 저장된 드로잉 로드. tf변경/지표토글로 같은 봇 재오픈은 메모리 _drawings 유지(이미 저장과 동기).
  if(String(id)!==String(_drawLoadedFor)){_drawings=[];_pendingTrend=null;_drawLoadedFor=String(id);try{_drawings=loadDrawings(id)}catch(e){_drawings=[];}}
@@ -1305,6 +1396,7 @@ function openChart(id,tf){
   var names=[].concat((d.overlays||[]).map(function(o){return o.label}),oscGroups.reduce(function(a,g){return a.concat((g.series||[]).map(function(s){return s.label}))},[]));
   document.getElementById('chartTitle').textContent=(isC?coin(d.symbol):d.symbol)+' · '+(isC?'Binance':'키움증권')+' '+tfLabel(d.interval)+(names.length?'  ·  '+names.join(' '):'');
   document.getElementById('chartNote').textContent=(isC?'데이터: Binance 공개 시세 · 실시간(WS)':'데이터: 키움증권 실제 차트(모의) · 실시간(20초 폴링)')+'  ·  시각 KST'+((d.priceLines||[]).length?'  ·  노랑=진입 빨강=손절 초록=익절':'')+((d.markers||[]).length?'  ·  ▲진입/매수 ▼청산':'')+(oscGroups.length?'  ·  보조지표 '+oscGroups.length+'개 패널 분리':'');
+  renderChartTrade(d.broker,d.symbol,d.ccy); // 봇·검색 차트 모두 상단에 종목 매수/매도/관심 바 노출
   body.innerHTML='';if(_chart){try{_chart.remove()}catch(e){}_chart=null;}
   if(!window.LightweightCharts||!LightweightCharts.CandlestickSeries){document.getElementById('chartTitle').textContent='차트 라이브러리 로드 실패(오프라인?)';return;}
   var nOsc=oscGroups.length;
@@ -1345,6 +1437,7 @@ function openChart(id,tf){
  }).catch(function(){document.getElementById('chartTitle').textContent='차트 오류(네트워크)';});}
 function closeChart(){document.getElementById('chartModal').style.display='none';closeKline();clearChartPoll();if(_chart&&_clickHandler){try{_chart.unsubscribeClick(_clickHandler)}catch(e){}}_clickHandler=null;_drawings=[];_pendingTrend=null;_drawLoadedFor=null;_drawMode='none';
  unbindProtectDrag();_protect=null;_protDrag=null;var _cp=document.getElementById('chartProtect');if(_cp){_cp.style.display='none';_cp.innerHTML='';}var _pm=document.getElementById('protectMsg');if(_pm)_pm.textContent=''; // 보호주문 정리(리스너 누수 방지)
+ var _ct=document.getElementById('chartTrade');if(_ct){_ct.style.display='none';_ct.innerHTML='';}_chartMeta=null; // 차트 주문바 정리
  _priceSeries=null;_ovSeries=[];_oscFlat=[];_markersPrim=null;_volSeries=null;if(_chart){try{_chart.remove()}catch(e){}_chart=null;}document.getElementById('chartBody').innerHTML='';}
 // ── 보호주문(OCO) — 차트에서 익절/손절선 드래그 + 진짜 OCO. 모든 안전판정은 서버(placeProtective)가 강제. ──
 function findBot(id){for(var i=0;i<bots.length;i++)if(String(bots[i].id)===String(id))return bots[i];return null;}
@@ -1711,7 +1804,7 @@ function renderAlerts(list){var el=document.getElementById('alertfeed');if(!el)r
  }).join('');}
 const es=new EventSource('/events'); // same-origin SSE — 세션쿠키 자동 첨부
 es.onmessage=e=>{const s=JSON.parse(e.data);bots=s.bots;document.getElementById('upd').textContent=new Date(s.updatedAt).toLocaleTimeString();subscribe();render();renderAlerts(s.alerts)};
-render();loadBalances();setTimeout(loadPrices,2500);setInterval(loadBalances,60000);setInterval(loadPrices,45000);
+render();renderWatch();loadBalances();setTimeout(loadPrices,2500);setInterval(loadBalances,60000);setInterval(loadPrices,45000);
 setTimeout(loadRealAccounts,1500);setInterval(loadRealAccounts,60000); // 거래소 실계정 패널 폴링
 </script></div></body></html>`;
 }
