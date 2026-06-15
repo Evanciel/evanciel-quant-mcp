@@ -3,6 +3,7 @@
  */
 import { describe, it, expect } from "vitest";
 import { decideLimitBracket, initLimitBracketState, findMyRestingOrder, LB_FILL_DEBOUNCE, type LimitBracketState, type LbObservation, type LbNode } from "../src/core/execution/limit-bracket.js";
+import { validateLimitBracketNode } from "../src/core/validation/composite-node.js";
 
 const NODE: LbNode = { symbol: "005930", buyPrice: 70000, qty: 5, sellPrice: 80000 };
 const mkState = (p: Partial<LimitBracketState> = {}): LimitBracketState => ({ ...initLimitBracketState(0, "2026-06-15T00:00:00Z"), bootGraceDone: true, reorderSessionKey: "2026-06-15", ...p });
@@ -112,6 +113,20 @@ describe("decideLimitBracket — 페이퍼 채널(가격교차 시뮬)", () => {
     const { action } = decideLimitBracket(NODE, mkState({ phase: "buy_resting" }), mkObs({ paper: true, refLow: 71000 }));
     expect(action.kind === "noop" || action.kind === "place").toBe(true);
   });
+});
+
+describe("validateLimitBracketNode — 입력 검증(적대검증 픽스)", () => {
+  const base = { id: "lb1", type: "limit_bracket", name: "삼성 지정가봇", symbol: "005930", buyPrice: 70000, qty: 5 };
+  it("정상 노드 → null", () => { expect(validateLimitBracketNode({ ...base, sellPrice: 80000 })).toBeNull(); });
+  it("매수전용(매도가 없음) → null", () => { expect(validateLimitBracketNode(base)).toBeNull(); });
+  it("매도가 ≤ 매수가 → 거부(손실 고정 방지)", () => {
+    expect(validateLimitBracketNode({ ...base, sellPrice: 70000 })).toMatch(/매도가/);
+    expect(validateLimitBracketNode({ ...base, sellPrice: 60000 })).toMatch(/매도가/);
+  });
+  it("노셔널 과도(매수가×수량 > 1e12) → 거부", () => { expect(validateLimitBracketNode({ ...base, buyPrice: 1e9, qty: 1e6 })).toMatch(/금액/); });
+  it("수량 0/음수 → 거부", () => { expect(validateLimitBracketNode({ ...base, qty: 0 })).not.toBeNull(); expect(validateLimitBracketNode({ ...base, qty: -1 })).not.toBeNull(); });
+  it("종목 없음 → 거부", () => { expect(validateLimitBracketNode({ ...base, symbol: "" })).not.toBeNull(); });
+  it("buyPrice 비유한(Infinity) → 거부", () => { expect(validateLimitBracketNode({ ...base, buyPrice: Infinity })).not.toBeNull(); });
 });
 
 describe("findMyRestingOrder — 오입양 방지", () => {

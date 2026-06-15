@@ -699,6 +699,8 @@ export class BinanceBrokerAdapter extends BaseBrokerAdapter {
       symbol,
       side: String(d.side ?? "").toUpperCase() === "SELL" ? "sell" : "buy",
       quantity: parseFloat(String(d.origQty ?? d.executedQty ?? "0")),
+      executedQty: parseFloat(String(d.executedQty ?? "0")), // 부분체결 추적(limit_bracket detectBuyFill의 cntr) — 키움 cntr_qty와 일관(적대검증 R-6)
+      origQty: parseFloat(String(d.origQty ?? "0")),
       price: parseFloat(String(d.stopPrice ?? d.price ?? "0")),
       status: this.mapStatus(String(d.status ?? "")),
       timestamp: new Date(Number(d.time ?? d.updateTime ?? Date.now())),

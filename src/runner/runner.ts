@@ -1107,6 +1107,10 @@ async function tickScanner(bot: store.BotRow, node: ScannerNode, riskSizing?: Ba
 //  매 틱: 거래소 관측(getOpenOrders/getPositions) → 리듀서 결정 → 실행(fillOrder 지정가/체결기록/취소/종료) → 영속.
 //  안전: liveGate(메인넷 차단) + fillOrder 9겹 안전망(allowKrLimit로 KR 지정가만 허용) + 멱등(getOpenOrders+세션키) + fail-closed(조회 실패=무결정).
 
+// 프로세스 생애 '재시작 그레이스' 추적(적대검증 safety#6 픽스): bootGraceDone를 DB에 영속하면 재시작 후 이미 true라
+//   grace가 안 걸려 첫 틱에 즉시 주문→인덱싱 지연 시 이중주문. 인메모리 Set으로 '이 프로세스에서 첫 틱인가'를 판별(bootSeeded 패턴).
+const lbBooted = new Set<string>();
+
 /** 계좌 보유에서 종목 보유수량 추출(현물 baseAsset 환원). */
 function lbHeldQty(positions: ExchangePos[], symbol: string, broker: Broker): number {
   const want = broker === "binance" ? baseAsset(symbol).toUpperCase() : symbol.toUpperCase();
@@ -1193,6 +1197,8 @@ async function tickLimitBracket(bot: store.BotRow, node: LimitBracketNode): Prom
     } catch { /* 시세 없음 → 미교차(noop) */ }
   }
 
+  // 재시작 그레이스 재적용: 이 프로세스에서 이 봇 첫 틱이면 bootGraceDone을 false로(영속값 무시) → 첫 틱 관측-only(주문 금지).
+  if (!lbBooted.has(bot.id)) { st.bootGraceDone = false; lbBooted.add(bot.id); }
   const { state: next, action } = decideLimitBracket(node, st, { marketOpen, sessionKey: sKey, paper, restingBuy, restingSell, ownHeldDelta, refLow, refHigh });
 
   if (action.kind === "place") {

@@ -258,7 +258,17 @@ export function validateLimitBracketNode(data: unknown): string | null {
   } catch (e) {
     return `지정가봇 검증 실패: 구조 파싱 오류 (${e instanceof Error ? e.message : String(e)})`;
   }
-  if (result.success) return null;
+  if (result.success) {
+    const n = result.data;
+    // 노셔널 절대상한(적대검증 safety#3): testnet에서 checkLimits 무력 → fat-finger/overflow를 환경무관 상한으로 차단.
+    if (n.buyPrice * n.qty > 1e12) return "지정가봇 검증 실패: 주문 금액(매수가×수량)이 과도합니다(상한 1e12) — 수량/가격 확인.";
+    if (n.sellPrice != null) {
+      if (n.sellPrice * n.qty > 1e12) return "지정가봇 검증 실패: 매도 금액(매도가×수량)이 과도합니다(상한 1e12).";
+      // 매도가 ≤ 매수가 차단(손실 고정 fat-finger): 브래킷은 '싸게 사서 비싸게 판다'가 의도.
+      if (n.sellPrice <= n.buyPrice) return `지정가봇 검증 실패: 매도가(${n.sellPrice})는 매수가(${n.buyPrice})보다 커야 합니다(손실 고정 방지). 매도 없이 매수만 하려면 매도가를 비우세요.`;
+    }
+    return null;
+  }
   const first = result.error.issues[0];
   return first ? `지정가봇 검증 실패: ${first.path.join(".")} — ${first.message}` : "지정가봇 구조가 올바르지 않습니다";
 }
