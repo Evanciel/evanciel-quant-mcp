@@ -58,7 +58,10 @@ function invalidateReconCache(broker: string, env: string): void { _reconPosCach
 /** 테스트 전용: reconcile 계좌 캐시 초기화(모듈 스코프라 테스트 간 누수 방지). 프로덕션 경로 미사용. */
 export function __clearReconCache(): void { _reconPosCache.clear(); _reconPosInflight.clear(); }
 
-type FillResult = { live: boolean; price: number; orderId?: string; note: string; filledQty?: number; failed?: boolean; unknown?: boolean };
+type FillResult = { live: boolean; price: number; orderId?: string; note: string; filledQty?: number; failed?: boolean; unknown?: boolean; pending?: boolean; cid?: string; limitPrice?: number };
+
+// 봇 진입 주문 의도(audit P1-5). undefined/market = 시장가(레거시 바이트 동일). limit은 binance 봇 한정(KR fail-closed).
+type EntryExecPlan = { type: "limit"; limitPrice: number; timeoutBars: number; maxSlippagePct: number } | { type: "market" };
 
 // 주문 결과불명(unknown verdict) 누적 → 강제 reconcile 임계(audit P1-2). env LIVE_UNKNOWN_MAX_COUNT(1~20, 기본5).
 const UNKNOWN_MAX_COUNT = (() => {
@@ -78,7 +81,7 @@ const UNKNOWN_MAX_COUNT = (() => {
  *    (포지션 채널=페이퍼로 시작). '모호한' 실패(주문이 나갔을 수도)는 페이퍼 기록 금지 → failed:true 동결.
  *    다음 틱 같은 봉이면 동일 clientOrderId pre-check가 기존 체결을 입양해 이중주문을 막는다(binance 한정).
  */
-async function fillOrder(bot: store.BotRow, side: "buy" | "sell", qty: number, price: number, symbol: string = bot.symbol, opts?: { posLive?: boolean; barIso?: string }): Promise<FillResult> {
+async function fillOrder(bot: store.BotRow, side: "buy" | "sell", qty: number, price: number, symbol: string = bot.symbol, opts?: { posLive?: boolean; barIso?: string; entry?: EntryExecPlan }): Promise<FillResult> {
   if (bot.mode !== "live") return { live: false, price, note: "페이퍼" };
   if (opts?.posLive === false) return { live: false, price, note: "페이퍼 채널(실주문 없음)" }; // 페이퍼 포지션은 페이퍼로만 변경
   const mustLive = opts?.posLive === true;
@@ -90,6 +93,9 @@ async function fillOrder(bot: store.BotRow, side: "buy" | "sell", qty: number, p
   };
   const broker = (["binance", "kis", "kiwoom"].includes(bot.broker) ? bot.broker : "binance") as Broker;
   const market = "spot" as "spot" | "futures"; // quant-mcp 러너는 현물만(선물 라이브는 stock-autotrade). 향후 선물 지원 시 심볼/설정 기반 분기.
+  // 지정가 진입(audit P1-5): binance 한정. KR(kis/키움)은 getOrderByClientId 부재로 미체결 확인/타임아웃 불가 → fail-closed 거절(무음 시장가 강등 금지).
+  const isLimit = opts?.entry?.type === "limit";
+  if (isLimit && (broker === "kis" || broker === "kiwoom")) { store.insertLog(bot.id, "gate", `KR 지정가 진입 미지원(${broker}, audit P1-5)`); return blocked("KR 지정가 미지원"); }
   const gate = liveGate(broker, market);
   if (!gate.allowed) { store.insertLog(bot.id, "gate", `라이브 차단(${gate.reason})`); return blocked("게이트 차단"); }
   // 통화 인식: Binance=USDT, 한투/키움=KRW → 통화별 안전 기본 캡(KRW 봇에 달러캡 적용 버그 방지).
@@ -136,13 +142,24 @@ async function fillOrder(bot: store.BotRow, side: "buy" | "sell", qty: number, p
   //   안 하면 주문 후 같은 사이클/TTL 내 reconcile이 옛 스냅샷으로 stale-adopt하거나, 빈 스냅샷을 clear 카운트에
   //   중복 반영(="N misses ≠ N 독립관측")할 수 있음(코덱스 지적). 무효화로 주문 직후 관측은 항상 신선.
   invalidateReconCache(broker, gate.env ?? "testnet"); // 키 = reconcile의 live.env(gate.env ?? "testnet")와 동일해야 무효화가 맞음
+  const orderPrice = isLimit ? (opts!.entry as Extract<EntryExecPlan, { type: "limit" }>).limitPrice : undefined;
   try {
-    const r = await got.adapter.placeOrder({ symbol, side, type: "market", quantity: nq, clientOrderId: cid });
+    const r = await got.adapter.placeOrder({ symbol, side, type: isLimit ? "limit" : "market", quantity: nq, clientOrderId: cid, ...(isLimit ? { price: orderPrice } : {}) });
     audit({ event: "bot_order_result", botId: bot.id, env: gate.env, orderId: r.orderId, status: r.status });
     // 거부는 체결이 아니다(P0-3: 키움 rejected가 정상 반환되어 live 기록되던 구멍). 진입=페이퍼 폴백 / 라이브채널=동결.
     if (r.status === "rejected") {
       store.insertLog(bot.id, "error", `[${gate.env}] 주문 거부 ${symbol} ${side} qty=${nq}`);
       return blocked("주문 거부");
+    }
+    // 지정가 진입(audit P1-5): pending=정상(호가 등록)이라 freeze 금지 → caller가 pendingEntry로 추적. 즉시 filled면 바로 반영.
+    if (isLimit) {
+      if (r.status === "filled" && typeof r.price === "number" && r.price > 0) {
+        store.insertLog(bot.id, "live", `[${gate.env}] 지정가 즉시체결 ${symbol} ${side} qty=${nq} @${r.price} (${r.orderId})`);
+        return { live: true, price: r.price, orderId: r.orderId, note: `${gate.env} 지정가 체결`, filledQty: r.quantity || nq, cid };
+      }
+      store.insertLog(bot.id, "live", `[${gate.env}] 지정가 접수(호가 등록) ${symbol} ${side} qty=${nq} @${orderPrice} (${r.orderId}) — 체결 대기`);
+      audit({ event: "bot_limit_resting", botId: bot.id, env: gate.env, orderId: r.orderId, refPrice: orderPrice });
+      return { live: false, pending: true, price: orderPrice ?? price, cid, limitPrice: orderPrice, orderId: r.orderId, note: `${gate.env} 지정가 대기`, filledQty: 0 };
     }
     // 체결 미확인 판정: 'filled' + 체결가(>0)만 확정 체결. 그 외(status=pending=접수형 미체결 / 체결가 0)는 미확인.
     //   ⚠️ priceConfirmed만으론 부족(P0-5 구멍): 키움 '지정가'는 pending인데도 참조가(>0)를 실어 보내 → priceConfirmed=true로
@@ -258,6 +275,9 @@ export interface PaperPosition {
   protFails?: number;        // 보호주문 동기화 연속 실패 수 — PROTECTIVE_MAX_FAILS 도달 시 비상 청산(P0-2)
   reconMisses?: number;      // reconcile 시 라이브 포지션이 거래소에 연속 부재한 틱 수 — RECON_CLEAR_MISSES 도달 시 가짜보유 정정(지연체결 오삭제 방지, 라이브 채널만)
   unknownCount?: number;     // 주문 결과불명(unknown verdict) 연속 누적(audit P1-2) — UNKNOWN_MAX_COUNT 도달 시 강제 getPositions reconcile로 수렴(단일봇 전용)
+  // 지정가 진입 대기(audit P1-5, binance 라이브 한정). 신호 봉에 LIMIT 배치 후 체결/타임아웃까지 추적(크래시 생존 → cid로 재조회·중복방지).
+  //   존재하면 무포지션(미체결) — resolvePendingEntry가 매 틱 최우선 해소(신호평가·reconcile 스킵). KR/스캐너는 진입 안 함(시장가).
+  pendingEntry?: { cid: string; limitPrice: number; origQty: number; filledQty: number; placedBarIso: string; timeoutBars: number; maxSlippagePct: number };
 }
 
 /** 폴링 주기(초) → Binance kline 타임프레임. 인트라데이 봉이라야 시간대(hour) 조건이 의미. */
