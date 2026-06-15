@@ -82,7 +82,7 @@ const UNKNOWN_MAX_COUNT = (() => {
  *    (포지션 채널=페이퍼로 시작). '모호한' 실패(주문이 나갔을 수도)는 페이퍼 기록 금지 → failed:true 동결.
  *    다음 틱 같은 봉이면 동일 clientOrderId pre-check가 기존 체결을 입양해 이중주문을 막는다(binance 한정).
  */
-async function fillOrder(bot: store.BotRow, side: "buy" | "sell", qty: number, price: number, symbol: string = bot.symbol, opts?: { posLive?: boolean; barIso?: string; entry?: EntryExecPlan }): Promise<FillResult> {
+async function fillOrder(bot: store.BotRow, side: "buy" | "sell", qty: number, price: number, symbol: string = bot.symbol, opts?: { posLive?: boolean; barIso?: string; entry?: EntryExecPlan; allowKrLimit?: boolean }): Promise<FillResult> {
   if (bot.mode !== "live") return { live: false, price, note: "페이퍼" };
   if (opts?.posLive === false) return { live: false, price, note: "페이퍼 채널(실주문 없음)" }; // 페이퍼 포지션은 페이퍼로만 변경
   const mustLive = opts?.posLive === true;
@@ -96,7 +96,10 @@ async function fillOrder(bot: store.BotRow, side: "buy" | "sell", qty: number, p
   const market = "spot" as "spot" | "futures"; // quant-mcp 러너는 현물만(선물 라이브는 stock-autotrade). 향후 선물 지원 시 심볼/설정 기반 분기.
   // 지정가 진입(audit P1-5): binance 한정. KR(kis/키움)은 getOrderByClientId 부재로 미체결 확인/타임아웃 불가 → fail-closed 거절(무음 시장가 강등 금지).
   const isLimit = opts?.entry?.type === "limit";
-  if (isLimit && (broker === "kis" || broker === "kiwoom")) { store.insertLog(bot.id, "gate", `KR 지정가 진입 미지원(${broker}, audit P1-5)`); return blocked("KR 지정가 미지원"); }
+  // KR 지정가: 기본은 fail-closed 거절(P1-5 신호진입은 getOrderByClientId 부재로 타임아웃 확인 불가). 단 limit_bracket 봇은
+  // 폴백 없는 순수 resting + getOpenOrders(ka10075) 기반 추적이라 KR 지정가가 목적 → opts.allowKrLimit로 허용.
+  // (적대검증 safety#4: 신헬퍼 신설 대신 이 게이트 1개만 우회 → 9겹 안전망·P0-5 미확인동결 그대로. KR은 isLimit 분기에서 pending=resting 반환, 절대 bought 아님.)
+  if (isLimit && !opts?.allowKrLimit && (broker === "kis" || broker === "kiwoom")) { store.insertLog(bot.id, "gate", `KR 지정가 진입 미지원(${broker}, audit P1-5)`); return blocked("KR 지정가 미지원"); }
   const gate = liveGate(broker, market);
   if (!gate.allowed) { store.insertLog(bot.id, "gate", `라이브 차단(${gate.reason})`); return blocked("게이트 차단"); }
   // 통화 인식: Binance=USDT, 한투/키움=KRW → 통화별 안전 기본 캡(KRW 봇에 달러캡 적용 버그 방지).
