@@ -641,7 +641,11 @@ export async function tickBot(botId: string): Promise<{ action: "buy" | "sell" |
   const eventCalendars = calNames.length ? buildEventCalendars(calNames) : undefined;
 
   // riskSizing(opt-in): 엔진 진입 사이징에 반영 → 백테 trade 수량 → derivePosition want.qty → 라이브 주문에 그대로(backtest≡live).
-  const cfg: BacktestConfig = { strategyId: "runner", symbol: bot.symbol, startDate: data[0].date, endDate: data[data.length - 1].date, initialCapital: bot.capital, commission: 0.1, timeframe: interval, auxSeries, mtfSeries, mtfRegimeSeries, eventCalendars, riskSizing: comp.risk_sizing as BacktestConfig["riskSizing"] };
+  // SL 체결 모델(audit P1-12 후속): gapHandling='worst' 고정 — 갭/플래시크래시 시 거래소 상주스톱(또는 KR 소프트스톱)은 봉 저가
+  //   터치로 발동·시가 체결한다. 'close'(엔진 기본=낙관)면 러너 내부 시뮬이 라이브보다 낙관적(SL 미발동)이라 OOS/DSR 게이트가
+  //   승인한 전략을 라이브에서 더 후하게 운용 → never-more-optimistic 위반. 게이트(handlers backtest/optimize)도 기본 'worst'로 맞춤.
+  //   slippage도 명시(게이트 기본과 동일 0.05% — 드리프트 방지).
+  const cfg: BacktestConfig = { strategyId: "runner", symbol: bot.symbol, startDate: data[0].date, endDate: data[data.length - 1].date, initialCapital: bot.capital, commission: 0.1, timeframe: interval, auxSeries, mtfSeries, mtfRegimeSeries, eventCalendars, riskSizing: comp.risk_sizing as BacktestConfig["riskSizing"], gapHandling: "worst", slippage: 0.05 };
   const risk = {
     stopLossPercent: comp.stop_loss_percent, takeProfitPercent: comp.take_profit_percent,
     tpLadder: comp.tp_ladder as never, scaleIn: comp.scale_in as never, pyramid: comp.pyramid as never,
@@ -895,7 +899,8 @@ async function tickScanner(bot: store.BotRow, node: ScannerNode, riskSizing?: Ba
     const auxSeries = thenSpreadSyms.length ? await buildAuxSeries(bars, thenSpreadSyms, interval) : undefined;
     const mtfSeries = thenMtfNeeds.length ? await buildMtfSeries(bars as unknown as MtfBar[], thenMtfNeeds, (tf, lim) => fetchKlines(sym, tf, lim) as unknown as Promise<MtfBar[]>) : undefined;
     const mtfRegimeSeries = thenMtfRegimeNeeds.length ? await buildMtfRegimeSeries(bars as unknown as MtfBar[], thenMtfRegimeNeeds, (tf, lim) => fetchKlines(sym, tf, lim) as unknown as Promise<MtfBar[]>) : undefined;
-    const cfg: BacktestConfig = { strategyId: "scanner", symbol: sym, startDate: bars[0].date, endDate: bars[bars.length - 1].date, initialCapital: perSymCapital, commission: 0.1, timeframe: interval, auxSeries, mtfSeries, mtfRegimeSeries, eventCalendars: thenEvents };
+    // SL 체결 모델: 단일봇 cfg와 동일하게 'worst' 고정 + slippage 명시(라이브 보수 일관, audit P1-12 후속).
+    const cfg: BacktestConfig = { strategyId: "scanner", symbol: sym, startDate: bars[0].date, endDate: bars[bars.length - 1].date, initialCapital: perSymCapital, commission: 0.1, timeframe: interval, auxSeries, mtfSeries, mtfRegimeSeries, eventCalendars: thenEvents, gapHandling: "worst", slippage: 0.05 };
     const res = runCompositeBacktest(node.then, bars as unknown as Parameters<typeof runCompositeBacktest>[1], cfg);
     wantHold[sym] = derivePosition(res.trades).holding;
   }

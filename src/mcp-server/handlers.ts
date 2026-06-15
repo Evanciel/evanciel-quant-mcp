@@ -144,13 +144,13 @@ export async function backtest(args: { tree: StrategyNode; symbol?: string; inte
   // 이벤트 캘린더는 절대 epoch 타임스탬프 → 윈도우 슬라이스 불필요(엔진이 각 봉 시각을 전체 이벤트와 대조).
   const calNames = collectEventCalendars(args.tree);
   const ev = calNames.length ? buildEventCalendars(calNames) : undefined;
-  const full = runCompositeBacktest(args.tree, data, { ...cfg(data, symbol, interval, aux, mtf, ev, mtfReg), gapHandling: args.gapHandling });
+  const full = runCompositeBacktest(args.tree, data, { ...cfg(data, symbol, interval, aux, mtf, ev, mtfReg), gapHandling: args.gapHandling ?? "worst" });
   let oos: Record<string, unknown> | null = null;
   const split = Math.floor(data.length * 0.7);
   if (split >= 30 && data.length - split >= 20) {
     const train = data.slice(0, split), test = data.slice(split);
-    const tr = runCompositeBacktest(args.tree, train, { ...cfg(train, symbol, interval, sliceAux(aux, 0, split), sliceAux(mtf, 0, split), ev, sliceMtfRegime(mtfReg, 0, split)), gapHandling: args.gapHandling });
-    const te = runCompositeBacktest(args.tree, test, { ...cfg(test, symbol, interval, sliceAux(aux, split, data.length), sliceAux(mtf, split, data.length), ev, sliceMtfRegime(mtfReg, split, data.length)), gapHandling: args.gapHandling });
+    const tr = runCompositeBacktest(args.tree, train, { ...cfg(train, symbol, interval, sliceAux(aux, 0, split), sliceAux(mtf, 0, split), ev, sliceMtfRegime(mtfReg, 0, split)), gapHandling: args.gapHandling ?? "worst" });
+    const te = runCompositeBacktest(args.tree, test, { ...cfg(test, symbol, interval, sliceAux(aux, split, data.length), sliceAux(mtf, split, data.length), ev, sliceMtfRegime(mtfReg, split, data.length)), gapHandling: args.gapHandling ?? "worst" });
     const m = calcReturnMoments(te.equityCurve);
     const psr = probabilisticSharpe(m.perBarSharpe, m.n, m.skewness, m.kurtosis, 0);
     oos = {
@@ -252,8 +252,10 @@ export async function strategyFactory(args: {
       if (!data) { data = await fetchKlinesChecked(sym, tf, days); klineCache.set(key, data); }
       if (data.length < 60) { rows.push({ id, valid: true, error: `데이터부족(${data.length})` }); continue; }
       const split = Math.floor(data.length * 0.7);
-      const tr = runCompositeBacktest(c.tree, data.slice(0, split), cfg(data.slice(0, split), sym, tf));
-      const te = runCompositeBacktest(c.tree, data.slice(split), cfg(data.slice(split), sym, tf));
+      // SL 체결 모델 'worst' 고정(audit P1-12 후속): OOS/DSR 생존자 선별이 러너(라이브)와 동일 보수 모델을 써야
+      //   '낙관적 백테로 통과 → 라이브 더 후하게' 발산을 막는다(never-more-optimistic).
+      const tr = runCompositeBacktest(c.tree, data.slice(0, split), { ...cfg(data.slice(0, split), sym, tf), gapHandling: "worst" });
+      const te = runCompositeBacktest(c.tree, data.slice(split), { ...cfg(data.slice(split), sym, tf), gapHandling: "worst" });
       const m = calcReturnMoments(te.equityCurve);
       moments.set(id, m);
       rows.push({ id, valid: true, sym, tf, trainReturn: +tr.totalReturnPercent.toFixed(2), testReturn: +te.totalReturnPercent.toFixed(2), testTrades: te.totalTrades, oosRobust: tr.totalReturnPercent > 0 && te.totalReturnPercent > 0 && te.totalTrades >= 1 });
