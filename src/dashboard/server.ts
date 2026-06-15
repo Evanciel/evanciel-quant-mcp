@@ -21,6 +21,7 @@ import { BROKER_FIELDS, upsertCredentials, credentialStatus, credentialsPath, en
 import { fetchKlines, fetchSpotSymbols } from "../data/binance-public.js";
 import { getAdapter } from "../brokers/index.js";
 import { placeOrder, placeProtective, cancelProtective, getProtective, getAccount, getOpenOrders, getOrderStatus, cancelOrderById, getQuote } from "../mcp-server/live-handlers.js"; // 수동주문·OCO보호주문·실계정조회·미체결조회/취소 — 안전경로 재사용
+import { saveComposite, createBot, startBot } from "../mcp-server/bot-handlers.js"; // 지정가 봇 생성(검증·게이트·dup·로그 재사용). 순환import은 함수선언 호이스팅으로 안전(런타임 호출만).
 import { computePositionDrift } from "../core/execution/reconcile.js"; // 페이퍼 vs 거래소 실보유 드리프트(정보용)
 import { detectAlerts, Debouncer, AlertBuffer, type BotAlertView } from "../core/alerts/alerts.js"; // 봇 이벤트 알림 엔진(순수)
 import { sendWebhook, validateWebhookUrl } from "../core/alerts/webhook.js"; // Slack/Discord 배달(SSRF 게이트)
@@ -857,6 +858,31 @@ export function startDashboard(port = 7788): Promise<{ url: string; port: number
       }).catch((e) => { res.writeHead(400, { "content-type": "application/json" }); res.end(JSON.stringify({ ok: false, error: e instanceof Error ? e.message : "bad request" })); });
       return;
     }
+    if (u.pathname === "/api/bot/limit") {
+      // 지정가 브래킷 봇 생성·가동(사용자 요구: 대시보드 검색→봇). saveComposite/createBot/startBot 재사용(검증·게이트·dup·로그).
+      //   mode=live → start 시 liveGate가 통제(testnet/mock 키만 통과, 메인넷은 마스터스위치). 신규 안전로직 0.
+      if (req.method !== "POST") { res.writeHead(405).end("method not allowed"); return; }
+      readJsonBody(req).then((body) => {
+        const broker = (typeof body.broker === "string" ? body.broker : "binance") as Broker;
+        const rawSym = typeof body.symbol === "string" ? body.symbol.trim() : "";
+        const symbol = broker === "binance" ? rawSym.toUpperCase() : rawSym;
+        const buyPrice = Number(body.buyPrice);
+        const qty = Number(body.quantity ?? body.qty);
+        const sellPrice = body.sellPrice != null && Number(body.sellPrice) > 0 ? Number(body.sellPrice) : undefined;
+        const fail = (code: number, error: string) => { res.writeHead(code, { "content-type": "application/json" }); res.end(JSON.stringify({ ok: false, error })); };
+        if (!symbol || !(buyPrice > 0) || !(qty > 0)) return fail(400, "입력 오류: symbol·buyPrice>0·quantity>0 필요");
+        if (body.sellPrice != null && !(sellPrice && sellPrice > 0)) return fail(400, "매도가는 0보다 커야 합니다(비우면 매수전용)");
+        const node = { id: `lb-${randomBytes(6).toString("hex")}`, type: "limit_bracket" as const, name: `${symbol} 지정가봇`, symbol, buyPrice, qty, ...(sellPrice ? { sellPrice } : {}) };
+        const comp = saveComposite({ name: `${symbol} 지정가 브래킷`, tree: node, symbol, market: "spot" }) as { ok?: boolean; compositeStrategyId?: string; error?: string };
+        if (!comp.ok || !comp.compositeStrategyId) return fail(400, comp.error || "전략 저장 실패");
+        const bot = createBot({ name: node.name, compositeStrategyId: comp.compositeStrategyId, symbol, mode: "live", broker, intervalSeconds: 30 }) as { ok?: boolean; botId?: string; error?: string; note?: string };
+        if (!bot.ok || !bot.botId) return fail(400, bot.error || "봇 생성 실패");
+        const started = startBot({ botId: bot.botId }) as { ok?: boolean; note?: string; error?: string };
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true, botId: bot.botId, started: !!started.ok, note: (started.ok ? started.note : started.error) || bot.note }));
+      }).catch((e) => { res.writeHead(400, { "content-type": "application/json" }); res.end(JSON.stringify({ ok: false, error: e instanceof Error ? e.message : "bad request" })); });
+      return;
+    }
     if (u.pathname === "/api/audit-health") {
       // 감사로그 무결성 모니터(audit P1-24, 읽기전용). 시크릿 0 — 실패 카운트·마지막 에러만.
       if (req.method !== "GET") { res.writeHead(405).end("method not allowed"); return; }
@@ -1380,7 +1406,30 @@ function renderChartTrade(broker,symbol,ccy){_chartMeta=(broker&&symbol)?{broker
  var w=isWatched(broker,symbol);bar.style.display='flex';
  bar.innerHTML='<span class="obtn buy" data-side="buy" data-broker="'+esc(broker)+'" data-market="spot" data-sym="'+esc(symbol)+'" data-ccy="'+esc(ccy||'')+'" onclick="openOrder(this)">매수</span>'+
   '<span class="obtn sell" data-side="sell" data-broker="'+esc(broker)+'" data-market="spot" data-sym="'+esc(symbol)+'" data-ccy="'+esc(ccy||'')+'" onclick="openOrder(this)">매도</span>'+
-  '<span class="ib'+(w?' on':'')+'" data-b="'+esc(broker)+'" data-s="'+esc(symbol)+'" onclick="toggleWatch(this.dataset.b,this.dataset.s)">'+(w?'★ 관심종목':'☆ 관심추가')+'</span>';}
+  '<span class="ib'+(w?' on':'')+'" data-b="'+esc(broker)+'" data-s="'+esc(symbol)+'" onclick="toggleWatch(this.dataset.b,this.dataset.s)">'+(w?'★ 관심종목':'☆ 관심추가')+'</span>'+
+  '<span class="ib" data-b="'+esc(broker)+'" data-s="'+esc(symbol)+'" data-c="'+esc(ccy||'')+'" onclick="openLimitBot(this.dataset.b,this.dataset.s,this.dataset.c)">🤖 지정가봇</span>';}
+// 지정가 봇 만들기 — 매수가 도달 시 자동 매수 →(매도가 입력 시) 자동 매도. 장 열릴 때마다 미체결 재주문, 매도 완료 시 자동 종료. (모의/testnet)
+function openLimitBot(broker,symbol){var m=document.getElementById('orderModal');var msg=document.getElementById('orderMsg');msg.textContent='';msg.className='setmsg';
+ document.getElementById('orderTitle').innerHTML='🤖 '+esc(coin(symbol))+' 지정가 봇';
+ document.getElementById('orderBody').innerHTML=
+  '<div class="hint" style="margin:2px 0 8px">매수가에 도달하면 <b>자동 매수</b> →(매도가 입력 시) <b>자동 매도</b>. 장 열릴 때마다 미체결분 재주문, 매도 완료 시 자동 종료. <b>모의/테스트넷</b>.</div>'+
+  '<div class="fld"><label>매수 지정가</label><input id="lbBuy" type="text" inputmode="decimal" autocomplete="off" placeholder="이 가격이 되면 매수"></div>'+
+  '<div class="fld"><label>수량</label><input id="lbQty" type="text" inputmode="decimal" autocomplete="off" placeholder="주식=정수 / 코인=소수"></div>'+
+  '<div class="fld"><label>매도 지정가 <span class="hint">(선택)</span></label><input id="lbSell" type="text" inputmode="decimal" autocomplete="off" placeholder="비우면 매수만(보유 유지)"></div>'+
+  '<button class="obig" data-b="'+esc(broker)+'" data-s="'+esc(symbol)+'" onclick="submitLimitBot(this.dataset.b,this.dataset.s)">🤖 지정가 봇 만들기</button>';
+ m.style.display='flex';}
+function submitLimitBot(broker,symbol){var msg=document.getElementById('orderMsg');
+ var buy=Number(document.getElementById('lbBuy').value),qty=Number(document.getElementById('lbQty').value);
+ var sellRaw=document.getElementById('lbSell').value.trim(),sell=sellRaw?Number(sellRaw):undefined;
+ if(!(buy>0)){msg.className='setmsg err';msg.textContent='매수 지정가를 입력하세요.';return;}
+ if(!(qty>0)){msg.className='setmsg err';msg.textContent='수량을 0보다 크게 입력하세요.';return;}
+ if(sellRaw&&!(sell>0)){msg.className='setmsg err';msg.textContent='매도가가 올바르지 않아요(비우면 매수전용).';return;}
+ msg.className='setmsg';msg.textContent='지정가 봇 생성 중…';
+ fetch('/api/bot/limit',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({broker:broker,symbol:symbol,buyPrice:buy,quantity:qty,sellPrice:sell})})
+  .then(function(r){return r.json()}).then(function(d){
+   if(!d.ok){msg.className='setmsg err';msg.textContent='실패: '+(d.error||'알 수 없음');return;}
+   msg.className='setmsg ok';msg.textContent='✅ 지정가 봇 생성·가동! '+esc(d.note||'')+' (봇 '+esc(String(d.botId||''))+')';
+  }).catch(function(e){msg.className='setmsg err';msg.textContent='실패: '+e.message;});}
 function openChart(id,tf){
  // 새 봇(또는 닫힌 뒤 재오픈) 진입 시 저장된 드로잉 로드. tf변경/지표토글로 같은 봇 재오픈은 메모리 _drawings 유지(이미 저장과 동기).
  if(String(id)!==String(_drawLoadedFor)){_drawings=[];_pendingTrend=null;_drawLoadedFor=String(id);try{_drawings=loadDrawings(id)}catch(e){_drawings=[];}}
