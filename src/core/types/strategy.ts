@@ -62,6 +62,16 @@ export interface BacktestConfig {
   mtfRegimeSeries?: Record<string, (RegimeLabel | null)[]>; // 멀티타임프레임 regime용: regimeMtfKey → 상위TF 레짐 라벨(LTF 정렬·전방채움, 닫힌 HTF 없으면 null). 지표값(number[])과 형태가 달라 mtfSeries와 분리.
   eventCalendars?: Record<string, number[]>; // 이벤트 조건용: 명명 캘린더 → 이벤트 epoch(ms) 배열. 러너/백테스트툴이 주입.
   riskSizing?: import("../risk/order-sizing").RiskSizingConfig | null; // 변동성 타게팅 사이징(opt-in). 미지정=legacy quantityPercent.
+  entryExecution?: EntryExecution; // 봇 지정가 진입(audit P1-5). 미지정=시장가(레거시 바이트 동일). limit은 binance 봇 한정.
+}
+
+// 봇 진입 체결 모델(audit P1-5). 백테 엔진·라이브 러너가 src/core/execution/entry.ts resolveEntryFill로 공유 → backtest≡live.
+//   설계·never-optimistic 증명: docs/02-design/p1-5-limit-entry-design.md.
+export interface EntryExecution {
+  type: "market" | "limit";
+  limitOffsetPct?: number; // 매수 지정가 오프셋(현재가 대비 %, maker는 ≤0). 기본 0. clamp -5..0.
+  timeoutBars?: number;    // N 닫힌봉 미체결 시 시장가 폴백. clamp 1..50, 기본 3.
+  maxSlippagePct?: number; // 폴백 시장가 슬리피지 캡(라이브 게이트 + 백테 폴백 슬립 단일소스). clamp 0..5, 기본 0.5.
 }
 
 export interface BacktestTrade {

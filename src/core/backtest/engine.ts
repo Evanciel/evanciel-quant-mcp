@@ -15,6 +15,7 @@ import { computeRegime, type RegimeParams, type RegimeLabel } from "./regime";
 import { evaluateLadderTick, openPosition, type PositionState, type LadderLevel, type ScaleInConfig, type PyramidConfig } from "../position/ladder";
 import { floorQty, quantizeQty } from "../position/qty";
 import { computeOrderQty } from "../risk/order-sizing"; // 변동성 타게팅 사이징(엔진·러너 공용 → backtest≡live)
+import { resolveEntryFill } from "../execution/entry"; // 봇 지정가 진입 체결 모델(엔진·러너 공용 → backtest≡live, audit P1-5)
 
 interface OHLCV {
   date: string;
@@ -764,6 +765,9 @@ export function runCompositeBacktest(
   let position = 0;
   let avgEntryPrice = 0;
   let positionState: PositionState | null = null; // 라더 모드 포지션 라이프사이클
+  // 지정가 진입 대기(audit P1-5). 신호 봉에서 지정가가 같은 봉에 안 채워지면 여기 보관 → entryBarIndex 봉에서 개시.
+  //   미설정(시장가)은 resolveEntryFill이 entryBarIndex=신호봉을 반환 → pendingFill 미사용(레거시 바이트 동일).
+  let pendingFill: { entryBarIndex: number; fillPrice: number; qty: number; isLadder: boolean; sigSL: number | null } | null = null;
   const trades: BacktestTrade[] = [];
   const equityCurve: { date: string; value: number }[] = [];
 
@@ -775,6 +779,23 @@ export function runCompositeBacktest(
 
   for (let i = 0; i < data.length; i++) {
     const price = data[i].close;
+    // 지정가 진입 대기 해소(audit P1-5): 미체결 동안 무포지션(flat) → SL/시그널 평가 안 함. entryBarIndex 봉에서 개시.
+    //   (시장가 경로는 entryBarIndex=신호봉이라 pendingFill이 설정되지 않음 → 이 블록 미진입 = 레거시 바이트 동일.)
+    if (pendingFill) {
+      if (i < pendingFill.entryBarIndex) {
+        equityCurve.push({ date: data[i].date, value: balance }); // position=0 → flat cash(미체결 지정가 무노출)
+        continue;
+      }
+      const pf = pendingFill; // i === entryBarIndex: 지정가(maker) 또는 캡 폴백 체결 → 포지션 개시
+      balance -= pf.qty * pf.fillPrice * (1 + (config.commission ?? 0.1) / 100);
+      position = pf.qty;
+      avgEntryPrice = pf.fillPrice;
+      if (pf.isLadder) positionState = openPosition({ entryPrice: pf.fillPrice, qty: pf.qty, stopLossPercent: pf.sigSL, trailingStopPercent: compositeRisk?.trailingStopPercent, openedAt: data[i].date });
+      trades.push({ date: data[i].date, action: "buy", price: pf.fillPrice, quantity: pf.qty, pnl: 0, balance });
+      pendingFill = null;
+      equityCurve.push({ date: data[i].date, value: balance + position * price }); // 개시 봉: 보유 반영. 같은 봉 청산 안 함(같은봉 진입-청산 금지).
+      continue;
+    }
     const activeStrategy = resolveActiveStrategy(rootNode, data, i, prices, volumes, 0, { aux: config.auxSeries, mtf: config.mtfSeries, mtfRegime: config.mtfRegimeSeries, events: config.eventCalendars });
 
     // 손절/익절 체크: 포지션 보유 중이면 활성 leaf 존재 여부와 무관하게 평가한다.
@@ -829,22 +850,27 @@ export function runCompositeBacktest(
         if (!allMet) continue;
 
         if (rule.action === "buy" && position === 0) {
-          const slip = (config.slippage ?? 0.05) / 100;
-          const buyPrice = price * (1 + slip);
+          // 진입 체결 해소(audit P1-5): 시장가=신호봉 즉시 체결(레거시 바이트 동일), 지정가=윈도우 내 maker 또는 타임아웃 폴백.
+          const { fillPrice, entryBarIndex } = resolveEntryFill(data, i, config.entryExecution, config.slippage ?? 0.05);
           // 사이징: riskSizing 있으면 변동성 타게팅/ATR/Kelly, 없으면 legacy 바이트 동일. 러너는 want.qty로 이 결과를 그대로 라이브 반영.
           // highs/lows는 ATR 모드만 사용(legacy/vol_target/kelly은 무시) → 기존 모드 결과 불변(회귀 0).
           const qty = computeOrderQty({
-            equity: balance, price: buyPrice, commissionPct: config.commission ?? 0.1,
+            equity: balance, price: fillPrice, commissionPct: config.commission ?? 0.1,
             closes: prices.slice(0, i + 1), highs: highs.slice(0, i + 1), lows: lows.slice(0, i + 1),
             timeframe: config.timeframe ?? "1d",
             legacyQuantityPercent: rule.quantityPercent, riskSizing: config.riskSizing ?? null,
             symbol: config.symbol, // KR(6자리 숫자)이면 정수주 양자화 → 라이브와 일관(크립토는 분수 유지)
           }).qty;
           if (qty > 0) {
-            balance -= qty * buyPrice * (1 + (config.commission ?? 0.1) / 100);
-            position = qty;
-            avgEntryPrice = buyPrice;
-            trades.push({ date: data[i].date, action: "buy", price: buyPrice, quantity: qty, pnl: 0, balance });
+            if (entryBarIndex === i) { // 같은 봉 체결(시장가 또는 같은봉 지정가 터치) → 즉시 개시
+              balance -= qty * fillPrice * (1 + (config.commission ?? 0.1) / 100);
+              position = qty;
+              avgEntryPrice = fillPrice;
+              trades.push({ date: data[i].date, action: "buy", price: fillPrice, quantity: qty, pnl: 0, balance });
+            } else { // 지정가 미체결 → entryBarIndex 봉에서 개시(이 봉은 flat). 추가 rule 평가 중단.
+              pendingFill = { entryBarIndex, fillPrice, qty, isLadder: false, sigSL: null };
+              break;
+            }
           }
         } else if (rule.action === "sell" && position > 0) {
           const slip = (config.slippage ?? 0.05) / 100;
@@ -894,17 +920,21 @@ export function runCompositeBacktest(
       if (position === 0 && activeStrategy && !exitedThisBar) {
         const { buyRule } = evalLadderSignals(activeStrategy, i, prices, volumes, highs, lows, compositeIndicatorCache);
         if (buyRule) {
-          const slip = (config.slippage ?? 0.05) / 100;
-          const buyPrice = price * (1 + slip);
+          // 진입 체결 해소(audit P1-5): 시장가=즉시 개시(레거시 바이트 동일), 지정가=윈도우 maker 또는 타임아웃 폴백.
+          const { fillPrice, entryBarIndex } = resolveEntryFill(data, i, config.entryExecution, config.slippage ?? 0.05);
           const investAmount = balance * (buyRule.quantityPercent / 100);
           // KR(6자리 숫자)이면 정수주 양자화(라이브와 일관), 크립토는 floorQty(8자리 분수)와 바이트 동일.
-          const qty = quantizeQty(investAmount / (buyPrice * (1 + (config.commission ?? 0.1) / 100)), config.symbol);
+          const qty = quantizeQty(investAmount / (fillPrice * (1 + (config.commission ?? 0.1) / 100)), config.symbol);
           if (qty > 0) {
-            balance -= qty * buyPrice * (1 + (config.commission ?? 0.1) / 100);
-            position = qty;
-            avgEntryPrice = buyPrice;
-            positionState = openPosition({ entryPrice: buyPrice, qty, stopLossPercent: sigSL, trailingStopPercent: compositeRisk?.trailingStopPercent, openedAt: data[i].date });
-            trades.push({ date: data[i].date, action: "buy", price: buyPrice, quantity: qty, pnl: 0, balance });
+            if (entryBarIndex === i) { // 즉시 개시(시장가 또는 같은봉 지정가 터치)
+              balance -= qty * fillPrice * (1 + (config.commission ?? 0.1) / 100);
+              position = qty;
+              avgEntryPrice = fillPrice;
+              positionState = openPosition({ entryPrice: fillPrice, qty, stopLossPercent: sigSL, trailingStopPercent: compositeRisk?.trailingStopPercent, openedAt: data[i].date });
+              trades.push({ date: data[i].date, action: "buy", price: fillPrice, quantity: qty, pnl: 0, balance });
+            } else { // 지정가 미체결 → entryBarIndex 봉에서 openPosition으로 개시(이 봉은 flat).
+              pendingFill = { entryBarIndex, fillPrice, qty, isLadder: true, sigSL: sigSL ?? null };
+            }
           }
         }
       }
