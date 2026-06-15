@@ -4,7 +4,10 @@
  * mode=live는 fillOrder가 liveGate 통과 시 어댑터로 실주문(미통과 시 페이퍼 폴백). 봇 라이브는 주문별 2단계 토큰이 아니라
  * 게이트 + 하드리밋 + 멱등으로 통제(2단계 토큰은 수동 place_order/place_protective 전용). 메인넷은 마스터스위치 전까지 OFF.
  */
-import type { StrategyNode, ScannerNode, BacktestConfig, EntryExecution } from "../core/types/strategy.js";
+import type { StrategyNode, ScannerNode, BacktestConfig, EntryExecution, LimitBracketNode } from "../core/types/strategy.js";
+import { decideLimitBracket, initLimitBracketState, findMyRestingOrder, type LimitBracketState } from "../core/execution/limit-bracket.js"; // 지속형 지정가 봇 순수 리듀서
+import { isMarketOpen, sessionKey } from "../util/market-hours.js"; // 연속매매 게이트 + 세션키(멱등)
+import { roundToKrxTick } from "../brokers/krx-tick.js"; // KR 가격 매칭(거래소 정렬가와 비교)
 import { runCompositeBacktest } from "../core/backtest/engine.js";
 import { elapsedClosedBars, checkSlippageCap, computeLimitPrice, clampTimeoutBars, clampMaxSlippagePct } from "../core/execution/entry.js"; // 봇 지정가 진입(audit P1-5)
 import { fetchKlines, buildAuxSeries, type Bar } from "../data/binance-public.js";
@@ -715,6 +718,10 @@ export async function tickBot(botId: string): Promise<{ action: "buy" | "sell" |
   if ((comp.root_node as { type?: string })?.type === "scanner") {
     return tickScanner(bot, comp.root_node as ScannerNode, comp.risk_sizing as BacktestConfig["riskSizing"]);
   }
+  // 지정가 브래킷 봇: 가격기반 주문관리(인디케이터 엔진/캔들 미사용). 장 열릴 때마다 미체결 지정가 재주문 → 체결 시 매도.
+  if ((comp.root_node as { type?: string })?.type === "limit_bracket") {
+    return tickLimitBracket(bot, comp.root_node as LimitBracketNode);
+  }
 
   const interval = secsToInterval(bot.interval_seconds); // 폴링 주기 → kline 타임프레임(인트라데이 자동). 시간대 조건 해금.
   // 데이터 소스 broker-aware: 크립토=Binance public klines, KR(키움/한투)=브로커 어댑터 getCandles(일봉).
@@ -1096,6 +1103,133 @@ async function tickScanner(bot: store.BotRow, node: ScannerNode, riskSizing?: Ba
   return { action: opens > 0 ? "buy" : closes > 0 ? "sell" : "hold", detail };
 }
 
+// ── 지속형 지정가 봇(limit_bracket) — 순수 리듀서 decideLimitBracket의 I/O 래퍼 ──
+//  매 틱: 거래소 관측(getOpenOrders/getPositions) → 리듀서 결정 → 실행(fillOrder 지정가/체결기록/취소/종료) → 영속.
+//  안전: liveGate(메인넷 차단) + fillOrder 9겹 안전망(allowKrLimit로 KR 지정가만 허용) + 멱등(getOpenOrders+세션키) + fail-closed(조회 실패=무결정).
+
+/** 계좌 보유에서 종목 보유수량 추출(현물 baseAsset 환원). */
+function lbHeldQty(positions: ExchangePos[], symbol: string, broker: Broker): number {
+  const want = broker === "binance" ? baseAsset(symbol).toUpperCase() : symbol.toUpperCase();
+  let q = 0;
+  for (const p of positions) {
+    const ps = String(p.symbol).toUpperCase();
+    if (ps === want || (broker === "binance" && baseAsset(ps) === want)) q += Number(p.quantity) || 0;
+  }
+  return q;
+}
+
+/** limit_bracket 봇의 거래소 잔존 미체결 주문 취소(stopBot/done 정리, 적대검증 safety#1). best-effort, 실패는 loud 로그(삼키지 않음). */
+export async function cancelLimitBracketRestingOrders(bot: store.BotRow): Promise<void> {
+  const st = bot.position_state as LimitBracketState | null;
+  if (!st || (!st.entryOrderId && !st.exitOrderId)) return;
+  const live = liveAdapterFor(bot);
+  if (!live) return; // 페이퍼=거래소 주문 없음
+  for (const oid of [st.entryOrderId, st.exitOrderId]) {
+    if (!oid) continue;
+    try {
+      const ok = await live.adapter.cancelOrder(oid, bot.symbol);
+      store.insertLog(bot.id, ok ? "hold" : "error", `[지정가봇] 잔존주문 취소 ${oid}: ${ok ? "성공" : "실패 — 거래소에서 수동 확인 필요"}`);
+    } catch (e) {
+      store.insertLog(bot.id, "error", `[지정가봇] 잔존주문 취소 예외 ${oid}(${e instanceof Error ? e.message : e}) — 거래소 수동 확인 필요`);
+    }
+  }
+}
+
+async function tickLimitBracket(bot: store.BotRow, node: LimitBracketNode): Promise<{ action: "buy" | "sell" | "hold"; detail: string }> {
+  const broker = (["binance", "kis", "kiwoom"].includes(bot.broker) ? bot.broker : "binance") as Broker;
+  const now = new Date();
+  const nowIso = now.toISOString();
+  const live = liveAdapterFor(bot);
+  const paper = !live;
+  const sKey = sessionKey(broker, now);
+  const marketOpen = isMarketOpen(broker, now);
+
+  let st = bot.position_state as LimitBracketState | null;
+  let restingBuy: ReturnType<typeof findMyRestingOrder>["order"] = null;
+  let restingSell: ReturnType<typeof findMyRestingOrder>["order"] = null;
+  let ownHeldDelta = 0;
+  let refLow: number | undefined; let refHigh: number | undefined;
+
+  if (live) {
+    // 거래소 관측(fail-closed: 조회 실패 시 장부 무변경·무결정 → 다음 틱 재시도).
+    let openOrders: { orderId: string; side: "buy" | "sell"; price: number; quantity: number; executedQty?: number }[] = [];
+    try {
+      const raw = live.adapter.getOpenOrders ? await live.adapter.getOpenOrders(node.symbol) : [];
+      openOrders = raw.map((o) => ({ orderId: String(o.orderId), side: o.side, price: o.price, quantity: o.quantity, executedQty: o.executedQty }));
+    } catch (e) {
+      store.insertLog(bot.id, "error", `[지정가봇] 미체결조회 실패(${e instanceof Error ? e.message : e}) → 무결정(다음 틱 재시도)`);
+      store.setBotPositionState(bot.id, st); return { action: "hold", detail: "미체결조회 실패 — 무결정" };
+    }
+    let held = 0;
+    const getPos = live.adapter.getPositions;
+    try {
+      const pos = getPos ? await getReconcilePositions(broker, live.env, () => getPos.call(live.adapter)) : [];
+      held = lbHeldQty(pos, node.symbol, broker);
+    } catch (e) {
+      store.insertLog(bot.id, "error", `[지정가봇] 보유조회 실패(${e instanceof Error ? e.message : e}) → 무결정(다음 틱 재시도)`);
+      store.setBotPositionState(bot.id, st); return { action: "hold", detail: "보유조회 실패 — 무결정" };
+    }
+    if (!st) { st = initLimitBracketState(held, nowIso); store.insertLog(bot.id, "hold", `[지정가봇] 시작 — 기준 계좌보유 ${held}(이후 증가분만 봇 체결로 인식)`); }
+    ownHeldDelta = Math.max(0, held - st.baselineQty);
+    const buyTarget = broker === "binance" ? node.buyPrice : roundToKrxTick(node.buyPrice);
+    const fb = findMyRestingOrder(openOrders, "buy", buyTarget, st.entryOrderId);
+    const sellTarget = node.sellPrice != null ? (broker === "binance" ? node.sellPrice : roundToKrxTick(node.sellPrice)) : 0;
+    const fs = node.sellPrice != null ? findMyRestingOrder(openOrders, "sell", sellTarget, st.exitOrderId) : { order: null, ambiguous: false };
+    if (fb.ambiguous || fs.ambiguous) {
+      store.insertLog(bot.id, "error", "[지정가봇] 미체결 주문 귀속 모호(같은 종목·가격 다건) → 동결(수동 정리 필요, fail-closed)");
+      store.setBotPositionState(bot.id, st); return { action: "hold", detail: "주문 귀속 모호 — 동결" };
+    }
+    restingBuy = fb.order; restingSell = fs.order;
+  } else {
+    if (!st) st = initLimitBracketState(0, nowIso);
+    // 페이퍼 가격교차 시뮬용 닫힌봉 저/고가(닫힌봉 = backtest 모델 일치).
+    try {
+      const iv = secsToInterval(bot.interval_seconds);
+      let bars: Bar[] = [];
+      if (broker === "binance") bars = await fetchKlines(node.symbol, iv, 3);
+      else { const da = getAdapter(broker, "spot")?.adapter as { getCandles?: (s: string, i: string, c: number) => Promise<Bar[]> } | undefined; bars = da?.getCandles ? await da.getCandles(node.symbol, iv, 3) : []; }
+      const closed = bars.length > 1 ? bars[bars.length - 2] : bars[bars.length - 1];
+      if (closed) { refLow = closed.low; refHigh = closed.high; }
+    } catch { /* 시세 없음 → 미교차(noop) */ }
+  }
+
+  const { state: next, action } = decideLimitBracket(node, st, { marketOpen, sessionKey: sKey, paper, restingBuy, restingSell, ownHeldDelta, refLow, refHigh });
+
+  if (action.kind === "place") {
+    const posLive = action.side === "sell" ? true : undefined; // 매도=라이브 보유는 라이브로만 청산(실패 동결) / 매수=신규(라이브 시도)
+    let q = action.qty;
+    if (action.side === "sell" && live) { const ledger = store.liveOpenLedger(bot.id).qty; if (ledger > 0) q = Math.min(q, ledger); } // 오버셀 방지(kr#1): 장부 미청산 상한
+    if (!(q > 0)) { store.setBotPositionState(bot.id, next); return { action: "hold", detail: "주문 수량 0(장부 상한) — 보류" }; }
+    const r = await fillOrder(bot, action.side, q, action.price, node.symbol, { entry: { type: "limit", limitPrice: action.price, timeoutBars: 1, maxSlippagePct: 0 }, allowKrLimit: true, posLive, barIso: nowIso });
+    if (r.failed) { store.setBotPositionState(bot.id, next); return { action: "hold", detail: `주문 동결(${r.note}) — 다음 틱 재시도` }; }
+    if (action.side === "buy") { if (r.orderId) next.entryOrderId = String(r.orderId); if (r.cid) next.entryCid = r.cid; }
+    else { if (r.orderId) next.exitOrderId = String(r.orderId); if (r.cid) next.exitCid = r.cid; }
+    store.setBotPositionState(bot.id, next, true, false);
+    return { action: action.side, detail: `${action.reason}${r.pending ? " (호가등록)" : ""}` };
+  }
+  if (action.kind === "fill") {
+    const isPaper = paper || next.live === false;
+    const cum = action.side === "buy" ? next.filledQty : next.soldQty;
+    const oid = action.side === "buy" ? (next.entryOrderId ?? "lb") : (next.exitOrderId ?? "lb");
+    const pnl = action.side === "sell" ? (action.price - (next.entryAvg ?? action.price)) * action.qty : 0;
+    store.tx(() => {
+      store.insertTrade({ bot_id: bot.id, side: action.side, price: action.price, qty: action.qty, pnl, is_paper: isPaper ? 1 : 0, reason: `[지정가봇] ${action.reason}`, idempotency_key: `${bot.id}:${oid}:${action.side}:${cum.toFixed(8)}` });
+      store.setBotPositionState(bot.id, next, true, true);
+    });
+    store.insertLog(bot.id, action.side, `[지정가봇] ${action.side === "buy" ? "매수" : "매도"} 체결 ${action.qty} @${action.price}${isPaper ? " (페이퍼)" : ""}`);
+    return { action: action.side, detail: action.reason };
+  }
+  if (action.kind === "done") {
+    store.setBotPositionState(bot.id, next, true, true);
+    const botNow = store.getBot(bot.id); if (botNow) await cancelLimitBracketRestingOrders(botNow); // 잔존 반대편 주문 취소(저장 후 최신 state로)
+    store.insertLog(bot.id, "hold", `[지정가봇] 종료 — ${action.reason}`);
+    runner().stop(bot.id); // 상태 저장·정리 후 마지막(ambiguous_halt 순서 차용)
+    return { action: "hold", detail: `종료: ${action.reason}` };
+  }
+  store.setBotPositionState(bot.id, next, true, false);
+  return { action: "hold", detail: action.reason };
+}
+
 /** 러너 데몬: 가동 봇을 interval마다 tick. graceful shutdown 지원. */
 export class Runner {
   private timers = new Map<string, ReturnType<typeof setInterval>>();
@@ -1173,6 +1307,14 @@ export async function emergencyStopAll(opts?: { closePositions?: boolean }): Pro
         store.insertLog(bot.id, "error", `비상 전체청산 예외(${e instanceof Error ? e.message : e}) — 수동 확인 필요`);
       }
     }
+  }
+  // limit_bracket 잔존 미체결 지정가 취소(적대검증 safety#1·#2): killswitch 시 거래소에 주문이 남아 봇 사후 체결되는 것 차단
+  //   (특히 Binance GTC는 만료 안 됨 → 나체 노출). closePositions와 무관하게 항상 취소(주문≠포지션).
+  for (const bot of bots) {
+    try {
+      if ((store.getComposite(bot.composite_strategy_id)?.root_node as { type?: string })?.type !== "limit_bracket") continue;
+      const b2 = store.getBot(bot.id); if (b2) await cancelLimitBracketRestingOrders(b2);
+    } catch (e) { store.insertLog(bot.id, "error", `비상정지 잔존주문 취소 예외(${e instanceof Error ? e.message : e})`); }
   }
   audit({ event: "emergency_stop_all", stopped: bots.length, closed, failed, closePositions: !!opts?.closePositions });
   return { stopped: bots.length, closed, failed };

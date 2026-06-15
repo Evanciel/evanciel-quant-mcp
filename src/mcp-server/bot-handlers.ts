@@ -4,7 +4,7 @@
  */
 import { validateBotRoot } from "../core/validation/composite-node.js";
 import * as store from "../store/db.js";
-import { runner } from "../runner/runner.js";
+import { runner, cancelLimitBracketRestingOrders } from "../runner/runner.js";
 import { startDashboard } from "../dashboard/server.js";
 import { liveGate, type Broker } from "../brokers/safety.js";
 import type { RiskSizingConfig } from "../core/risk/order-sizing.js";
@@ -103,10 +103,15 @@ export function startBot(a: { botId: string }) {
   return { ok: true, botId: a.botId, status: "running", note: `${Math.max(15, b.interval_seconds)}초마다 평가(${modeLabel}). open_dashboard로 실시간 확인.` };
 }
 
-export function stopBot(a: { botId: string }) {
+export async function stopBot(a: { botId: string }) {
   const b = store.getBot(a.botId);
   if (!b) return { ok: false, error: `봇 없음: ${a.botId}` };
   runner().stop(a.botId);
+  // limit_bracket: 거래소 잔존 미체결 지정가 취소(봇 중지 후 주문이 남아 사후 체결되는 것 차단, 적대검증 safety#1).
+  const comp = store.getComposite(b.composite_strategy_id);
+  if ((comp?.root_node as { type?: string })?.type === "limit_bracket") {
+    try { await cancelLimitBracketRestingOrders(b); } catch (e) { store.insertLog(a.botId, "error", `중지 시 잔존주문 취소 예외(${e instanceof Error ? e.message : e})`); }
+  }
   store.insertLog(a.botId, "stop", `[${b.mode}] 봇 중지`);
   return { ok: true, botId: a.botId, status: "stopped" };
 }
