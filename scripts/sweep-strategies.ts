@@ -10,8 +10,8 @@ import { calcReturnMoments } from "../src/core/backtest/metrics.js";
 import { probabilisticSharpe } from "../src/core/backtest/deflated-sharpe.js";
 
 const now = new Date().toISOString();
-const SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"];
-const TFS = ["1h", "4h", "1d"];
+const SYMBOLS = (process.env.SWEEP_SYMBOLS || "BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT,ADAUSDT,DOGEUSDT,AVAXUSDT,LINKUSDT,MATICUSDT").split(",");
+const TFS = (process.env.SWEEP_TFS || "1h,4h,1d").split(",");
 const leaf = (symbol: string, rules: unknown[]) => ({ id: "r", type: "leaf", name: "s", strategy: { id: "s", userId: "u", name: "s", description: "", symbol, rules, isActive: true, createdAt: now, updatedAt: now } });
 const rsi = (p: number, action: string, op: string, v: number) => ({ id: action, action, conditions: [{ id: "c", indicator: "rsi", params: { period: p }, operator: op, value: v }], quantityPercent: 100 });
 
