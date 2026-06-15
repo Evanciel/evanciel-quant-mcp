@@ -92,6 +92,9 @@ export const DEFAULT_LIVE_MAX_NOTIONAL = LIVE_DEFAULTS_BY_CCY.USDT.cap;
  */
 export function checkLimits(order: { symbol: string; notional: number; quoteCurrency?: string }): { ok: boolean; reason: string } {
   const liveActive = trim(process.env.LIVE_TRADING_ENABLED) === "true";
+  // 하드리밋(노셔널 캡·심볼 allowlist·일일손실 서킷)은 **실제 돈(메인넷=마스터 ON)에서만** 강제(설계 의도 "메인넷=하드리밋").
+  // testnet/모의(마스터 OFF)=가짜돈 → 무마찰 샌드박스로 통과. 메인넷 켜면 아래 설정값(또는 통화 기본값)이 자동 복귀.
+  if (!liveActive) return { ok: true, reason: "ok (testnet/모의 — 하드리밋은 메인넷 전용)" };
   const def = ccyDefaults(order.quoteCurrency);
   // env 숫자 파서: 유한 양수만 채택. 음수/garbage는 0 → 아래 `||` 체인이 통화별 안전 기본값으로 폴백.
   //   (audit P1-24 후속: 음수 typo[예: -50]가 truthy라 circuit/cap으로 채택되고 `>0` 가드에 걸러져 서킷/캡이

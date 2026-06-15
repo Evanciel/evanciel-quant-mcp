@@ -46,16 +46,25 @@ describe("safety gate", () => {
     expect(liveGate("binance").allowed).toBe(true);
   });
 
-  it("하드리밋: 노셔널 캡 초과 차단", () => {
+  it("하드리밋: 노셔널 캡 초과 차단(메인넷 전용)", () => {
+    process.env.LIVE_TRADING_ENABLED = "true"; // 하드리밋은 메인넷(마스터 ON)에서만 강제
     process.env.LIVE_MAX_NOTIONAL = "1000";
     expect(checkLimits({ symbol: "BTCUSDT", notional: 5000 }).ok).toBe(false);
     expect(checkLimits({ symbol: "BTCUSDT", notional: 500 }).ok).toBe(true);
   });
 
-  it("하드리밋: 심볼 allowlist", () => {
+  it("하드리밋: 심볼 allowlist(메인넷 전용)", () => {
+    process.env.LIVE_TRADING_ENABLED = "true";
     process.env.LIVE_SYMBOL_ALLOWLIST = "BTCUSDT,ETHUSDT";
     expect(checkLimits({ symbol: "DOGEUSDT", notional: 1 }).ok).toBe(false);
     expect(checkLimits({ symbol: "BTCUSDT", notional: 1 }).ok).toBe(true);
+  });
+
+  it("testnet/모의(마스터 OFF)는 하드리밋 무마찰 — 캡·allowlist 둘 다 통과(가짜돈 샌드박스)", () => {
+    // 마스터 OFF(LIVE_TRADING_ENABLED 미설정): 캡·allowlist를 빡세게 걸어도 testnet 주문은 통과해야 함.
+    process.env.LIVE_MAX_NOTIONAL = "50";
+    process.env.LIVE_SYMBOL_ALLOWLIST = "BTCUSDT";
+    expect(checkLimits({ symbol: "SOLUSDT", notional: 999999 }).ok).toBe(true);
   });
 
   it("2단계 토큰: fail-CLOSED (단일사용 + 해시바인딩)", () => {
