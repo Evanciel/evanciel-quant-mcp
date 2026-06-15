@@ -14,7 +14,7 @@ process.env.BINANCE_ENV = "testnet";
 process.env.BINANCE_API_KEY = "x".repeat(64);
 process.env.BINANCE_API_SECRET = "y".repeat(64);
 
-const ctl = vi.hoisted(() => ({ orderStatus: "pending" as "pending" | "filled" | "rejected", restingQty: 0, executedQty: 0, quote: 100, limitCid: "", placeCalls: [] as { type: string; price?: number }[], cancelCalls: 0, getPositionsCount: 0 }));
+const ctl = vi.hoisted(() => ({ orderStatus: "pending" as "pending" | "filled" | "rejected" | "missing", restingQty: 0, executedQty: 0, quote: 100, limitCid: "", placeCalls: [] as { type: string; price?: number }[], cancelCalls: 0, getPositionsCount: 0 }));
 const klinesMock = vi.hoisted(() => vi.fn());
 vi.mock("../src/data/binance-public.js", async (orig) => {
   const actual = await (orig() as Promise<Record<string, unknown>>);
@@ -29,6 +29,7 @@ vi.mock("../src/brokers/index.js", () => ({
     },
     async getOrderByClientId(_s: string, cid: string) {
       if (cid !== ctl.limitCid) return null; // 미발행 cid(사전체크/시장가 cid) → 거래소에 없음(실거래소 동형)
+      if (ctl.orderStatus === "missing") return null; // 인덱싱 지연(testnet 실측): 방금 낸 주문이 조회 null
       const base = { orderId: "L1", symbol: "BTCUSDT", side: "buy" as const, origQty: ctl.restingQty, timestamp: new Date() };
       if (ctl.orderStatus === "filled") return { ...base, quantity: ctl.restingQty, executedQty: ctl.restingQty, price: 99, status: "filled" as const };
       if (ctl.orderStatus === "rejected") return { ...base, quantity: 0, executedQty: 0, price: 0, status: "rejected" as const };
@@ -123,6 +124,19 @@ describe("P1-5 pendingEntry 상태머신", () => {
     await tickBot(id);                       // 대기 유지
     expect(ctl.getPositionsCount).toBe(after);                        // reconcile 미진입
     expect(ctl.placeCalls.filter((p) => p.type === "limit")).toHaveLength(1); // 중복 배치 없음(crash-restart 멱등 동형)
+  });
+
+  it("⑦ 인덱싱 지연(조회 null=not_placed) + 타임아웃 전 → 대기 유지(유령 주문 방지)", async () => {
+    const id = mkBot(limitEE);
+    klinesMock.mockResolvedValue(bars(baseMs));
+    await tickBot(id);                       // 배치
+    ctl.orderStatus = "missing";             // 방금 낸 주문이 조회 null(testnet 인덱싱 지연)
+    klinesMock.mockResolvedValue(bars(baseMs + HOUR)); // 1봉(timeout 2 미만)
+    const r = await tickBot(id);
+    expect(r.action).toBe("hold");
+    const ps = store.getBot(id)?.position_state as { pendingEntry?: unknown };
+    expect(ps?.pendingEntry).toBeDefined();  // 해제 안 함(회귀 전 버그: not_placed 즉시 해제 → 유령 주문)
+    expect(ctl.placeCalls.filter((p) => p.type === "market")).toHaveLength(0); // 타임아웃 전이라 폴백도 안 함
   });
 
   it("⑥ KR(키움) limit 봇 start_bot 거절(fail-closed)", () => {

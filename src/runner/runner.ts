@@ -611,27 +611,25 @@ async function resolvePendingEntry(bot: store.BotRow, cur: PaperPosition, lastIs
     audit({ event: "limit_entry_filled", botId: bot.id, env: live.env, fillPrice, filledQty });
     return bookEntryFill(bot, fillPrice, filledQty, lastIso, risk, null, "limitfill", "지정가 진입 체결");
   }
-  if (verdict === "open") {
-    const elapsed = elapsedClosedBars(pe.placedBarIso, lastIso, Math.max(1, bot.interval_seconds) * 1000);
-    if (elapsed < pe.timeoutBars) { store.setBotPositionState(bot.id, cur, true, false); return { cur, detail: `지정가 대기(${elapsed}/${pe.timeoutBars}봉)` }; }
-    // 타임아웃 → 취소 + (부분체결 개시) + 잔량 캡게이트 시장가 폴백.
-    if (adapter.cancelOrderByClientId) { try { await adapter.cancelOrderByClientId(bot.symbol, pe.cid); } catch (e) { store.insertLog(bot.id, "gate", `지정가 취소 실패(${e instanceof Error ? e.message : e}) — 폴백 진행`); } }
-    let executed = 0;
-    try { const re = await getOrder(bot.symbol, pe.cid); executed = (re?.executedQty && re.executedQty > 0) ? re.executedQty : 0; } catch { /* 재조회 실패 → 보수적 executed=0 */ }
-    audit({ event: "limit_entry_timeout", botId: bot.id, env: live.env, executed, origQty: pe.origQty });
-    let base: PaperPosition | null = null;
-    if (executed > 1e-9) base = (await bookEntryFill(bot, pe.limitPrice, executed, lastIso, risk, null, "limitpartial", "지정가 부분체결")).cur;
-    const remaining = Math.max(0, pe.origQty - executed);
-    if (remaining <= 1e-9) { if (!base) store.setBotPositionState(bot.id, null, true, false); return { cur: base, detail: `지정가 타임아웃 — 체결 ${executed}` }; }
-    return fillMarketFallback(bot, remaining, pe.limitPrice, pe.maxSlippagePct, lastIso, risk, base);
-  }
-  if (verdict === "rejected" || verdict === "not_placed") {
-    store.insertLog(bot.id, "gate", `[${live.env}] 지정가 주문 ${verdict} → 대기 해제(다음 틱 재평가)`);
+  if (verdict === "rejected") { // CANCELED/REJECTED/EXPIRED = 거래소 명시 종료 → 즉시 해제(재평가)
+    store.insertLog(bot.id, "gate", `[${live.env}] 지정가 주문 거절/취소(rejected) → 대기 해제(다음 틱 재평가)`);
     store.setBotPositionState(bot.id, null, true, false);
-    return { cur: null, detail: `지정가 ${verdict} — 대기 해제` };
+    return { cur: null, detail: "지정가 거절/취소 — 대기 해제" };
   }
-  store.setBotPositionState(bot.id, cur, true, false); // unknown → 유지
-  return { cur, detail: "지정가 상태 불명 — 대기 유지" };
+  // open / not_placed / unknown = 미확정. ⚠️ testnet 실측: 방금 낸 주문이 인덱싱 지연으로 조회 1회 null(not_placed) 가능 →
+  //   즉시 해제하면 유령 주문 발생. '미확정'은 타임아웃 봉까지 유지(틱 간격이 인덱싱 지연 흡수) → 타임아웃 시 취소+캡게이트 시장가 폴백.
+  const elapsed = elapsedClosedBars(pe.placedBarIso, lastIso, Math.max(1, bot.interval_seconds) * 1000);
+  if (elapsed < pe.timeoutBars) { store.setBotPositionState(bot.id, cur, true, false); return { cur, detail: `지정가 대기(${elapsed}/${pe.timeoutBars}봉, ${verdict})` }; }
+  // 타임아웃 → 취소 + (부분체결 개시) + 잔량 캡게이트 시장가 폴백.
+  if (adapter.cancelOrderByClientId) { try { await adapter.cancelOrderByClientId(bot.symbol, pe.cid); } catch (e) { store.insertLog(bot.id, "gate", `지정가 취소 실패(${e instanceof Error ? e.message : e}) — 폴백 진행`); } }
+  let executed = 0;
+  try { const re = await getOrder(bot.symbol, pe.cid); executed = (re?.executedQty && re.executedQty > 0) ? re.executedQty : 0; } catch { /* 재조회 실패 → 보수적 executed=0 */ }
+  audit({ event: "limit_entry_timeout", botId: bot.id, env: live.env, executed, origQty: pe.origQty });
+  let base: PaperPosition | null = null;
+  if (executed > 1e-9) base = (await bookEntryFill(bot, pe.limitPrice, executed, lastIso, risk, null, "limitpartial", "지정가 부분체결")).cur;
+  const remaining = Math.max(0, pe.origQty - executed);
+  if (remaining <= 1e-9) { if (!base) store.setBotPositionState(bot.id, null, true, false); return { cur: base, detail: `지정가 타임아웃 — 체결 ${executed}` }; }
+  return fillMarketFallback(bot, remaining, pe.limitPrice, pe.maxSlippagePct, lastIso, risk, base);
 }
 
 // ── 포트폴리오 레벨 캡(opt-in) — 러너측 스냅샷 + 진입 게이트 적용 ──
