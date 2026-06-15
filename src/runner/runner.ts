@@ -1097,6 +1097,9 @@ async function tickScanner(bot: store.BotRow, node: ScannerNode, riskSizing?: Ba
 export class Runner {
   private timers = new Map<string, ReturnType<typeof setInterval>>();
   private alive = true;
+  // per-bot 재진입 락(적대검증 races#1): tick이 interval보다 오래 걸리면(키움 다중 네트워크 호출 등)
+  // setInterval이 같은 봇에 tick을 동시 재진입시켜 이중주문/lost-update 발생 → 진행 중이면 스킵. 전 봇 타입 적용.
+  private ticking = new Set<string>();
   private backupTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor() {
@@ -1111,7 +1114,14 @@ export class Runner {
     if (!bot) return;
     store.setBotStatus(botId, "running");
     if (this.timers.has(botId)) return;
-    const run = () => { if (this.alive) tickBot(botId).catch((e) => store.insertLog(botId, "error", String(e instanceof Error ? e.message : e))); };
+    const run = () => {
+      if (!this.alive) return;
+      if (this.ticking.has(botId)) return; // 이전 틱 진행중 → 재진입 차단(이중주문·lost-update 방지)
+      this.ticking.add(botId);
+      tickBot(botId)
+        .catch((e) => store.insertLog(botId, "error", String(e instanceof Error ? e.message : e)))
+        .finally(() => this.ticking.delete(botId));
+    };
     run();
     this.timers.set(botId, setInterval(run, Math.max(15, bot.interval_seconds) * 1000));
   }

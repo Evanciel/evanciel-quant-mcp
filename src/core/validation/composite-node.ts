@@ -237,13 +237,40 @@ export function validateScannerNode(data: unknown): string | null {
   return first ? `스캐너 검증 실패: ${first.path.join(".")} — ${first.message}` : "스캐너 구조가 올바르지 않습니다";
 }
 
+// ── 지정가 브래킷 봇 노드(봇 최상위 전용) ──
+// 환경무관 sanity 상한(적대검증 safety#3): 하드리밋(checkLimits)은 메인넷 전용이라 testnet에서 무력 →
+//   여기서 fat-finger/overflow를 절대값으로 차단(qty·가격 상한). 재주문 폭주는 러너의 세션당 재주문 캡이 담당.
+const LimitBracketNodeSchema = z.object({
+  id: z.string(),
+  type: z.literal("limit_bracket"),
+  name: z.string(),
+  symbol: z.string().min(1),
+  buyPrice: z.number().finite().positive().max(1e9),
+  qty: z.number().finite().positive().max(1e9),
+  sellPrice: z.number().finite().positive().max(1e9).optional(),
+});
+
+/** 지정가 브래킷 노드 검증. 실패 시 에러 메시지, 성공 시 null. */
+export function validateLimitBracketNode(data: unknown): string | null {
+  let result: ReturnType<typeof LimitBracketNodeSchema.safeParse>;
+  try {
+    result = LimitBracketNodeSchema.safeParse(data);
+  } catch (e) {
+    return `지정가봇 검증 실패: 구조 파싱 오류 (${e instanceof Error ? e.message : String(e)})`;
+  }
+  if (result.success) return null;
+  const first = result.error.issues[0];
+  return first ? `지정가봇 검증 실패: ${first.path.join(".")} — ${first.message}` : "지정가봇 구조가 올바르지 않습니다";
+}
+
 /**
- * 봇 root_node 검증 — scanner면 validateScannerNode, 아니면 validateRootNode. 봇 생성/배포의 단일 게이트.
+ * 봇 root_node 검증 — scanner→validateScannerNode, limit_bracket→validateLimitBracketNode, 그 외→validateRootNode.
+ * 봇 생성/배포의 단일 게이트. (limit_bracket 분기 누락 시 StrategyNodeSchema가 '구조오류'로 reject돼 save 실패 — 적대검증)
  */
 export function validateBotRoot(data: unknown): string | null {
-  if (data && typeof data === "object" && (data as { type?: unknown }).type === "scanner") {
-    return validateScannerNode(data);
-  }
+  const t = data && typeof data === "object" ? (data as { type?: unknown }).type : undefined;
+  if (t === "scanner") return validateScannerNode(data);
+  if (t === "limit_bracket") return validateLimitBracketNode(data);
   return validateRootNode(data);
 }
 

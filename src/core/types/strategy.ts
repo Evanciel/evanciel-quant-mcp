@@ -247,7 +247,18 @@ export interface ScannerNode {
   then: StrategyNode;  // 선정 종목에 적용할 복합전략
   schedule?: ScannerSchedule;
 }
-export type BotRootNode = StrategyNode | ScannerNode;
+// 지정가 브래킷 봇(봇 최상위 전용, StrategyNode 트리 중첩 불가). 가격기반 주문관리 — 인디케이터 엔진 미사용,
+// 백테 비대상. 장 열릴 때마다 매수 지정가 재주문 → 체결되면 매도 지정가 → 매도 체결 시 자동종료. validateLimitBracketNode로 검증.
+export interface LimitBracketNode {
+  id: string;
+  type: "limit_bracket";
+  name: string;
+  symbol: string;      // bot.symbol과 일치
+  buyPrice: number;    // 매수 지정가(>0). 키움은 placeOrder가 roundToKrxTick 정렬.
+  qty: number;         // 목표 매수 수량(>0). 키움=정수주(normalizeQuantity 내림).
+  sellPrice?: number;  // 선택 매도 지정가(>0). 없으면 매수전용(체결 후 보유 유지, 매도 단계 생략).
+}
+export type BotRootNode = StrategyNode | ScannerNode | LimitBracketNode;
 
 export interface MultiBacktestResult {
   results: {

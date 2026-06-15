@@ -128,6 +128,8 @@ export async function scanUniverse(args: { universe: string[]; metric?: RankMetr
 
 // ── 2. backtest (70/30 hold-out OOS + PSR) ── 단일 홀드아웃 분할(롤링/확장 워크포워드 아님: split=floor(len*0.7), train=앞 70%, test=뒤 30%).
 export async function backtest(args: { tree: StrategyNode; symbol?: string; interval?: string; days?: number; gapHandling?: "close" | "worst"; entryExecution?: EntryExecution }) {
+  // 지정가 브래킷 봇은 백테 비대상(가격기반 주문관리 — OHLCV로 재현할 신호전략 아님). 조용한 빈결과 대신 loud reject(적대검증).
+  if ((args.tree as { type?: string })?.type === "limit_bracket") return { ok: false, error: "지정가 브래킷 봇은 백테스트 비대상입니다 — 인디케이터 엔진 대응물이 없는 주문관리 봇입니다." };
   const err = validateRootNode(args.tree);
   if (err) return { ok: false, error: `검증 실패: ${err}` };
   const symbol = args.symbol || "BTCUSDT", interval = args.interval || "1d", days = Number(args.days || 200);
@@ -167,6 +169,7 @@ export async function backtest(args: { tree: StrategyNode; symbol?: string; inte
 
 // ── 3. backtest_short (sell=숏진입, buy=커버) ──
 export async function backtestShort(args: { tree: StrategyNode; symbol?: string; interval?: string; days?: number; risk?: Parameters<typeof runShortBacktest>[3] }) {
+  if ((args.tree as { type?: string })?.type === "limit_bracket") return { ok: false, error: "지정가 브래킷 봇은 백테스트 비대상입니다 — 인디케이터 엔진 대응물이 없는 주문관리 봇입니다." };
   const err = validateRootNode(args.tree);
   if (err) return { ok: false, error: `검증 실패: ${err}` };
   const symbol = args.symbol || "BTCUSDT", interval = args.interval || "1d", days = Number(args.days || 200);
