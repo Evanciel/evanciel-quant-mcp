@@ -14,21 +14,21 @@ const COMM = 0.001, SLIP = 0.0005;
 
 function maxDD(eq: number[]): number { let peak = eq[0], mdd = 0; for (const v of eq) { if (v > peak) peak = v; const dd = (peak - v) / peak; if (dd > mdd) mdd = dd; } return mdd * 100; }
 
-function regimeHaltLong(data: Bar[]): { ret: number; mdd: number; daysIn: number } {
+function regimeHaltLong(data: Bar[]): { ret: number; mdd: number; daysIn: number; winRate: number; trades: number } {
   const prices = data.map((b) => b.close), highs = data.map((b) => b.high), lows = data.map((b) => b.low);
-  let equity = 1, side: "flat" | "long" = "flat", entry = 0, inBars = 0;
+  let equity = 1, side: "flat" | "long" = "flat", entry = 0, inBars = 0, trades = 0, wins = 0;
   const eq: number[] = [];
   for (let i = 0; i < data.length; i++) {
     const px = prices[i];
     if (i < 50) { eq.push(equity); continue; }
     const up = computeRegime(prices.slice(0, i + 1), highs.slice(0, i + 1), lows.slice(0, i + 1)).label === "trend_up";
-    if (side === "long" && !up) { equity *= 1 + ((px * (1 - SLIP) - entry) / entry) - COMM; side = "flat"; }
+    if (side === "long" && !up) { const net = ((px * (1 - SLIP) - entry) / entry) - COMM; equity *= 1 + net; side = "flat"; trades++; if (net > 0) wins++; }
     else if (side === "flat" && up) { side = "long"; entry = px * (1 + SLIP); equity *= 1 - COMM; }
     if (side === "long") inBars++;
     eq.push(side === "long" ? equity * (1 + (px - entry) / entry) : equity);
   }
-  if (side === "long") equity *= 1 + (prices[prices.length - 1] - entry) / entry;
-  return { ret: (equity - 1) * 100, mdd: maxDD(eq), daysIn: Math.round((inBars / (data.length - 50)) * 100) };
+  if (side === "long") { const net = (prices[prices.length - 1] - entry) / entry; equity *= 1 + net; trades++; if (net > 0) wins++; } // 마지막 미청산도 1거래로
+  return { ret: (equity - 1) * 100, mdd: maxDD(eq), daysIn: Math.round((inBars / (data.length - 50)) * 100), winRate: trades ? (wins / trades) * 100 : 0, trades };
 }
 function buyHold(data: Bar[]): { ret: number; mdd: number } {
   const p = data.map((b) => b.close); const eq = p.map((x) => x / p[0]);
@@ -42,6 +42,6 @@ for (const s of SYMBOLS) {
   if (data.length < 200) continue;
   const h = regimeHaltLong(data), b = buyHold(data);
   const ddCut = b.mdd > 0 ? Math.round((1 - h.mdd / b.mdd) * 100) : 0;
-  console.log(`${s.padEnd(9)} | ${h.ret.toFixed(0).padStart(5)}% / MDD ${h.mdd.toFixed(0)}% / 시장노출 ${h.daysIn}% | ${b.ret.toFixed(0).padStart(5)}% / MDD ${b.mdd.toFixed(0)}%  → 낙폭 ${ddCut > 0 ? ddCut + "% 감소" : "감소못함"}`);
+  console.log(`${s.padEnd(9)} | 승률 ${h.winRate.toFixed(0)}%(${h.trades}회) · ${h.ret.toFixed(0).padStart(5)}% / MDD ${h.mdd.toFixed(0)}% / 노출 ${h.daysIn}% | 보유 ${b.ret.toFixed(0).padStart(5)}% / MDD ${b.mdd.toFixed(0)}% → 낙폭 ${ddCut > 0 ? ddCut + "%↓" : "감소못함"}`);
 }
 console.log(`\n정직: 레짐정지는 보통 "수익은 보유와 비슷하거나 덜, 대신 MDD(낙폭)가 크게 작다"가 핵심 — 하락장에 빠져나와 손실을 던다(리스크 통제). 알파(초과수익)는 기대 안 함. 과거≠미래.`);
