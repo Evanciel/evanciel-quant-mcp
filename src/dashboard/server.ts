@@ -1266,7 +1266,7 @@ function setupKline(sym,tf){closeKline();
 // 봉 마감 시 1회: 지표 다시 받아 기존 시리즈에 setData(차트/패널 유지 → 깜빡임·줌리셋 없음).
 function refreshSeries(){if(_refreshing||!_priceSeries||!_chartId)return;_refreshing=true;
  var _q=Array.from(chartInds).filter(function(k){return k!=='volume'});var indQ=_q.length?'&ind='+encodeURIComponent(_q.join(',')):'';
- fetch('/api/candles?bot='+encodeURIComponent(_chartId)+(_chartTf?'&tf='+_chartTf:'')+indQ).then(function(r){return r.json()}).then(function(d){_refreshing=false;if(!d.ok||!_priceSeries)return;
+ fetch('/api/candles?bot='+encodeURIComponent(_chartId)+(_chartTf?'&tf='+_chartTf:'')+indQ).then(function(r){if(r.status===401){sessionLost();throw new Error('session');}return r.json()}).then(function(d){_refreshing=false;if(!d.ok||!_priceSeries)return;
   try{_priceSeries.setData(d.bars||[]);}catch(e){}
   (d.overlays||[]).forEach(function(o,i){if(_ovSeries[i])try{_ovSeries[i].setData(o.data||[])}catch(e){}});
   var flat=(d.oscGroups||[]).reduce(function(a,g){return a.concat(g.series||[])},[]);
@@ -1436,7 +1436,7 @@ function openChart(id,tf){
  _chartId=id;var modal=document.getElementById('chartModal'),body=document.getElementById('chartBody');
  document.getElementById('chartTitle').textContent='차트 불러오는 중…';modal.style.display='flex';
  var _oq=Array.from(chartInds).filter(function(k){return k!=='volume'});var indQ=_oq.length?'&ind='+encodeURIComponent(_oq.join(',')):''; // volume=클라전용(refreshSeries와 일관)
- fetch('/api/candles?bot='+encodeURIComponent(id)+(tf?'&tf='+tf:'')+indQ).then(function(r){return r.json()}).then(function(d){
+ fetch('/api/candles?bot='+encodeURIComponent(id)+(tf?'&tf='+tf:'')+indQ).then(function(r){if(r.status===401){sessionLost();throw new Error('session');}return r.json()}).then(function(d){
   if(!d.ok){document.getElementById('chartTitle').textContent='차트 오류: '+(d.error||'불러오기 실패');document.getElementById('chartTf').innerHTML='';return;}
   var isC=d.broker==='binance';
   _chartTf=d.interval;
@@ -1483,7 +1483,7 @@ function openChart(id,tf){
   closeKline();clearChartPoll();
   if(isC)setupKline(d.symbol,d.interval);
   else _chartPoll=setInterval(refreshSeries,20000); // KR 실시간 근사(20초마다 키움 차트 재요청). 429 회피용 간격.
- }).catch(function(){document.getElementById('chartTitle').textContent='차트 오류(네트워크)';});}
+ }).catch(function(e){document.getElementById('chartTitle').textContent=(e&&e.message==='session')?'세션 만료 — 위 빨간 안내대로 새 URL(?token=…)로 다시 접속하세요':'차트 오류(네트워크)';});}
 function closeChart(){document.getElementById('chartModal').style.display='none';closeKline();clearChartPoll();if(_chart&&_clickHandler){try{_chart.unsubscribeClick(_clickHandler)}catch(e){}}_clickHandler=null;_drawings=[];_pendingTrend=null;_drawLoadedFor=null;_drawMode='none';
  unbindProtectDrag();_protect=null;_protDrag=null;var _cp=document.getElementById('chartProtect');if(_cp){_cp.style.display='none';_cp.innerHTML='';}var _pm=document.getElementById('protectMsg');if(_pm)_pm.textContent=''; // 보호주문 정리(리스너 누수 방지)
  var _ct=document.getElementById('chartTrade');if(_ct){_ct.style.display='none';_ct.innerHTML='';}_chartMeta=null; // 차트 주문바 정리
@@ -1851,8 +1851,11 @@ function renderAlerts(list){var el=document.getElementById('alertfeed');if(!el)r
    var t=new Date(a.ts);var hh=('0'+t.getHours()).slice(-2)+':'+('0'+t.getMinutes()).slice(-2)+':'+('0'+t.getSeconds()).slice(-2);
    return '<div class="alertrow '+esc(a.level)+'"><span class="ad">'+icon(a.level)+'</span><span class="at">'+hh+'</span><span class="am">'+esc(a.message)+'</span></div>';
  }).join('');}
+// 세션 만료(데몬 재시작 → token·sessionId 갱신 → 옛 쿠키 무효) 전역 안내. "네트워크 오류"로 오표시 금지 — 원인·해법을 정직하게.
+function sessionLost(){var b=document.getElementById('sessbar');if(!b){b=document.createElement('div');b.id='sessbar';b.style.cssText='position:fixed;top:0;left:0;right:0;z-index:9999;background:#7f1d1d;color:#fff;padding:10px 14px;text-align:center;font-size:14px;box-shadow:0 2px 8px rgba(0,0,0,.4)';document.body.appendChild(b);}b.innerHTML='⚠️ 세션 만료 — 데몬이 재시작됐어요. 터미널/스크립트가 알려준 새 대시보드 URL(<b>?token=…</b>)로 다시 접속하세요.';}
 const es=new EventSource('/events'); // same-origin SSE — 세션쿠키 자동 첨부
 es.onmessage=e=>{const s=JSON.parse(e.data);bots=s.bots;document.getElementById('upd').textContent=new Date(s.updatedAt).toLocaleTimeString();subscribe();render();renderAlerts(s.alerts)};
+es.onerror=function(){if(es.readyState===2)sessionLost();}; // readyState 2=CLOSED=재연결 불가(보통 세션만료/데몬재시작) → 정직 안내
 render();renderWatch();loadBalances();setTimeout(loadPrices,2500);setInterval(loadBalances,60000);setInterval(loadPrices,45000);
 setTimeout(loadRealAccounts,1500);setInterval(loadRealAccounts,60000); // 거래소 실계정 패널 폴링
 </script></div></body></html>`;
