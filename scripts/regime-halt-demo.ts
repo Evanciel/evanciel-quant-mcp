@@ -36,12 +36,18 @@ function buyHold(data: Bar[]): { ret: number; mdd: number } {
 }
 
 console.log(`══ 레짐 정지(리스크 통제) vs 그냥 보유 — ${TF}, ${BARS}봉 ══`);
-console.log(`종목      | 레짐정지 수익 / MDD / 보유비율 | 그냥보유 수익 / MDD`);
+console.log(`[전체기간] 종목 | 레짐정지 승률·수익·MDD·노출 | 보유 수익·MDD`);
+const oosRows: string[] = [];
 for (const s of SYMBOLS) {
   let data: Bar[]; try { data = await fetchKlines(s, TF, BARS); } catch { continue; }
   if (data.length < 200) continue;
+  const split = Math.floor(data.length * 0.7);
   const h = regimeHaltLong(data), b = buyHold(data);
+  const ho = regimeHaltLong(data.slice(split)), bo = buyHold(data.slice(split)); // OOS=최근 30%
   const ddCut = b.mdd > 0 ? Math.round((1 - h.mdd / b.mdd) * 100) : 0;
-  console.log(`${s.padEnd(9)} | 승률 ${h.winRate.toFixed(0)}%(${h.trades}회) · ${h.ret.toFixed(0).padStart(5)}% / MDD ${h.mdd.toFixed(0)}% / 노출 ${h.daysIn}% | 보유 ${b.ret.toFixed(0).padStart(5)}% / MDD ${b.mdd.toFixed(0)}% → 낙폭 ${ddCut > 0 ? ddCut + "%↓" : "감소못함"}`);
+  console.log(`${s.padEnd(9)} | 승률 ${h.winRate.toFixed(0)}% · ${h.ret.toFixed(0).padStart(5)}% / MDD ${h.mdd.toFixed(0)}% / 노출 ${h.daysIn}% | 보유 ${b.ret.toFixed(0).padStart(5)}% / MDD ${b.mdd.toFixed(0)}% → 낙폭 ${ddCut > 0 ? ddCut + "%↓" : "—"}`);
+  oosRows.push(`${s.padEnd(9)} | 레짐정지 ${ho.ret.toFixed(0).padStart(5)}%(승률${ho.winRate.toFixed(0)}%, 노출${ho.daysIn}%) | 보유 ${bo.ret.toFixed(0).padStart(5)}%`);
 }
+console.log(`\n[OOS = 최근 30%(현 하락장 비중↑) — 진짜 봐야 할 구간]`);
+for (const r of oosRows) console.log(r);
 console.log(`\n정직: 레짐정지는 보통 "수익은 보유와 비슷하거나 덜, 대신 MDD(낙폭)가 크게 작다"가 핵심 — 하락장에 빠져나와 손실을 던다(리스크 통제). 알파(초과수익)는 기대 안 함. 과거≠미래.`);
