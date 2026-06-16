@@ -516,11 +516,38 @@ async function candlesFor(botId: string, tf?: string, inds?: string[]): Promise<
   }
 }
 
+// 한글 종목명 → 키움 6자리 코드(주요 대형주). 검색창에 "삼성전자"라고 치면(드롭다운이 코인이어도) 자동으로 키움 주식 차트로
+// 라우팅. 미수록 종목은 코드 직접입력 안내(정직). 전체 종목명 검색이 필요하면 키움 종목마스터 연동이 후속 과제.
+const KR_STOCKS: Record<string, [string, string]> = {
+  "삼성전자": ["005930", "삼성전자"], "samsung": ["005930", "삼성전자"], "sk하이닉스": ["000660", "SK하이닉스"], "하이닉스": ["000660", "SK하이닉스"],
+  "naver": ["035420", "NAVER"], "네이버": ["035420", "NAVER"], "카카오": ["035720", "카카오"], "카카오뱅크": ["323410", "카카오뱅크"], "카카오페이": ["377300", "카카오페이"],
+  "현대차": ["005380", "현대차"], "현대자동차": ["005380", "현대차"], "기아": ["000270", "기아"], "현대모비스": ["012330", "현대모비스"],
+  "삼성바이오로직스": ["207940", "삼성바이오로직스"], "셀트리온": ["068270", "셀트리온"], "lg에너지솔루션": ["373220", "LG에너지솔루션"], "엘지에너지솔루션": ["373220", "LG에너지솔루션"],
+  "posco홀딩스": ["005490", "POSCO홀딩스"], "포스코홀딩스": ["005490", "POSCO홀딩스"], "포스코": ["005490", "POSCO홀딩스"],
+  "kb금융": ["105560", "KB금융"], "신한지주": ["055550", "신한지주"], "하나금융지주": ["086790", "하나금융지주"], "기업은행": ["024110", "기업은행"],
+  "삼성sdi": ["006400", "삼성SDI"], "lg화학": ["051910", "LG화학"], "삼성물산": ["028260", "삼성물산"], "lg전자": ["066570", "LG전자"], "삼성전기": ["009150", "삼성전기"],
+  "sk이노베이션": ["096770", "SK이노베이션"], "삼성생명": ["032830", "삼성생명"], "삼성화재": ["000810", "삼성화재"], "sk텔레콤": ["017670", "SK텔레콤"], "skt": ["017670", "SK텔레콤"],
+  "kt": ["030200", "KT"], "한국전력": ["015760", "한국전력"], "한전": ["015760", "한국전력"], "엔씨소프트": ["036570", "엔씨소프트"], "넷마블": ["251270", "넷마블"],
+  "하이브": ["352820", "하이브"], "hybe": ["352820", "하이브"], "크래프톤": ["259960", "크래프톤"], "kt&g": ["033780", "KT&G"], "삼성에스디에스": ["018260", "삼성SDS"], "삼성sds": ["018260", "삼성SDS"],
+  "대한항공": ["003490", "대한항공"], "hmm": ["011200", "HMM"], "lg": ["003550", "LG"],
+};
+/** 입력이 한글 종목명이면 [코드, 표시명] 반환(공백제거+소문자 정규화). 코인 티커/숫자코드/미수록 한글은 null. */
+function resolveKrStock(input: string): [string, string] | null {
+  const norm = (input || "").trim().replace(/\s+/g, "").toLowerCase();
+  if (!norm) return null;
+  return KR_STOCKS[norm] ?? KR_STOCKS[(input || "").trim()] ?? null;
+}
+
 /** 임의 broker+symbol 차트(검색·워치리스트용). 봇/전략 무관 → 전략 오버레이·진입선·마커 없음, 차트 토글 지표만. 읽기전용.
  *  클라가 openChart("sym:BROKER:SYMBOL")로 호출 → /api/candles 핸들러가 이 함수로 분기(차트 기계 전체 재사용). */
-async function candlesForSymbol(broker: string, symbol: string, tf?: string, inds?: string[]): Promise<{ ok: boolean; symbol?: string; broker?: string; ccy?: string; interval?: string; intraday?: boolean; bars?: { time: number; open: number; high: number; low: number; close: number }[]; overlays?: unknown[]; oscGroups?: unknown[]; priceLines?: unknown[]; markers?: unknown[]; error?: string }> {
-  const bk = broker === "kiwoom" || broker === "kis" ? broker : "binance";
-  const sym = bk === "binance" ? symbol.toUpperCase() : symbol.trim();
+async function candlesForSymbol(broker: string, symbol: string, tf?: string, inds?: string[]): Promise<{ ok: boolean; symbol?: string; name?: string; broker?: string; ccy?: string; interval?: string; intraday?: boolean; bars?: { time: number; open: number; high: number; low: number; close: number }[]; overlays?: unknown[]; oscGroups?: unknown[]; priceLines?: unknown[]; markers?: unknown[]; error?: string }> {
+  // 한글 종목명 자동 해석: "삼성전자" → 키움 005930(드롭다운이 코인이어도 주식으로 라우팅). 미수록 한글은 코드 안내.
+  const kr = resolveKrStock(symbol);
+  let bkIn = broker, symIn = symbol; let krName: string | undefined;
+  if (kr) { bkIn = "kiwoom"; symIn = kr[0]; krName = kr[1]; }
+  else if (/[가-힣]/.test(symbol)) return { ok: false, error: `'${symbol.trim()}' 종목코드를 못 찾았어요 — 위 드롭다운에서 '키움(주식)' 선택 후 6자리 코드(예: 삼성전자=005930) 입력` };
+  const bk = bkIn === "kiwoom" || bkIn === "kis" ? bkIn : "binance";
+  const sym = bk === "binance" ? symIn.toUpperCase() : symIn.trim();
   if (!sym) return { ok: false, error: "종목을 입력하세요" };
   const toUnix = (s: string) => Math.floor(Date.parse(s.length === 10 ? s + "T00:00:00Z" : s) / 1000);
   try {
@@ -542,9 +569,11 @@ async function candlesForSymbol(broker: string, symbol: string, tf?: string, ind
     if (!bars.length) return { ok: false, error: "차트 데이터 없음 — 종목코드를 확인하세요" };
     const ccy = bk === "binance" ? "USD" : "KRW";
     const ind = buildIndicators(bars, parseToggleInds(inds)); // 전략 없음 → 사용자가 켠 토글 지표만
-    return { ok: true, symbol: sym, broker: bk, ccy, interval: iv, intraday, bars, overlays: ind.overlays, oscGroups: ind.oscGroups, priceLines: [], markers: [] };
+    return { ok: true, symbol: sym, name: krName, broker: bk, ccy, interval: iv, intraday, bars, overlays: ind.overlays, oscGroups: ind.oscGroups, priceLines: [], markers: [] };
   } catch (e) {
-    return { ok: false, error: e instanceof Error ? e.message : "candles 실패" };
+    const m = e instanceof Error ? e.message : "candles 실패";
+    if (bk === "binance" && /\b400\b/.test(m)) return { ok: false, error: `'${sym}'를 Binance에서 못 찾았어요 — 코인 티커(예: BTCUSDT)인지 확인하세요. 한국 주식이면 위 드롭다운에서 '키움(주식)' 선택.` };
+    return { ok: false, error: m };
   }
 }
 
@@ -1458,7 +1487,7 @@ function openChart(id,tf){
   renderTfButtons(d.interval);renderIndButtons();renderDrawButtons();
   var oscGroups=d.oscGroups||[];
   var names=[].concat((d.overlays||[]).map(function(o){return o.label}),oscGroups.reduce(function(a,g){return a.concat((g.series||[]).map(function(s){return s.label}))},[]));
-  document.getElementById('chartTitle').textContent=(isC?coin(d.symbol):d.symbol)+' · '+(isC?'Binance':'키움증권')+' '+tfLabel(d.interval)+(names.length?'  ·  '+names.join(' '):'');
+  document.getElementById('chartTitle').textContent=(isC?coin(d.symbol):(d.name?d.name+' ('+d.symbol+')':d.symbol))+' · '+(isC?'Binance':'키움증권')+' '+tfLabel(d.interval)+(names.length?'  ·  '+names.join(' '):'');
   document.getElementById('chartNote').textContent=(isC?'데이터: Binance 공개 시세 · 실시간(WS)':'데이터: 키움증권 실제 차트(모의) · 실시간(20초 폴링)')+'  ·  시각 KST'+((d.priceLines||[]).length?'  ·  노랑=진입 빨강=손절 초록=익절':'')+((d.markers||[]).length?'  ·  ▲진입/매수 ▼청산':'')+(oscGroups.length?'  ·  보조지표 '+oscGroups.length+'개 패널 분리':'');
   renderChartTrade(d.broker,d.symbol,d.ccy); // 봇·검색 차트 모두 상단에 종목 매수/매도/관심 바 노출
   body.innerHTML='';if(_chart){try{_chart.remove()}catch(e){}_chart=null;}
