@@ -478,6 +478,23 @@ async function livePrices() {
   }
   return out;
 }
+// 캔들 원본(raw) 캐시 — 차트 열기/타임프레임 토글/20초 폴링이 매번 거래소 API를 때리지 않게. 짧은 TTL(현재 봉은 WS·폴링이
+// 갱신하므로 약간 stale 허용). 동시 동일요청은 in-flight 공유(폴링+사용자 조작이 겹칠 때 중복 페치 방지). 지표는 캐시 안 함(매번 재계산=빠름).
+type RawCandle = { date: string; datetime?: string; open: number; high: number; low: number; close: number; volume?: number };
+const _candleCache = new Map<string, { at: number; raw: RawCandle[] }>();
+const _candleInflight = new Map<string, Promise<RawCandle[]>>();
+const CANDLE_TTL_MS = 8000;
+async function cachedRawCandles(key: string, fetcher: () => Promise<RawCandle[]>): Promise<RawCandle[]> {
+  const c = _candleCache.get(key);
+  if (c && Date.now() - c.at < CANDLE_TTL_MS) return c.raw;
+  let inf = _candleInflight.get(key);
+  if (!inf) {
+    inf = fetcher().then((raw) => { if (raw.length) _candleCache.set(key, { at: Date.now(), raw }); return raw; }).finally(() => _candleInflight.delete(key));
+    _candleInflight.set(key, inf);
+  }
+  return inf;
+}
+
 async function candlesFor(botId: string, tf?: string, inds?: string[]): Promise<{ ok: boolean; symbol?: string; broker?: string; ccy?: string; interval?: string; intraday?: boolean; bars?: { time: number; open: number; high: number; low: number; close: number }[]; overlays?: unknown[]; oscGroups?: unknown[]; priceLines?: unknown[]; markers?: unknown[]; error?: string }> {
   const bot = store.getBot(botId);
   if (!bot) return { ok: false, error: "봇 없음" };
@@ -487,11 +504,11 @@ async function candlesFor(botId: string, tf?: string, inds?: string[]): Promise<
     const intraday = /m$/.test(iv) || /h$/.test(iv); // 분/시간봉이면 시각 표시
     let raw: { date: string; datetime?: string; open: number; high: number; low: number; close: number; volume?: number }[] = [];
     if (bot.broker === "binance") {
-      raw = await fetchKlines(bot.symbol, TF_BINANCE[iv] ?? "1d", iv === "1mo" ? 120 : 200);
+      raw = await cachedRawCandles(`binance:${bot.symbol}:${iv}`, () => fetchKlines(bot.symbol, TF_BINANCE[iv] ?? "1d", iv === "1mo" ? 120 : 200));
     } else {
       const ad = getAdapter(bot.broker as Parameters<typeof getAdapter>[0], "spot")?.adapter as { getCandles?: (s: string, i: string, n: number) => Promise<{ date: string; datetime?: string; open: number; high: number; low: number; close: number; volume?: number }[]> } | undefined;
       if (!ad?.getCandles) return { ok: false, error: `${bot.broker} 차트 데이터 미지원(키 필요할 수 있음)` };
-      raw = await ad.getCandles(bot.symbol, iv, 200);
+      raw = await cachedRawCandles(`${bot.broker}:${bot.symbol}:${iv}`, () => ad.getCandles!(bot.symbol, iv, 200));
     }
     const bars = raw
       .map((b) => ({ time: toUnix(b.datetime ?? b.date), open: b.open, high: b.high, low: b.low, close: b.close, volume: b.volume ?? 0 }))
@@ -555,11 +572,11 @@ async function candlesForSymbol(broker: string, symbol: string, tf?: string, ind
     const intraday = /m$/.test(iv) || /h$/.test(iv);
     let raw: { date: string; datetime?: string; open: number; high: number; low: number; close: number; volume?: number }[] = [];
     if (bk === "binance") {
-      raw = await fetchKlines(sym, TF_BINANCE[iv] ?? "1d", iv === "1mo" ? 120 : 200);
+      raw = await cachedRawCandles(`binance:${sym}:${iv}`, () => fetchKlines(sym, TF_BINANCE[iv] ?? "1d", iv === "1mo" ? 120 : 200));
     } else {
       const ad = getAdapter(bk as Parameters<typeof getAdapter>[0], "spot")?.adapter as { getCandles?: (s: string, i: string, n: number) => Promise<{ date: string; datetime?: string; open: number; high: number; low: number; close: number; volume?: number }[]> } | undefined;
       if (!ad?.getCandles) return { ok: false, error: `${bk} 차트 데이터 미지원(키 필요할 수 있음)` };
-      raw = await ad.getCandles(sym, iv, 200);
+      raw = await cachedRawCandles(`${bk}:${sym}:${iv}`, () => ad.getCandles!(sym, iv, 200));
     }
     const bars = raw
       .map((b) => ({ time: toUnix(b.datetime ?? b.date), open: b.open, high: b.high, low: b.low, close: b.close, volume: b.volume ?? 0 }))
