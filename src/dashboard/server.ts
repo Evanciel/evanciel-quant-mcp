@@ -13,11 +13,11 @@
  */
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { randomBytes, timingSafeEqual } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync, chmodSync, existsSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import * as store from "../store/db.js";
-import { BROKER_FIELDS, upsertCredentials, credentialStatus, credentialsPath, enableLive, disableLive, liveSettingsStatus, type BrokerKey } from "../setup/credentials.js";
+import { BROKER_FIELDS, upsertCredentials, credentialStatus, credentialsPath, enableLive, disableLive, liveSettingsStatus, dataDir, type BrokerKey } from "../setup/credentials.js";
 import { fetchKlines, fetchSpotSymbols } from "../data/binance-public.js";
 import { getAdapter } from "../brokers/index.js";
 import { placeOrder, placeProtective, cancelProtective, getProtective, getAccount, getOpenOrders, getOrderStatus, cancelOrderById, getQuote } from "../mcp-server/live-handlers.js"; // 수동주문·OCO보호주문·실계정조회·미체결조회/취소 — 안전경로 재사용
@@ -610,10 +610,25 @@ function vendorChartsJs(): Buffer | null {
   return _vendorJs;
 }
 
+/** 대시보드 토큰·세션을 데이터 디렉터리에 영속화 → 데몬 재시작에도 URL 고정 + 열린 탭 유지(부팅마다 토큰 churn 제거).
+ *  127.0.0.1 전용 로컬 대시보드라 영속 토큰이 합리적. chmod 600. 손상/부재 시 재생성. 로테이션=파일 삭제 후 재기동. */
+function loadOrCreateDashboardAuth(): { token: string; sessionId: string } {
+  const path = join(dataDir(), "dashboard-auth.json");
+  try {
+    if (existsSync(path)) {
+      const j = JSON.parse(readFileSync(path, "utf8")) as { token?: unknown; sessionId?: unknown };
+      if (typeof j.token === "string" && /^[0-9a-f]{32}$/.test(j.token) && typeof j.sessionId === "string" && /^[0-9a-f]{32}$/.test(j.sessionId)) return { token: j.token, sessionId: j.sessionId };
+    }
+  } catch { /* 손상 → 재생성 */ }
+  const auth = { token: randomBytes(16).toString("hex"), sessionId: randomBytes(16).toString("hex") };
+  try { writeFileSync(path, JSON.stringify(auth) + "\n", { encoding: "utf8" }); chmodSync(path, 0o600); } catch { /* 쓰기 실패 시 이번 세션 한정(비영속)으로라도 동작 */ }
+  return auth;
+}
+
 export function startDashboard(port = 7788): Promise<{ url: string; port: number }> {
   if (_state) return Promise.resolve({ url: _state.url, port: _state.port });
-  const token = randomBytes(16).toString("hex");
-  const sessionId = randomBytes(16).toString("hex"); // 쿠키 세션값 — 부트스트랩 토큰과 별개 값(토큰 유출≠세션, 세션 유출≠토큰)
+  // 토큰·세션 분리 유지(토큰 유출≠세션). 영속(부팅마다 고정 = URL 안 바뀜, 열린 탭 유지).
+  const { token, sessionId } = loadOrCreateDashboardAuth();
   let actualPort = port; // listen 후 실포트(port 0=에페메랄 지원). 요청은 listen 후에만 도착하므로 핸들러에서 참조 안전.
 
   const server = createServer((req: IncomingMessage, res: ServerResponse) => {
