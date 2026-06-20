@@ -26,6 +26,9 @@ npx quant-mcp setup
 **방법 C. 환경변수 직접 (고급/서버 운영)**
 `.env` 파일(gitignore + `chmod 600`) 또는 시크릿 매니저(1Password `op run`, Infisical, Doppler) 경유. MCP 클라이언트 설정의 `env`로도 가능하며, 이 값은 credentials.env보다 **우선**합니다(운영 오버라이드). 변수명은 아래 각 브로커 절 참고.
 
+**방법 D. 프로젝트 `.env.local` (로컬 dev)**
+프로젝트 루트의 `.env.local`(gitignore)에 `KEY=VALUE`로 넣으면 MCP 서버·데몬이 기동 시 자동 로드합니다(non-override — MCP env·credentials.env가 우선). 별칭 키도 인식(예: 토스 `TOSS_API_KEY`=`TOSS_CLIENT_ID`). 프로젝트 루트에서 실행할 때만 적용됩니다.
+
 > **✅ 검증 상태 (2026-06-08)**: 머니패스가 **Binance testnet에서 E2E 검증 완료** — 봇 진입 시 거래소에 **상주 손절/익절(STOP/TP) 주문 자동 배치**(봇이 죽어도 거래소가 손절 보호), 트레일링 갱신, 청산 시 자동 취소(고아주문 0), 모호한 실패 시 체결 reconcile(중복주문 방지), 실잔고 기반 사이징(잔고초과 예방), 가격/수량 거래소 필터 정규화. 검증 스크립트: `scripts/verify-testnet-{connection,order-e2e,bot-e2e}.ts`. 상주주문 점검/정리: `scripts/testnet-cleanup-orders.ts`.
 
 ---
