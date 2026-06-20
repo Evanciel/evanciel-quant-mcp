@@ -309,18 +309,25 @@ export class TossBrokerAdapter extends BaseBrokerAdapter {
       const sym = order.symbol.trim();
       const kr = isKrSymbol(sym);
       const isMarket = order.type === "market";
-      // 수량: KR·US LIMIT은 정수(스펙 quantity=^\d+$). US MARKET만 소수주 허용(소수주는 LIMIT 불가 — fractionalQuantityUsMarketOnly).
-      //   → US LIMIT에 소수 수량을 보내면 400 invalid-request로 silent 실패하던 버그 차단(적대검증 M2).
-      const fractionalOk = !kr && isMarket;
+      const amountBased = order.orderAmount != null && order.orderAmount > 0;
+      // 금액기반(orderAmount)은 US MARKET 전용(스펙 OrderCreateAmountBased). KR/지정가는 fail-closed.
+      if (amountBased && (kr || !isMarket)) {
+        throw new Error("Toss 금액기반 주문(orderAmount)은 US MARKET 전용 — KR/지정가 불가(fail-closed).");
+      }
       const body: Record<string, unknown> = {
         symbol: sym,
         side: order.side === "buy" ? "BUY" : "SELL",
         orderType: isMarket ? "MARKET" : "LIMIT",
-        quantity: String(fractionalOk ? order.quantity : Math.max(0, Math.floor(order.quantity))),
       };
-      if (!isMarket) {
+      if (amountBased) {
+        body.orderAmount = String(order.orderAmount); // 달러 금액(체결 수량은 거래소가 결정 — OrderCreateAmountBased)
+      } else {
+        // 수량: KR·US LIMIT은 정수(스펙 quantity=^\d+$). US MARKET만 소수주 허용(소수주는 LIMIT 불가 — fractionalQuantityUsMarketOnly).
+        //   → US LIMIT에 소수 수량을 보내면 400 invalid-request로 silent 실패하던 버그 차단(적대검증 M2).
+        const fractionalOk = !kr && isMarket;
+        body.quantity = String(fractionalOk ? order.quantity : Math.max(0, Math.floor(order.quantity)));
         // 지정가: KR은 KRX 호가단위 정렬 필수(미정렬 시 invalid-tick-size 거부), US는 그대로.
-        body.price = String(kr ? roundToKrxTick(order.price ?? 0) : (order.price ?? 0));
+        if (!isMarket) body.price = String(kr ? roundToKrxTick(order.price ?? 0) : (order.price ?? 0));
       }
       if (order.clientOrderId) body.clientOrderId = order.clientOrderId.slice(0, 36); // 멱등키(최대 36자)
 

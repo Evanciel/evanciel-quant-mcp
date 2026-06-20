@@ -1147,8 +1147,8 @@ async function tickLimitBracket(bot: store.BotRow, node: LimitBracketNode): Prom
   const nowIso = now.toISOString();
   const live = liveAdapterFor(bot);
   const paper = !live;
-  const sKey = sessionKey(broker, now);
-  const marketOpen = isMarketOpen(broker, now);
+  const sKey = sessionKey(broker, now, bot.symbol);          // 토스 US 심볼은 ET 세션 경계
+  const marketOpen = isMarketOpen(broker, now, bot.symbol);  // 토스 US 심볼은 US RTH(09:30~16:00 ET)
 
   let st = bot.position_state as LimitBracketState | null;
   let restingBuy: ReturnType<typeof findMyRestingOrder>["order"] = null;

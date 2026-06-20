@@ -8,3 +8,8 @@ credentials.env
 .git-commit-msg.txt
 
 scripts/_proposals.json
+
+# 로컬 툴링 상태(커밋 제외)
+.bkit/
+.claude/
+.playwright-mcp/

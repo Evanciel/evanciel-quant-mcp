@@ -40,6 +40,9 @@ export interface OrderRequest {
   // take_profit_market(익절 시장가). 보호주문은 stopPrice(트리거가) 필수 + reduceOnly 권장.
   type: "market" | "limit" | "stop_market" | "stop_limit" | "take_profit_market";
   quantity: number;
+  // 금액기반 시장가(달러). 토스 US MARKET 전용 — 설정 시 quantity 대신 금액으로 주문(체결 수량은 거래소 결정).
+  // 다른 어댑터는 무시. 수동주문 한정(봇 러너는 수량기반 사이징 유지).
+  orderAmount?: number;
   price?: number;
   stopPrice?: number;     // 보호주문 트리거 가격(stop_*/take_profit_*).
   reduceOnly?: boolean;   // 포지션 축소 전용(보호주문·숏커버). 선물에서 의미.

@@ -5,6 +5,17 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] — 2026-06-21 토스 US 완성도 (금액주문 + 세션 게이팅)
+
+토스 어댑터 US 후속 2건. Tests → 598.
+
+### Added
+- **US 금액기반 시장가 주문**(`orderAmount`, 토스 US MARKET 전용, **수동 한정**): `OrderRequest.orderAmount` + 어댑터 amount-based 본문 + `live-handlers.placeOrder` 금액경로(notional=orderAmount, USD, 2단계 토큰 해시 바인딩, 하드블록 경유) + `place_order` MCP 스키마 + `/api/order`(수량 또는 금액 택일). 봇 러너는 수량기반 사이징 유지.
+- **US 세션 게이팅**: `isMarketOpen`/`sessionKey` 심볼 인식 — 토스 US 심볼=US 정규장(09:30~16:00 ET, EDT/EST DST 반영). KR(kis/키움/토스 KR)·binance 동작 보존.
+
+### Notes
+- 금액주문은 KR/지정가 fail-closed(스펙상 US MARKET 전용). 대시보드 금액 입력 UI는 후속(미검증 템플릿 JS).
+
 ## [Unreleased] — 2026-06-20 토스증권(Toss) 브로커 추가
 
 quant-mcp 4번째 브로커. PDCA(plan→design→do→check 100%→report) + 다단계 적대검증(울트라코드). 라이브 읽기 E2E 8/8. Tests → 585.
