@@ -11,7 +11,7 @@ import { readFileSync, writeFileSync, existsSync, chmodSync, mkdirSync } from "n
 import { join } from "node:path";
 import { homedir } from "node:os";
 
-export type BrokerKey = "binance" | "kis" | "kiwoom";
+export type BrokerKey = "binance" | "kis" | "kiwoom" | "toss";
 
 /** 브로커별 자격증명 환경변수 필드(폼/마법사가 물어볼 항목). secret=마스킹 대상. */
 export const BROKER_FIELDS: Record<BrokerKey, { key: string; label: string; secret: boolean; optional?: boolean }[]> = {
@@ -32,6 +32,12 @@ export const BROKER_FIELDS: Record<BrokerKey, { key: string; label: string; secr
     { key: "KIWOOM_ENV", label: "환경(mock/live)", secret: false },
     { key: "KIWOOM_APPKEY", label: "App Key", secret: true },
     { key: "KIWOOM_SECRETKEY", label: "Secret Key", secret: true },
+  ],
+  toss: [
+    { key: "TOSS_ENV", label: "환경(live — 토스는 모의 없음)", secret: false },
+    { key: "TOSS_CLIENT_ID", label: "Client ID", secret: true },
+    { key: "TOSS_CLIENT_SECRET", label: "Client Secret", secret: true },
+    { key: "TOSS_ACCOUNT_SEQ", label: "계좌 식별번호(accountSeq, /accounts 조회)", secret: false },
   ],
 };
 

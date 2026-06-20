@@ -145,7 +145,7 @@ export const createBotShape = {
   symbol: z.string().trim().max(40).regex(/^[A-Za-z0-9._/-]*$/, "심볼은 영숫자·._/- 만 허용").optional(),
   capital: z.number().default(1_000_000).describe("운용 자본(페이퍼)"),
   mode: z.enum(["paper", "live"]).default("paper").describe("paper(기본) 또는 live. live는 브로커 키 + 마스터스위치 게이트 통과 시에만 실주문, 미통과 시 페이퍼 폴백(봇은 생성 시 사전승인 — 주문별 토큰 없음)"),
-  broker: z.enum(["binance", "kis", "kiwoom"]).default("binance").describe("브로커(enum 고정 — 임의 문자열 거부)"),
+  broker: z.enum(["binance", "kis", "kiwoom", "toss"]).default("binance").describe("브로커(enum 고정 — 임의 문자열 거부)"),
   intervalSeconds: z.number().int().default(60).describe("평가 주기(최소 15초)"),
 };
 export const listEventsShape = {
@@ -173,7 +173,7 @@ export const listBotsShape = {};
 export const openDashboardShape = { port: z.number().int().default(7788).describe("대시보드 로컬 포트(127.0.0.1)") };
 
 // ── v2.5: 라이브 거래(BYOK, 안전게이트) ──
-const brokerEnum = z.enum(["binance", "kis", "kiwoom"]).default("binance");
+const brokerEnum = z.enum(["binance", "kis", "kiwoom", "toss"]).default("binance");
 const marketEnum = z.enum(["spot", "futures"]).default("spot");
 export const liveStatusShape = {};
 export const brokerReadShape = { broker: brokerEnum, market: marketEnum };

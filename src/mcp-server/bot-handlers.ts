@@ -92,7 +92,7 @@ export function startBot(a: { botId: string }) {
     }
     // 지정가 진입 KR 거절(audit P1-5 Q3): KIS/키움은 getOrderByClientId 부재로 미체결 확인/타임아웃 불가 → 라이브 안전추적 불가.
     //   fail-closed 거절(무음 시장가 강등 금지). 지정가 진입은 binance 한정.
-    if (comp && (comp.entry_execution as { type?: string } | null)?.type === "limit" && (b.broker === "kis" || b.broker === "kiwoom")) {
+    if (comp && (comp.entry_execution as { type?: string } | null)?.type === "limit" && (b.broker === "kis" || b.broker === "kiwoom" || b.broker === "toss")) {
       return { ok: false, error: `KR 브로커(${b.broker})는 지정가 진입(entry_execution.type=limit) 라이브 미지원 — 미체결 체결확인 미배선(audit P1-5). 시장가(type=market)로 바꾸거나 Binance 봇으로 운용하세요.` };
     }
   }

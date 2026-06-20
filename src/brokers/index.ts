@@ -5,6 +5,7 @@
 import { BinanceBrokerAdapter } from "./binance.js";
 import { KisBrokerAdapter } from "./kis.js";
 import { KiwoomBrokerAdapter } from "./kiwoom.js";
+import { TossBrokerAdapter } from "./toss.js";
 import { loadCredentials, type Broker, type Env } from "./safety.js";
 import type { BrokerAdapter } from "./types.js";
 
@@ -15,6 +16,7 @@ export function getAdapter(broker: Broker, market: "spot" | "futures" = "spot"):
   if (broker === "binance") return { adapter: new BinanceBrokerAdapter(c), env };
   if (broker === "kis") return { adapter: new KisBrokerAdapter(c), env };
   if (broker === "kiwoom") return { adapter: new KiwoomBrokerAdapter(c), env };
+  if (broker === "toss") return { adapter: new TossBrokerAdapter(c), env };
   return null;
 }
 
@@ -22,7 +24,7 @@ export function getAdapter(broker: Broker, market: "spot" | "futures" = "spot"):
 export function configuredBrokers(): { broker: Broker; market?: string; env: Env; live: boolean }[] {
   const out: { broker: Broker; market?: string; env: Env; live: boolean }[] = [];
   const masterOn = (process.env.LIVE_TRADING_ENABLED || "").trim() === "true";
-  for (const [broker, market] of [["binance", "spot"], ["binance", "futures"], ["kis", undefined], ["kiwoom", undefined]] as [Broker, ("spot" | "futures") | undefined][]) {
+  for (const [broker, market] of [["binance", "spot"], ["binance", "futures"], ["kis", undefined], ["kiwoom", undefined], ["toss", undefined]] as [Broker, ("spot" | "futures") | undefined][]) {
     const c = loadCredentials(broker, market ?? "spot");
     if (c) out.push({ broker, market, env: c.env, live: c.env === "live" && masterOn });
   }

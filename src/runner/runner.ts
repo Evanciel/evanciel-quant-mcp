@@ -24,7 +24,7 @@ import { computeOrderQty } from "../core/risk/order-sizing.js"; // 스캐너 진
 //   getOrderByClientId 지원=주문 시점 즉시 filled 확인)는 reconcile 불필요 → 술어 미충족으로 미진입(회귀 0).
 import * as store from "../store/db.js";
 import { getAdapter } from "../brokers/index.js";
-import { liveGate, checkLimits, audit, loadPortfolioGateConfig, portfolioGate, type Broker } from "../brokers/safety.js";
+import { liveGate, checkLimits, quoteCurrencyFor, audit, loadPortfolioGateConfig, portfolioGate, type Broker } from "../brokers/safety.js";
 import { floorQty, quantizeQty } from "../core/position/qty.js";
 import type { PortfolioPosition } from "../core/risk/portfolio.js";
 
@@ -95,18 +95,18 @@ async function fillOrder(bot: store.BotRow, side: "buy" | "sell", qty: number, p
     store.insertLog(bot.id, "error", `라이브 포지션 관리 불가(${note}) → 동결(기록 없음, 다음 틱 재시도)`);
     return { live: false, price, note, failed: true };
   };
-  const broker = (["binance", "kis", "kiwoom"].includes(bot.broker) ? bot.broker : "binance") as Broker;
+  const broker = (["binance", "kis", "kiwoom", "toss"].includes(bot.broker) ? bot.broker : "binance") as Broker;
   const market = "spot" as "spot" | "futures"; // quant-mcp 러너는 현물만(선물 라이브는 stock-autotrade). 향후 선물 지원 시 심볼/설정 기반 분기.
   // 지정가 진입(audit P1-5): binance 한정. KR(kis/키움)은 getOrderByClientId 부재로 미체결 확인/타임아웃 불가 → fail-closed 거절(무음 시장가 강등 금지).
   const isLimit = opts?.entry?.type === "limit";
   // KR 지정가: 기본은 fail-closed 거절(P1-5 신호진입은 getOrderByClientId 부재로 타임아웃 확인 불가). 단 limit_bracket 봇은
   // 폴백 없는 순수 resting + getOpenOrders(ka10075) 기반 추적이라 KR 지정가가 목적 → opts.allowKrLimit로 허용.
   // (적대검증 safety#4: 신헬퍼 신설 대신 이 게이트 1개만 우회 → 9겹 안전망·P0-5 미확인동결 그대로. KR은 isLimit 분기에서 pending=resting 반환, 절대 bought 아님.)
-  if (isLimit && !opts?.allowKrLimit && (broker === "kis" || broker === "kiwoom")) { store.insertLog(bot.id, "gate", `KR 지정가 진입 미지원(${broker}, audit P1-5)`); return blocked("KR 지정가 미지원"); }
+  if (isLimit && !opts?.allowKrLimit && (broker === "kis" || broker === "kiwoom" || broker === "toss")) { store.insertLog(bot.id, "gate", `KR 지정가 진입 미지원(${broker}, audit P1-5)`); return blocked("KR 지정가 미지원"); }
   const gate = liveGate(broker, market);
   if (!gate.allowed) { store.insertLog(bot.id, "gate", `라이브 차단(${gate.reason})`); return blocked("게이트 차단"); }
   // 통화 인식: Binance=USDT, 한투/키움=KRW → 통화별 안전 기본 캡(KRW 봇에 달러캡 적용 버그 방지).
-  const quoteCurrency = broker === "binance" ? "USDT" : "KRW";
+  const quoteCurrency = quoteCurrencyFor(broker, symbol);
   const got = getAdapter(broker, market);
   if (!got) { store.insertLog(bot.id, "gate", "어댑터 없음"); return blocked("어댑터없음"); }
   // 거래소 LOT_SIZE(stepSize)로 수량 정규화 — 안 하면 -1013(LOT_SIZE) 거부. minQty/minNotional 보정 포함.
@@ -115,7 +115,9 @@ async function fillOrder(bot: store.BotRow, side: "buy" | "sell", qty: number, p
   if (side === "buy" && got.adapter.getBalance) {
     try {
       const bal = await got.adapter.getBalance();
-      const affordable = sizeFromBalance(bal.cashBalance, price, 99); // 수수료 여유 1%
+      // 통화 일치 시에만 실잔고 클램프. 토스 US 주문은 계좌현금=KRW인데 주문가=USD → 단위 불일치 클램프 금지(KRW÷USD=무의미).
+      //   불일치 시 하드캡(checkLimits, 통화 인식)이 노셔널을 통제. (적대검증: 교차통화 affordability 버그.)
+      const affordable = bal.currency === quoteCurrency ? sizeFromBalance(bal.cashBalance, price, 99) : 0; // 수수료 여유 1%
       if (affordable > 0 && affordable < nq) {
         nq = got.adapter.normalizeQuantity ? await got.adapter.normalizeQuantity(symbol, affordable, price) : affordable;
         store.insertLog(bot.id, "gate", `실잔고 제한: 주문 ${qty}→${nq}(가용현금 ${bal.cashBalance})`);
@@ -221,7 +223,7 @@ type LiveAdapter = NonNullable<ReturnType<typeof getAdapter>>["adapter"];
 /** 라이브 봇의 어댑터 해석(mode=live + 게이트 통과 + 어댑터 존재 시). 아니면 null(페이퍼=엔진이 스톱 시뮬레이트). */
 function liveAdapterFor(bot: store.BotRow): { adapter: LiveAdapter; env: string } | null {
   if (bot.mode !== "live") return null;
-  const broker = (["binance", "kis", "kiwoom"].includes(bot.broker) ? bot.broker : "binance") as Broker;
+  const broker = (["binance", "kis", "kiwoom", "toss"].includes(bot.broker) ? bot.broker : "binance") as Broker;
   const market = "spot" as "spot" | "futures"; // 현물(페이퍼봇과 일치). 선물 보호주문은 후속.
   const gate = liveGate(broker, market);
   if (!gate.allowed) return null; // 게이트가 메인넷(LIVE_TRADING_ENABLED) 등 통제. testnet/mock만 통과.
@@ -246,7 +248,7 @@ async function syncBotProtective(bot: store.BotRow, posLive: boolean, symbol: st
   // KR 브로커(KIS/키움)는 거래소 상주 SL/TP 미지원(audit P0-3). 어댑터가 protective 타입을 명시 거절하므로
   // 시도 자체를 스킵 — 시도하면 매 틱 실패 집계 → PROTECTIVE_MAX_FAILS 비상청산 오발동. 경고는 봇당 1회(스팸 금지).
   // KR 포지션의 SL/TP는 봇 폴링 평가(소프트스톱)가 수행한다(봇 다운 시 손절 공백 — 문서·로그로 정직 고지).
-  if (bot.broker === "kis" || bot.broker === "kiwoom") {
+  if (bot.broker === "kis" || bot.broker === "kiwoom" || bot.broker === "toss") {
     if (posQty > 1e-9 && !krProtectiveWarned.has(bot.id)) {
       krProtectiveWarned.add(bot.id);
       store.insertLog(bot.id, "gate", `KR 브로커(${bot.broker})는 거래소 상주 보호주문(SL/TP) 미지원 — 봇 폴링 평가로만 손절/익절 동작. 봇/프로세스 다운 시 손절 공백(audit P0-3).`);
@@ -454,7 +456,7 @@ async function bootSeedLivePosition(bot: store.BotRow, cur: PaperPosition | null
   if (cur && cur.status === "open") return cur; // 장부 존재 → 주기 reconcile 책임(여긴 null 갭 전용)
   const ledger = store.liveOpenLedger(bot.id);
   if (!(ledger.qty > 1e-9)) return cur; // 라이브 체결 근거 0 → 거래소 보유는 수동 보유로 간주(채택 금지)
-  const broker = (["binance", "kis", "kiwoom"].includes(bot.broker) ? bot.broker : "binance") as Broker;
+  const broker = (["binance", "kis", "kiwoom", "toss"].includes(bot.broker) ? bot.broker : "binance") as Broker;
   const got = getAdapter(broker, "spot"); // liveGate 비경유 — 게이트 OFF여도 read-only 조회는 수행(P0-1 핵심)
   const adapter = got?.adapter as { getPositions?: () => Promise<ExchangePos[]> } | undefined;
   if (!got || typeof adapter?.getPositions !== "function") {
@@ -726,11 +728,11 @@ export async function tickBot(botId: string): Promise<{ action: "buy" | "sell" |
   const interval = secsToInterval(bot.interval_seconds); // 폴링 주기 → kline 타임프레임(인트라데이 자동). 시간대 조건 해금.
   // 데이터 소스 broker-aware: 크립토=Binance public klines, KR(키움/한투)=브로커 어댑터 getCandles(일봉).
   //   KR 종목코드는 Binance에 없으므로 어댑터에서 OHLCV를 가져와야 지표 평가 가능(없으면 빈 배열→데이터부족 hold).
-  const dataBroker = (["binance", "kis", "kiwoom"].includes(bot.broker) ? bot.broker : "binance") as Broker;
+  const dataBroker = (["binance", "kis", "kiwoom", "toss"].includes(bot.broker) ? bot.broker : "binance") as Broker;
   let fetched: Bar[];
   if (dataBroker === "binance") {
     fetched = await fetchKlines(bot.symbol, interval, 300);
-  } else if (dataBroker === "kiwoom") {
+  } else if (dataBroker === "kiwoom" || dataBroker === "toss") {
     const da = getAdapter(dataBroker, "spot")?.adapter as { getCandles?: (s: string, i: string, c: number) => Promise<Bar[]> } | undefined;
     fetched = da?.getCandles ? await da.getCandles(bot.symbol, interval, 300) : [];
   } else {
@@ -1140,7 +1142,7 @@ export async function cancelLimitBracketRestingOrders(bot: store.BotRow): Promis
 }
 
 async function tickLimitBracket(bot: store.BotRow, node: LimitBracketNode): Promise<{ action: "buy" | "sell" | "hold"; detail: string }> {
-  const broker = (["binance", "kis", "kiwoom"].includes(bot.broker) ? bot.broker : "binance") as Broker;
+  const broker = (["binance", "kis", "kiwoom", "toss"].includes(bot.broker) ? bot.broker : "binance") as Broker;
   const now = new Date();
   const nowIso = now.toISOString();
   const live = liveAdapterFor(bot);

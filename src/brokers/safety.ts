@@ -8,13 +8,26 @@ import { appendFileSync } from "node:fs";
 import { join } from "node:path";
 import { dataDir, db } from "../store/db.js";
 import type { BrokerCredentials } from "./types.js";
+import { isKrSymbol } from "./krx-tick.js";
 import { evaluatePortfolioRisk, type PortfolioPosition, type CircuitState } from "../core/risk/portfolio.js";
 
-export type Broker = "binance" | "kis" | "kiwoom";
+export type Broker = "binance" | "kis" | "kiwoom" | "toss";
 export type Env = "testnet" | "mock" | "live";
 
 const trim = (v?: string) => (v ?? "").trim();
 export const mask = (s?: string) => { const t = trim(s); return t ? `${t.slice(0, 2)}…${t.slice(-4)}` : "(none)"; };
+
+/**
+ * 주문 통화 판정(단일 진실원). Binance=USDT. 토스=심볼별(KR 6자리→KRW / US 티커→USD). KIS·키움=KRW.
+ * checkLimits 통화별 캡·일일손실 서킷에 사용. 기존 binance→USDT / kis·kiwoom→KRW는 바이트 동일(회귀 0).
+ * isKrSymbol(krx-tick.ts)을 재사용 — 6자리 규약이 어댑터·서킷·대시보드에서 단일 정의(불일치로 인한 오통화 방지).
+ */
+export function quoteCurrencyFor(broker: Broker, symbol?: string): string {
+  if (broker === "binance") return "USDT";
+  // 토스: US 티커→USD, KR 6자리·무심볼→KRW(KR 기축, 대시보드 ccyOf와 동일 규약). 실제 호출은 항상 심볼 동반.
+  if (broker === "toss") { const s = (symbol ?? "").trim(); return s && !isKrSymbol(s) ? "USD" : "KRW"; }
+  return "KRW"; // kis, kiwoom
+}
 
 /** 브로커별 자격증명을 env에서 읽음(절대 로그 금지). 키 없으면 null. env 기본=안전(testnet/mock). */
 export function loadCredentials(broker: Broker, market: "spot" | "futures" = "spot"): (BrokerCredentials & { env: Env; market?: string }) | null {
@@ -40,6 +53,18 @@ export function loadCredentials(broker: Broker, market: "spot" | "futures" = "sp
     const appkey = trim(process.env.KIWOOM_APPKEY), secretkey = trim(process.env.KIWOOM_SECRETKEY);
     if (!appkey || !secretkey) return null;
     return { env, appkey, secretkey };
+  }
+  if (broker === "toss") {
+    // ⚠️ 토스는 **모의 호스트가 없다**(단일 라이브 호스트) → env 기본 "live". master OFF면 liveGate가 페이퍼로 폴백하고,
+    //   주문 쓰기는 어댑터 하드블록(env=live + master)이 추가 방어한다(kis/키움의 "mock" 기본과 다른 이유).
+    const env = (trim(process.env.TOSS_ENV) || "live") as Env;
+    // 표준명 TOSS_CLIENT_ID/SECRET + 흔한 변형(TOSS_API_KEY/TOSS_SECRET_KEY) 둘 다 허용(KIS 패턴, 설정 마찰 완화).
+    const clientId = trim(process.env.TOSS_CLIENT_ID) || trim(process.env.TOSS_API_KEY);
+    const clientSecret = trim(process.env.TOSS_CLIENT_SECRET) || trim(process.env.TOSS_SECRET_KEY);
+    // accountSeq는 계좌·자산·주문에만 필요(시세·캔들은 토큰만으로 가능) → 선택. 미설정 시 account 호출만 어댑터가 명시 throw.
+    const accountSeq = trim(process.env.TOSS_ACCOUNT_SEQ) || trim(process.env.TOSS_ACCOUNT);
+    if (!clientId || !clientSecret) return null;
+    return { env, clientId, clientSecret, accountSeq };
   }
   return null;
 }
@@ -268,9 +293,12 @@ export function dailyRealizedLoss(quoteCurrency?: string): number {
     const ccy = quoteCurrency ? quoteCurrency.toUpperCase() : null;
     let r: { s: number } | undefined;
     if (ccy === "USDT" || ccy === "USD") {
-      r = db().prepare(`SELECT COALESCE(SUM(t.pnl),0) s FROM trades t JOIN bots b ON b.id=t.bot_id WHERE t.is_paper=0 AND t.ts >= ? AND b.broker='binance'`).get(since) as { s: number } | undefined;
+      // 토스 US(USD) 손익도 이 서킷에. ⚠️ 토스는 KR+US가 같은 broker='toss'라 KR/US를 SQL로 분리하지 않고 양 통화 버킷에
+      //   모두 합산(coarse IN) — 과집계는 서킷을 '더 일찍' 발화시키는 fail-safe. GLOB로 심볼 분리하면 /^\d{6}$/와 미세 불일치 시
+      //   silent fail-open 위험이라 의도적으로 coarse 채택(설계 강화①).
+      r = db().prepare(`SELECT COALESCE(SUM(t.pnl),0) s FROM trades t JOIN bots b ON b.id=t.bot_id WHERE t.is_paper=0 AND t.ts >= ? AND b.broker IN ('binance','toss')`).get(since) as { s: number } | undefined;
     } else if (ccy === "KRW") {
-      r = db().prepare(`SELECT COALESCE(SUM(t.pnl),0) s FROM trades t JOIN bots b ON b.id=t.bot_id WHERE t.is_paper=0 AND t.ts >= ? AND b.broker IN ('kis','kiwoom')`).get(since) as { s: number } | undefined;
+      r = db().prepare(`SELECT COALESCE(SUM(t.pnl),0) s FROM trades t JOIN bots b ON b.id=t.bot_id WHERE t.is_paper=0 AND t.ts >= ? AND b.broker IN ('kis','kiwoom','toss')`).get(since) as { s: number } | undefined;
     } else {
       r = db().prepare(`SELECT COALESCE(SUM(pnl),0) s FROM trades WHERE is_paper=0 AND ts >= ?`).get(since) as { s: number } | undefined;
     }
