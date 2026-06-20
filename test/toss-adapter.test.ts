@@ -148,6 +148,24 @@ describe("placeOrder — 본문 매핑(마스터 ON)", () => {
   });
 });
 
+describe("placeOrder — 금액기반(orderAmount, US MARKET 전용)", () => {
+  beforeEach(() => { process.env.LIVE_TRADING_ENABLED = "true"; });
+  it("US MARKET + orderAmount → amount-based 본문(quantity 없음)", async () => {
+    const cap = mockFetch([["/api/v1/orders", () => res(200, { result: { orderId: "o" } })]]);
+    await new TossBrokerAdapter(LIVE).placeOrder({ symbol: "AAPL", side: "buy", type: "market", quantity: 0, orderAmount: 100.5 });
+    expect(cap.lastBody).toMatchObject({ symbol: "AAPL", side: "BUY", orderType: "MARKET", orderAmount: "100.5" });
+    expect(cap.lastBody!.quantity).toBeUndefined();
+  });
+  it("KR + orderAmount → fail-closed throw", async () => {
+    mockFetch([["/api/v1/orders", () => res(200, { result: { orderId: "o" } })]]);
+    await expect(new TossBrokerAdapter(LIVE).placeOrder({ symbol: "005930", side: "buy", type: "market", quantity: 0, orderAmount: 100 })).rejects.toThrow(/US MARKET|금액/);
+  });
+  it("US LIMIT + orderAmount → fail-closed throw(금액은 MARKET만)", async () => {
+    mockFetch([["/api/v1/orders", () => res(200, { result: { orderId: "o" } })]]);
+    await expect(new TossBrokerAdapter(LIVE).placeOrder({ symbol: "AAPL", side: "buy", type: "limit", quantity: 0, price: 100, orderAmount: 100 })).rejects.toThrow(/US MARKET|금액/);
+  });
+});
+
 describe("cancelOrder — env=live 요구, 4xx=false", () => {
   it("env=mock → throw", async () => {
     mockFetch([["/cancel", () => res(200, { result: { orderId: "n" } })]]);

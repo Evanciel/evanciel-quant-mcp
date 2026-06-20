@@ -899,17 +899,18 @@ export function startDashboard(port = 7788): Promise<{ url: string; port: number
       readJsonBody(req).then(async (body) => {
         const symbol = typeof body.symbol === "string" ? body.symbol.trim() : "";
         const side = body.side === "buy" || body.side === "sell" ? body.side : null;
-        const quantity = Number(body.quantity);
+        const quantity = Number(body.quantity) > 0 ? Number(body.quantity) : undefined;
+        const orderAmount = body.orderAmount != null && Number(body.orderAmount) > 0 ? Number(body.orderAmount) : undefined; // US 금액기반(달러)
         const broker = (typeof body.broker === "string" ? body.broker : "binance") as Broker;
         const market = body.market === "futures" ? "futures" : "spot";
         const type = body.type === "limit" ? "limit" : "market";
         const price = body.price != null && Number(body.price) > 0 ? Number(body.price) : undefined;
         const confirmToken = typeof body.confirmToken === "string" ? body.confirmToken : undefined;
         const fail = (code: number, error: string) => { res.writeHead(code, { "content-type": "application/json" }); res.end(JSON.stringify({ ok: false, error })); };
-        if (!symbol || !side || !(quantity > 0)) return fail(400, "입력 오류: symbol·side(buy/sell)·quantity>0 필요");
+        if (!symbol || !side || (!quantity && !orderAmount)) return fail(400, "입력 오류: symbol·side(buy/sell) + (quantity>0 또는 orderAmount>0) 필요");
         if (type === "limit" && !(price && price > 0)) return fail(400, "지정가 주문은 price>0 필요");
         // 서버는 클라가 보낸 가격/노셔널/env를 신뢰하지 않음 — placeOrder가 getPrice 재계산+checkLimits+게이트 강제.
-        const r = await placeOrder({ broker, market, symbol, side, type, quantity, price, confirmToken });
+        const r = await placeOrder({ broker, market, symbol, side, type, quantity, price, orderAmount, confirmToken });
         // 지정가 접수(pending) 확정 시 체결 추적 등록(P1-20) — 30s 폴링으로 체결/취소 알림.
         const rr = r as { ok?: boolean; phase?: string; result?: { orderId?: string; status?: string } };
         if (rr.ok && rr.phase === "executed" && rr.result?.orderId && rr.result.status === "pending") {

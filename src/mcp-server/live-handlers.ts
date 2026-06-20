@@ -114,7 +114,7 @@ export function liveStatus() {
 
 export async function placeOrder(a: {
   broker?: Broker; market?: "spot" | "futures"; symbol: string; side: "buy" | "sell";
-  type?: "market" | "limit"; quantity: number; price?: number; confirmToken?: string;
+  type?: "market" | "limit"; quantity?: number; price?: number; orderAmount?: number; confirmToken?: string;
 }) {
   const broker = a.broker || "binance", market = a.market || "spot", type = a.type || "market";
   const got = getAdapter(broker, market);
@@ -123,16 +123,50 @@ export async function placeOrder(a: {
   const gate = liveGate(broker, market);
   if (!gate.allowed) return { ok: false, error: gate.reason, gate };
 
-  // 가격/노셔널 → 하드리밋. 통화 인식(Binance=USDT, 한투/키움=KRW) → 통화별 캡 적용(KR에 USDT 캡 오판 방지).
+  // ── 금액기반 주문(US MARKET 전용, 수동 한정): quantity 대신 달러 금액. notional=orderAmount → 정규화/현재가 산출 스킵. ──
+  //   동일 안전 골격 재사용: liveGate → checkLimits(USD) → 2단계 confirmToken(orderAmount 해시 바인딩) → audit → adapter.
+  if (a.orderAmount != null && a.orderAmount > 0) {
+    if (a.quantity != null) return { ok: false, error: "수량과 금액은 동시에 지정할 수 없습니다(하나만)." };
+    if (broker !== "toss") return { ok: false, error: "금액기반 주문은 토스 US 시장가만 지원합니다." };
+    if (type !== "market") return { ok: false, error: "금액기반 주문은 시장가(market)만 가능합니다." };
+    if (quoteCurrencyFor(broker, a.symbol) !== "USD") return { ok: false, error: "금액기반 주문은 US 종목만 가능합니다(KR 불가)." };
+    const notional = a.orderAmount;
+    const lim = checkLimits({ symbol: a.symbol, notional, quoteCurrency: "USD" });
+    if (!lim.ok) return { ok: false, error: `하드리밋 차단: ${lim.reason}` };
+    const hash = orderHash({ broker, market, symbol: a.symbol, side: a.side, type, orderAmount: a.orderAmount, env: gate.env });
+    if (!a.confirmToken) {
+      const token = mintToken(hash);
+      return {
+        ok: true, phase: "preview", needConfirm: true, confirmToken: token,
+        preview: { broker, market, env: gate.env, symbol: a.symbol, side: a.side, type, orderAmount: a.orderAmount, notional: +notional.toFixed(2), currency: "USD" },
+        note: `⚠️ ${String(gate.env).toUpperCase()} 금액주문 프리뷰($${a.orderAmount}). 동일 인자 + 이 confirmToken으로 다시 호출해야 실제 주문(5분 TTL, 단일사용).`,
+      };
+    }
+    if (!consumeToken(a.confirmToken, hash)) return { ok: false, error: "확인토큰 무효/만료/불일치 → 거절(fail-closed). 프리뷰부터 다시." };
+    audit({ event: "order_attempt", broker, market, env: gate.env, symbol: a.symbol, side: a.side, type, orderAmount: a.orderAmount });
+    try {
+      const result = await got.adapter.placeOrder({ symbol: a.symbol, side: a.side, type: "market", quantity: 0, orderAmount: a.orderAmount });
+      audit({ event: "order_result", broker, env: gate.env, orderId: result.orderId, status: result.status, symbol: result.symbol, side: result.side, orderAmount: a.orderAmount });
+      return { ok: true, phase: "executed", broker, env: gate.env, result };
+    } catch (e) {
+      audit({ event: "order_error", broker, env: gate.env, error: e instanceof Error ? e.message : String(e) });
+      return { ok: false, error: e instanceof Error ? e.message : String(e) };
+    }
+  }
+
+  // ── 수량기반 주문(기존 경로) ──
+  if (a.quantity == null) return { ok: false, error: "수량(quantity) 또는 금액(orderAmount)이 필요합니다." };
+  const qty = a.quantity;
+  // 가격/노셔널 → 하드리밋. 통화 인식(Binance=USDT, 한투/키움=KRW, 토스=심볼별) → 통화별 캡 적용(KR에 USDT 캡 오판 방지).
   const quoteCurrency = quoteCurrencyFor(broker, a.symbol);
   let price = a.price ?? 0;
   if (!price) { try { price = (await got.adapter.getPrice(a.symbol)).price; } catch { price = 0; } }
   // 시장가인데 현재가 산출 실패(price=0) → 노셔널 불명. 메인넷(live)에서는 캡 적용 불가하므로 거절(fail-closed, 리스크통제).
   if (!(price > 0) && gate.env === "live") return { ok: false, error: "현재가 산출 실패 → 노셔널 불명. 메인넷 시장가 거절(지정가로 주문하세요)." };
   // ① 캡 검증을 '제출될 정규화 수량'으로(minNotional 상향분이 캡 초과한 채 제출되던 구멍 차단). 해시/프리뷰/주문 모두 effQty로 통일.
-  let effQty = a.quantity;
+  let effQty = qty;
   if (typeof got.adapter.normalizeQuantity === "function" && price > 0) {
-    try { effQty = await got.adapter.normalizeQuantity(a.symbol, a.quantity, price); } catch { effQty = a.quantity; }
+    try { effQty = await got.adapter.normalizeQuantity(a.symbol, qty, price); } catch { effQty = qty; }
   }
   if (!(effQty > 0)) return { ok: false, error: "정규화 후 수량 0(최소수량/스텝 미달)." };
   const notional = price * effQty;

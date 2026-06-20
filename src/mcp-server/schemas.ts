@@ -183,8 +183,9 @@ export const placeOrderShape = {
   symbol: z.string().describe("종목/심볼 (BTCUSDT, 005930 등)"),
   side: z.enum(["buy", "sell"]),
   type: z.enum(["market", "limit"]).default("market"),
-  quantity: z.number().positive(),
+  quantity: z.number().positive().optional().describe("수량(수량기반). orderAmount와 배타"),
   price: z.number().optional().describe("지정가 시 가격(시장가는 생략)"),
+  orderAmount: z.number().positive().optional().describe("US 금액기반 시장가(달러). 토스 US MARKET 전용, quantity와 배타"),
   confirmToken: z.string().optional().describe("프리뷰가 반환한 토큰. 없으면 프리뷰만(실주문 안 함=fail-closed)"),
 };
 // OCO 보호주문(현물 전용 → market 미포함. 핸들러가 market="spot" 하드코딩). 핸들러가 클라값 전부 불신·재계산 → 스키마는 입구 형변환만.
