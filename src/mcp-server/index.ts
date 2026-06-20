@@ -182,9 +182,12 @@ export function buildServer(): McpServer {
 }
 
 async function main() {
-  const { loadCredentialsFile } = await import("../setup/credentials.js");
+  const { loadCredentialsFile, loadEnvLocalFile } = await import("../setup/credentials.js");
   const n = loadCredentialsFile(); // ~/.quant-mcp/credentials.env → process.env (MCP 설정 env 우선)
   if (n > 0) process.stderr.write(`loaded ${n} credential(s) from credentials.env\n`);
+  // 프로젝트 .env.local 폴백(go-daemon과 동일 소스) — MCP 경유 라이브 호출에도 .env.local 키가 보이도록(non-override).
+  const m = loadEnvLocalFile();
+  if (m > 0) process.stderr.write(`loaded ${m} credential(s) from .env.local\n`);
   const server = buildServer();
   const transport = new StdioServerTransport();
   await server.connect(transport);

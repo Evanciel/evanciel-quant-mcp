@@ -149,6 +149,23 @@ export function loadCredentialsFile(): number {
   return n;
 }
 
+/**
+ * 프로젝트 `.env.local`(gitignore, 로컬 dev 편의) → process.env 로드. **go-daemon과 동일 규약: 화이트리스트 없이 non-override**.
+ *   화이트리스트(ALL_KEYS)를 안 쓰는 이유: 사용자가 별칭 키(TOSS_API_KEY/TOSS_SECRET_KEY, KIS_APP_KEY 등)를 .env.local에
+ *   넣어도 인식돼야 함(loadCredentials가 별칭을 읽음 — ALL_KEYS엔 표준명만 있어 걸러짐). .env.local은 사용자 소유 gitignore 파일.
+ * 우선순위: MCP 클라이언트 env > credentials.env > .env.local (전부 non-override라 먼저 채워진 값이 우선).
+ *   MCP 서버·데몬이 동일 키 소스를 보도록 — 종전엔 데몬만 .env.local을 읽어 MCP 경유 라이브 호출 시 키 누락.
+ *   cwd 기준(프로젝트 루트 실행 가정). 미설정 키만 채움(기존 env·credentials.env 우선).
+ */
+export function loadEnvLocalFile(cwd: string = process.cwd()): number {
+  const env = parseEnvFile(join(cwd, ".env.local"));
+  let n = 0;
+  for (const [k, v] of Object.entries(env)) {
+    if (process.env[k] === undefined) { process.env[k] = v; n++; }
+  }
+  return n;
+}
+
 /** 현재 설정 상태(마스킹). 키 값은 절대 반환 안 함. */
 export function credentialStatus(): Record<BrokerKey, { configured: boolean; fields: Record<string, string> }> {
   const out = {} as Record<BrokerKey, { configured: boolean; fields: Record<string, string> }>;
