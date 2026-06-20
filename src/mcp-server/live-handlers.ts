@@ -4,7 +4,7 @@
  * 키 넣으면 testnet 즉시거래, 메인넷은 LIVE_TRADING_ENABLED + 2단계토큰 필수.
  */
 import { getAdapter, configuredBrokers } from "../brokers/index.js";
-import { liveGate, checkLimits, orderHash, mintToken, consumeToken, audit, auditFailureCount, lastAuditError, type Broker } from "../brokers/safety.js";
+import { liveGate, checkLimits, quoteCurrencyFor, orderHash, mintToken, consumeToken, audit, auditFailureCount, lastAuditError, type Broker } from "../brokers/safety.js";
 
 export async function getPositions(a: { broker?: Broker; market?: "spot" | "futures" }) {
   const broker = a.broker || "binance", market = a.market || "spot";
@@ -124,7 +124,7 @@ export async function placeOrder(a: {
   if (!gate.allowed) return { ok: false, error: gate.reason, gate };
 
   // 가격/노셔널 → 하드리밋. 통화 인식(Binance=USDT, 한투/키움=KRW) → 통화별 캡 적용(KR에 USDT 캡 오판 방지).
-  const quoteCurrency = broker === "binance" ? "USDT" : "KRW";
+  const quoteCurrency = quoteCurrencyFor(broker, a.symbol);
   let price = a.price ?? 0;
   if (!price) { try { price = (await got.adapter.getPrice(a.symbol)).price; } catch { price = 0; } }
   // 시장가인데 현재가 산출 실패(price=0) → 노셔널 불명. 메인넷(live)에서는 캡 적용 불가하므로 거절(fail-closed, 리스크통제).
@@ -212,7 +212,7 @@ export async function placeProtective(a: {
   if (effQty > held + 1e-9) return { ok: false, error: `정규화 수량 ${effQty} > 실보유(매도가능) ${held}.` };
 
   // 3) 하드리밋 — TP·SL 노셔널 각각 캡(한쪽만 우회 불가). 정규화 수량 기준.
-  const quoteCurrency = broker === "binance" ? "USDT" : "KRW";
+  const quoteCurrency = quoteCurrencyFor(broker, a.symbol);
   const tpLim = checkLimits({ symbol: a.symbol, notional: a.takeProfitPrice * effQty, quoteCurrency });
   if (!tpLim.ok) return { ok: false, error: `하드리밋 차단(익절): ${tpLim.reason}` };
   const slLim = checkLimits({ symbol: a.symbol, notional: a.stopPrice * effQty, quoteCurrency });

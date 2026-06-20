@@ -237,6 +237,15 @@ describe("P1-6 일일손실 통화 분리", () => {
     expect(dailyRealizedLoss()).toBe(-50030); // 미지정=전체(하위호환)
   });
 
+  it("토스 거래는 KRW·USDT 양 버킷에 over-count(강화①, fail-safe — 절대 fail-open 아님)", () => {
+    mkBot("ts", "toss");
+    rawTrade("ts", "2026-06-09T16:00:00.000Z", -10000); // toss KR 손실
+    // 토스는 broker='toss' 단일이라 KR/US를 SQL 분리 안 하고 양 통화 버킷에 합산(과집계=서킷 조기발화). 적대검증으로 추가.
+    expect(dailyRealizedLoss("KRW")).toBe(-60000);  // kw(-50000) + ts(-10000)
+    expect(dailyRealizedLoss("USDT")).toBe(-10030); // bn(-30) + ts(-10000)
+    expect(dailyRealizedLoss("USD")).toBe(-10030);  // USD도 동일 버킷
+  });
+
   it("KRW 서킷 도달이 USDT 주문을 막지 않음(독립 서킷)", () => {
     process.env.LIVE_TRADING_ENABLED = "true";
     process.env.LIVE_DAILY_LOSS_LIMIT_KRW = "40000"; // KRW -50000 > 40000 → KRW 차단

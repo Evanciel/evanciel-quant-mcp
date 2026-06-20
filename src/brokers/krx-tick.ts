@@ -22,3 +22,12 @@ export function roundToKrxTick(price: number): number {
   const t = krxTick(price);
   return Math.round(price / t) * t;
 }
+
+/**
+ * KR 종목 코드(6자리 숫자) 여부 — KRW/USD 통화 판정 + KR 정수주 판정의 **단일 진실원**.
+ * 토스는 KR(005930)·US(AAPL)를 단일 API로 섞어 다루므로 통화/수량 분기가 이 한 곳에서만 정의돼야 한다
+ * (safety.quoteCurrencyFor / toss 어댑터 / 대시보드가 전부 이 함수를 재사용 → 정의 불일치로 인한 서킷 오버킷·오통화 방지).
+ */
+export function isKrSymbol(symbol: string): boolean {
+  return /^\d{6}$/.test((symbol ?? "").trim());
+}

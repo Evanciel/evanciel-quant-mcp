@@ -276,7 +276,7 @@ function collectIndicators(node: unknown, acc: string[] = []): string[] {
 const intervalKo = (sec?: number): string =>
   !sec ? "—" : sec >= 86400 ? `${Math.round(sec / 86400)}일봉` : sec >= 3600 ? `${Math.round(sec / 3600)}시간봉` : sec >= 60 ? `${Math.round(sec / 60)}분봉` : `${sec}초`;
 const BROKER_DATA: Record<string, string> = {
-  binance: "Binance 실시간 시세(WS)", kiwoom: "키움증권 일봉(ka10081) · 시세 지연 가능", kis: "한국투자증권 시세",
+  binance: "Binance 실시간 시세(WS)", kiwoom: "키움증권 일봉(ka10081) · 시세 지연 가능", kis: "한국투자증권 시세", toss: "토스증권 시세(일봉/분봉)",
 };
 /** composite + bot → 상세 부연설명 객체(클라이언트가 패널에 렌더). */
 function buildDetail(
@@ -515,7 +515,7 @@ async function candlesFor(botId: string, tf?: string, inds?: string[]): Promise<
       .filter((b) => Number.isFinite(b.time) && b.close > 0)
       .sort((a, b) => a.time - b.time)
       .filter((b, i, arr) => i === 0 || b.time !== arr[i - 1].time);
-    const ccy = bot.broker === "binance" ? "USD" : "KRW";
+    const ccy = bot.broker === "binance" ? "USD" : (bot.broker === "toss" && !/^\d{6}$/.test(bot.symbol.trim()) ? "USD" : "KRW"); // 토스 US 티커=USD, 그 외 KRW
     const comp = store.getComposite(bot.composite_strategy_id);
     // 전략이 쓰는 지표(차트≡전략) + 사용자가 차트에서 토글로 켠 지표를 합쳐서 그림.
     const stratSpecs = collectIndicatorSpecs(comp?.root_node ?? {});
@@ -563,7 +563,7 @@ async function candlesForSymbol(broker: string, symbol: string, tf?: string, ind
   let bkIn = broker, symIn = symbol; let krName: string | undefined;
   if (kr) { bkIn = "kiwoom"; symIn = kr[0]; krName = kr[1]; }
   else if (/[가-힣]/.test(symbol)) return { ok: false, error: `'${symbol.trim()}' 종목코드를 못 찾았어요 — 위 드롭다운에서 '키움(주식)' 선택 후 6자리 코드(예: 삼성전자=005930) 입력` };
-  const bk = bkIn === "kiwoom" || bkIn === "kis" ? bkIn : "binance";
+  const bk = bkIn === "kiwoom" || bkIn === "kis" || bkIn === "toss" ? bkIn : "binance";
   const sym = bk === "binance" ? symIn.toUpperCase() : symIn.trim();
   if (!sym) return { ok: false, error: "종목을 입력하세요" };
   const toUnix = (s: string) => Math.floor(Date.parse(s.length === 10 ? s + "T00:00:00Z" : s) / 1000);
@@ -584,7 +584,7 @@ async function candlesForSymbol(broker: string, symbol: string, tf?: string, ind
       .sort((a, b) => a.time - b.time)
       .filter((b, i, arr) => i === 0 || b.time !== arr[i - 1].time);
     if (!bars.length) return { ok: false, error: "차트 데이터 없음 — 종목코드를 확인하세요" };
-    const ccy = bk === "binance" ? "USD" : "KRW";
+    const ccy = bk === "binance" ? "USD" : (bk === "toss" && !/^\d{6}$/.test(sym.trim()) ? "USD" : "KRW"); // 토스 US 티커=USD, 그 외 KRW
     const ind = buildIndicators(bars, parseToggleInds(inds)); // 전략 없음 → 사용자가 켠 토글 지표만
     return { ok: true, symbol: sym, name: krName, broker: bk, ccy, interval: iv, intraday, bars, overlays: ind.overlays, oscGroups: ind.oscGroups, priceLines: [], markers: [] };
   } catch (e) {
@@ -1186,7 +1186,7 @@ h1{font-size:18px;margin:0 0 2px}.sub{color:#8a94a6;font-size:12px;margin-bottom
   <span class="gear" onclick="openHist()">📋 주문/체결</span>
   <span class="gear" onclick="toggleSettings()">⚙️ API 키 설정</span></div>
 <div class="searchbar">
-  <select id="qbroker" onchange="onQBroker()"><option value="binance">Binance(코인)</option><option value="kiwoom">키움(주식)</option><option value="kis">한투(주식)</option></select>
+  <select id="qbroker" onchange="onQBroker()"><option value="binance">Binance(코인)</option><option value="kiwoom">키움(주식)</option><option value="kis">한투(주식)</option><option value="toss">토스(주식)</option></select>
   <input id="qsym" type="text" autocomplete="off" list="qsymlist" placeholder="종목 검색 — 예: BTCUSDT" oninput="qSuggest()" onkeydown="if(event.key==='Enter')searchChart()">
   <datalist id="qsymlist"></datalist>
   <button class="sbtn" onclick="searchChart()">🔍 차트 보기</button>
@@ -1235,7 +1235,7 @@ h1{font-size:18px;margin:0 0 2px}.sub{color:#8a94a6;font-size:12px;margin-bottom
 <script>
 let bots=[];const prices=new Map();let ws=null;var accounts={};var realAccounts={}; // realAccounts[broker]=거래소 실계정 스냅샷(getAccount)
 function fmt(n,d=2){return Number(n).toLocaleString(undefined,{minimumFractionDigits:d,maximumFractionDigits:d})}
-function ccyOf(broker){return broker==='binance'?'USD':'KRW'}
+function ccyOf(broker,symbol){if(broker==='binance')return 'USD';if(broker==='toss')return (symbol&&!/^[0-9]{6}$/.test(String(symbol).trim()))?'USD':'KRW';return 'KRW'}
 function csym(c){return c==='KRW'?'₩':'$'}
 function money(n,c){return csym(c)+Math.round(Math.abs(Number(n)||0)).toLocaleString()}
 function signed(n,c){var v=Math.round(Number(n)||0);return (v>=0?'+':'-')+csym(c)+Math.abs(v).toLocaleString()}
@@ -1555,9 +1555,9 @@ function initProtect(id){var bar=document.getElementById('chartProtect');var b=f
  var pos=b&&!b.isScanner&&(b.positions||[]).filter(function(p){return p.side==='long'&&p.qty>0;})[0]; // 현물 롱만(OCO SELL)
  if(!pos||!_priceSeries||(b.broker!=='binance')){_protect=null;if(bar)bar.style.display='none';var pm0=document.getElementById('protectMsg');
   // KR(키움/KIS)은 거래소 상주 OCO 미지원 — 조용히 숨기지 않고 정직하게 고지(audit P0-3). 봇 폴링 손절만 동작.
-  if(pm0)pm0.textContent=(pos&&b&&(b.broker==='kis'||b.broker==='kiwoom'))?'ℹ️ 한국주식은 거래소 상주 OCO 보호주문 미지원 — 봇이 켜져 있을 때만 손절/익절이 동작해요.':'';return;}
+  if(pm0)pm0.textContent=(pos&&b&&(b.broker==='kis'||b.broker==='kiwoom'||b.broker==='toss'))?'ℹ️ 한국주식은 거래소 상주 OCO 보호주문 미지원 — 봇이 켜져 있을 때만 손절/익절이 동작해요.':'';return;}
  var entry=pos.entryAvg;
- _protect={sym:pos.symbol,broker:b.broker,market:b.market||'spot',ccy:ccyOf(b.broker),qty:pos.qty,entry:entry,side:'long',
+ _protect={sym:pos.symbol,broker:b.broker,market:b.market||'spot',ccy:ccyOf(b.broker,pos.symbol),qty:pos.qty,entry:entry,side:'long',
    tpPrice:entry*(1+PROT_TP_PCT/100),slPrice:entry*(1-PROT_SL_PCT/100),tpLine:null,slLine:null,confirmToken:null,active:false,orderListId:null};
  drawProtectLines();renderProtectBar();bindProtectDrag();loadActiveProtect(id);
 }
@@ -1632,13 +1632,13 @@ function renderHistTabs(){var el=document.getElementById('histTabs');
   '<span class="tfb'+(_histTab==='orders'?' on':'')+'" data-t="orders" onclick="setHistTab(this.dataset.t)">미체결 주문</span>'+
   (_histTab==='trades'
    ?'<select class="hsel" onchange="_histDays=Number(this.value);loadHist()">'+[[1,'오늘'],[7,'7일'],[30,'30일'],[0,'전체']].map(function(o){return '<option value="'+o[0]+'"'+(_histDays===o[0]?' selected':'')+'>'+o[1]+'</option>'}).join('')+'</select>'
-   :'<select class="hsel" onchange="_histBroker=this.value;loadHist()">'+['binance','kiwoom','kis'].map(function(b){return '<option value="'+b+'"'+(_histBroker===b?' selected':'')+'>'+esc(brokerLabel(b))+'</option>'}).join('')+'</select>');}
+   :'<select class="hsel" onchange="_histBroker=this.value;loadHist()">'+['binance','kiwoom','kis','toss'].map(function(b){return '<option value="'+b+'"'+(_histBroker===b?' selected':'')+'>'+esc(brokerLabel(b))+'</option>'}).join('')+'</select>');}
 function loadHist(){var body=document.getElementById('histBody');var msg=document.getElementById('histMsg');msg.textContent='';body.innerHTML='<div class="hint" style="padding:12px">불러오는 중…</div>';
  if(_histTab==='trades'){
   fetch('/api/trades'+(_histDays>0?'?days='+_histDays:'')).then(function(r){return r.json()}).then(function(d){
    if(!d.ok){body.innerHTML='';msg.className='setmsg err';msg.textContent='오류: '+(d.error||'');return;}
    if(!d.trades.length){body.innerHTML='<div class="hint" style="padding:12px">기간 내 체결 없음</div>';return;}
-   var rows=d.trades.map(function(t){var ccy=/^\d{6}$/.test(String(t.symbol||''))?'KRW':'USD';
+   var rows=d.trades.map(function(t){var ccy=/^[0-9]{6}$/.test(String(t.symbol||''))?'KRW':'USD';
     return '<tr><td>'+esc(String(t.ts).slice(0,16).replace('T',' '))+'</td><td>'+esc(t.bot_name||'-')+'</td><td>'+esc(coin(t.symbol||''))+'</td>'+
      '<td class="'+(t.side==='buy'?'up':'dn')+'">'+(t.side==='buy'?'매수':'매도')+(t.is_paper?'':' <b>실</b>')+'</td>'+
      '<td style="text-align:right">'+fmt(t.qty,4)+'</td><td style="text-align:right">'+fmt(t.price,ccy==='KRW'?0:2)+'</td>'+
@@ -1675,7 +1675,7 @@ function orderFormBody(side,qty){return '<div class="fld"><label>수량</label><
   '<button class="obig'+(side==='sell'?' danger':'')+'" onclick="submitOrder()">주문 미리보기 →</button>';}
 // 자유 수동주문 폼 — 브로커·종목·방향까지 직접 선택(봇 카드와 무관). o={broker,symbol,side,quantity} 프리필(확정 실패 후 복원용).
 function manualFormBody(o){o=o||{};var sel=function(v){return o.broker===v?' selected':''};var ss=function(v){return (o.side||'buy')===v?' selected':''};
- return '<div class="fld"><label>거래소/증권사</label><select id="obroker"><option value="binance"'+sel('binance')+'>Binance (암호화폐)</option><option value="kiwoom"'+sel('kiwoom')+'>키움증권 (주식)</option><option value="kis"'+sel('kis')+'>한국투자증권 (주식)</option></select></div>'+
+ return '<div class="fld"><label>거래소/증권사</label><select id="obroker"><option value="binance"'+sel('binance')+'>Binance (암호화폐)</option><option value="kiwoom"'+sel('kiwoom')+'>키움증권 (주식)</option><option value="kis"'+sel('kis')+'>한국투자증권 (주식)</option><option value="toss"'+sel('toss')+'>토스증권 (주식)</option></select></div>'+
   '<div class="fld"><label>종목</label><input id="osym" type="text" autocomplete="off" placeholder="예: BTCUSDT 또는 005930" value="'+(o.symbol?esc(o.symbol):'')+'"></div>'+
   '<div class="fld"><label>시세/잔고</label><div style="display:flex;gap:8px;align-items:center;min-width:0"><span class="tfb" onclick="quoteManual()">조회</span><span id="oquote" class="hint" style="overflow:hidden;text-overflow:ellipsis">종목 입력 후 조회 — 현재가·가용잔고·보유 확인</span></div></div>'+
   '<div class="fld"><label>방향</label><select id="oside"><option value="buy"'+ss('buy')+'>매수 (사기)</option><option value="sell"'+ss('sell')+'>매도 (팔기)</option></select></div>'+
@@ -1694,7 +1694,7 @@ function quoteManual(){var b=document.getElementById('obroker').value;var sym=do
 function applyPreset(p){var out=document.getElementById('oquote');if(!_quote){if(out)out.textContent='먼저 [조회]로 시세/잔고를 불러오세요';return;}
  var side=document.getElementById('oside').value;var pct=p==='max'?100:Number(p);var qty;
  if(side==='sell'){qty=_quote.held*pct/100;}else{qty=(_quote.cashBalance*pct/100)/_quote.price*0.99;} // 수수료 여유 1%
- var kr=/^\d{6}$/.test(String(_quote.symbol||''));qty=kr?Math.floor(qty):Math.floor(qty*1e8)/1e8;
+ var kr=/^[0-9]{6}$/.test(String(_quote.symbol||''));qty=kr?Math.floor(qty):Math.floor(qty*1e8)/1e8;
  document.getElementById('oqty').value=qty>0?String(qty):'0';
  if(side==='sell'&&!(qty>0)&&out)out.textContent='매도할 보유 수량이 없어요';}
 function openManualOrder(){_quote=null;_order={manual:true,market:'spot',side:'buy'};
@@ -1763,13 +1763,13 @@ function card(r){var b=r.b,live=b.mode==='live',open=expanded.has(b.id),rp=r.rp;
   '<div class="strat" style="display:'+(open?'block':'none')+'">'+detailHtml(b)+'</div>';
  return el;}
 function render(){var pos=document.getElementById('pos');pos.innerHTML='';
- var rows=bots.map(function(b){var ccy=ccyOf(b.broker);var ps=b.positions||[];var body='',bsum=0,n=0;
+ var rows=bots.map(function(b){var ccy=ccyOf(b.broker,b.symbol);var ps=b.positions||[];var body='',bsum=0,n=0;
   if(ps.length){for(const p of ps){var r=posRow(p,ccy);bsum+=r.abs;n++;body+=r.html;}}
   else body='<div class="prow" style="color:#8a94a6">지금은 대기 중이에요 (가진 것 없음)</div>';
   return {b:b,ccy:ccy,ps:ps,body:body,bsum:bsum,n:n,rp:b.realizedPnl||0,cap:(b.detail&&b.detail.capital)||0};});
  var acc={USD:{cap:0,unr:0,real:0,n:0},KRW:{cap:0,unr:0,real:0,n:0}};
  rows.forEach(function(r){var a=acc[r.ccy];a.cap+=r.cap;a.unr+=r.bsum;a.real+=r.rp;a.n++;});
- var BK={binance:{label:'💰 Binance',sub:'암호화폐·USDT'},kiwoom:{label:'🏦 키움증권',sub:'주식·KRW(모의)'},kis:{label:'🏦 한국투자증권',sub:'주식·KRW'}};
+ var BK={binance:{label:'💰 Binance',sub:'암호화폐·USDT'},kiwoom:{label:'🏦 키움증권',sub:'주식·KRW(모의)'},kis:{label:'🏦 한국투자증권',sub:'주식·KRW'},toss:{label:'🏦 토스증권',sub:'주식·KR/US'}};
  var brokers=[];rows.forEach(function(r){if(brokers.indexOf(r.b.broker)<0)brokers.push(r.b.broker);});
  var posCount=0;
  for(const bk of brokers){var gr=rows.filter(function(r){return r.b.broker===bk});if(!gr.length)continue;
@@ -1794,7 +1794,7 @@ function render(){var pos=document.getElementById('pos');pos.innerHTML='';
 // ── API 키 설정 패널 (시크릿은 type=password·autocomplete=off, 저장 후 마스킹만 표시·재조회 불가) ──
 let setLoaded=false;
 function toggleSettings(){const p=document.getElementById('setpanel');const show=p.style.display!=='block';p.style.display=show?'block':'none';if(show&&!setLoaded){loadSettings();}}
-function brokerLabel(b){return {binance:'Binance (암호화폐)',kis:'한국투자증권',kiwoom:'키움증권'}[b]||b;}
+function brokerLabel(b){return {binance:'Binance (암호화폐)',kis:'한국투자증권',kiwoom:'키움증권',toss:'토스증권'}[b]||b;}
 function loadSettings(){fetch('/api/credentials').then(r=>r.json()).then(d=>{if(!d.ok)return;setLoaded=true;
  document.getElementById('credpath').textContent=d.path;
  const body=document.getElementById('setbody');body.innerHTML='';

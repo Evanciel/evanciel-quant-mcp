@@ -5,6 +5,22 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] — 2026-06-20 토스증권(Toss) 브로커 추가
+
+quant-mcp 4번째 브로커. PDCA(plan→design→do→check 100%→report) + 다단계 적대검증(울트라코드). 라이브 읽기 E2E 8/8. Tests → 585.
+
+### Added
+- **토스증권 Open API 어댑터** (`src/brokers/toss.ts`, KR+US): OAuth2 client_credentials, 시세·계좌·보유·주문·취소·미체결, 캔들(1m/1d, `before` 커서 페이지네이션). 멀티브로커 배선(`toss`) + 대시보드 통합(드롭다운·차트·통화 표시).
+- **읽기 전용 라이브 E2E** (`scripts/verify-toss-e2e.ts`) — 토큰→/accounts→KR/US 시세→캔들→잔고→보유→미체결.
+- `quoteCurrencyFor(broker, symbol)` — 주문 통화 판정 단일 진실원(KRW/USDT/USD); 일일손실 서킷에 toss 포함(coarse `IN`, fail-safe over-count). 키 별칭 허용(`TOSS_API_KEY`↔`TOSS_CLIENT_ID`).
+
+### Fixed (real-money safety)
+- **토스 라이브-쓰기 하드블록**: 토스는 모의 호스트가 없어 placeOrder/cancelOrder는 `env=live`(+주문은 `LIVE_TRADING_ENABLED`)일 때만 — `checkLimits` 마스터-OFF 단락으로 "페이퍼인데 실호스트 무캡 도달"하던 구멍 봉쇄.
+- 적대검증 4건: 러너 캔들 디스패치 toss 누락(시그널봇 영구 hold) / US LIMIT 소수수량 거부(스펙 `^\d+$`) / 대시보드 정규식 esbuild cook(`\d`→`d`) / 교차통화 affordability(KRW÷USD).
+
+### Notes
+- 주문 쓰기 기본 페이퍼(`LIVE_TRADING_ENABLED` OFF). `getOrderByClientId` 미구현으로 KR 포지션-reconcile 라우팅 보존. OCO/거래소 상주 보호주문 미지원(fail-closed). 단일 주문경로(`placeOrder`)·no-retry-on-POST 불변식 유지.
+
 ## [Unreleased] — 2026-06-12 full-audit upgrade (Sprints 1–6)
 
 Driven by the adversarially-verified full audit (`docs/03-analysis/full-audit-2026-06-12.md`).

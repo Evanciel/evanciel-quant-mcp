@@ -3,7 +3,7 @@
  * v2(라이브, bring-your-own-keys)에서 Binance/한국투자(KIS)/키움 어댑터가 이 포트를 구현한다.
  * 설계: docs/02-design/quant-mcp-v1-design.md §5. 키움은 KIS와 wire 비호환 → 전용 KiwoomBrokerAdapter 필요.
  */
-export type BrokerType = "hantoo" | "kiwoom" | "binance" | "alpaca";
+export type BrokerType = "hantoo" | "kiwoom" | "binance" | "alpaca" | "toss";
 
 export interface BrokerConfig {
   type: BrokerType;
