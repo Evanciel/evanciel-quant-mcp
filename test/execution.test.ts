@@ -35,6 +35,17 @@ describe("planProtectiveOrders", () => {
     expect(planProtectiveOrders({ ...base, positionSide: "long" })).toHaveLength(0);
     expect(planProtectiveOrders({ ...base, positionSide: "long", qty: 0, stopLossPercent: 5 })).toHaveLength(0);
   });
+
+  it("clientOrderId 충돌내성(#16): 봇/심볼 다르면 cid 다름, 같은 입력은 결정적 동일, 거래소 한도 내", () => {
+    const cids = (botId: string, symbol: string) =>
+      planProtectiveOrders({ botId, symbol, qty: 1, entryAvg: 100, positionSide: "long", stopLossPercent: 5, takeProfitPercent: 10 }).map((x) => x.clientOrderId).sort();
+    const a = cids("bot-aaaaaaaa-1111", "BTCUSDT");
+    expect(a).toHaveLength(2);
+    expect(a).not.toEqual(cids("bot-bbbbbbbb-2222", "BTCUSDT")); // 다른 봇 → 다른 cid(교차봇 취소 사고 차단)
+    expect(a).not.toEqual(cids("bot-aaaaaaaa-1111", "ETHUSDT")); // 다른 심볼 → 다른 cid
+    expect(a).toEqual(cids("bot-aaaaaaaa-1111", "BTCUSDT"));     // 같은 입력 → 결정적 동일(멱등 슬롯, 트레일링 외 안정)
+    for (const id of a) { expect(id.length).toBeLessThanOrEqual(36); expect(id).toMatch(/^[a-zA-Z0-9_-]+$/); } // 거래소 charset/길이
+  });
 });
 
 describe("reconcileProtective", () => {

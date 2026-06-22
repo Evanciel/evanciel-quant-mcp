@@ -81,9 +81,17 @@ export function disableLive(): { written: string[]; path: string } {
 /** 라이브 운영 상태 요약(키 노출 0). 대시보드/마법사 표시용. */
 export function liveSettingsStatus(): { masterOn: boolean; env: string; maxNotional: string; allowlist: string; dailyLossLimit: string } {
   const T = (s?: string) => (s ?? "").trim();
+  // env는 **설정된 브로커별**로 표기(적대검증 #18): 종전 BINANCE_ENV 단독 표기는 binance 미설정 KR-only(Toss/KIS/키움)
+  //   메인넷 배포를 'testnet'으로 오표시 → 운영자가 실돈인데 testnet으로 오인(testnet-vs-live 인적 가드 무력화). 토스는
+  //   모의 호스트가 없어 기본 live. 설정된 브로커들의 env를 합쳐 보여 정확한 상황 인지를 보장한다.
+  const st = credentialStatus();
+  const envVar: Record<BrokerKey, string> = { binance: "BINANCE_ENV", kis: "KIS_ENV", kiwoom: "KIWOOM_ENV", toss: "TOSS_ENV" };
+  const envDef: Record<BrokerKey, string> = { binance: "testnet", kis: "mock", kiwoom: "mock", toss: "live" };
+  const parts: string[] = [];
+  for (const b of Object.keys(envVar) as BrokerKey[]) if (st[b].configured) parts.push(`${b}:${T(process.env[envVar[b]]) || envDef[b]}`);
   return {
     masterOn: T(process.env.LIVE_TRADING_ENABLED) === "true",
-    env: T(process.env.BINANCE_ENV) || "testnet",
+    env: parts.length ? parts.join(", ") : (T(process.env.BINANCE_ENV) || "testnet"),
     maxNotional: T(process.env.LIVE_MAX_NOTIONAL) || "통화별 기본(USDT 100 / KRW 150,000)",
     allowlist: T(process.env.LIVE_SYMBOL_ALLOWLIST) || "(전체 허용)",
     dailyLossLimit: T(process.env.LIVE_DAILY_LOSS_LIMIT) || "통화별 기본(USDT 50 / KRW 75,000)",

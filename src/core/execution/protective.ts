@@ -8,6 +8,7 @@
  *
  * 정직: 보호주문은 '리스크 통제'의 핵심이지 알파가 아니다. 슬리피지·갭·부분체결은 여전히 존재.
  */
+import { createHash } from "node:crypto";
 
 export interface ProtectiveOrder {
   kind: "stop_loss" | "take_profit";
@@ -116,10 +117,12 @@ function num(x: number | null | undefined): number | null {
   return typeof x === "number" && Number.isFinite(x) && x > 0 ? x : null;
 }
 function coid(botId: string, symbol: string, kind: string, price: number): string {
-  // 거래소 clientOrderId 한도(≤36자, [a-zA-Z0-9-_])라 botId(UUID 36자)+접미사를 그대로 못 씀.
-  // (botId|symbol|kind|price)의 32비트 해시를 base36으로 → 가격 포함이라 트레일링 갱신 시 새 슬롯(취소+재배치). 안정적·짧음.
+  // 거래소 clientOrderId 한도(≤36자, [a-zA-Z0-9-_])라 botId(UUID)+접미사를 그대로 못 씀.
+  // (botId|symbol|kind|price-cents)의 sha256 앞 30자(hex). 가격(cents) 포함이라 트레일링 갱신 시 새 슬롯(취소+재배치).
+  //   ⚠️ 적대검증 #16: 종전 32비트 imul 해시는 한 계좌에 여러 봇/심볼이 도는 fleet에서 birthday-bound 충돌 가능 →
+  //   봇 A의 cancel이 봇 B의 상주 보호주문을 취소(나체)하거나, 중복 clientOrderId 거부로 한쪽 보호가 누락(편다리)됐다.
+  //   sha256(앞 30자=120비트)로 cross-bot/symbol 충돌 사실상 0. 결정적(테스트 가능)·거래소 charset/길이 한도 내.
   const key = `${botId}|${symbol}|${kind}|${Math.round(price * 1e2)}`;
-  let h = 0;
-  for (let i = 0; i < key.length; i++) h = (Math.imul(h, 31) + key.charCodeAt(i)) >>> 0;
-  return `p${kind === "sl" ? "S" : "T"}${h.toString(36)}`; // 예: pS1a2b3c (≤10자, kind는 해시키에도 포함)
+  const h = createHash("sha256").update(key).digest("hex").slice(0, 30);
+  return `p${kind === "sl" ? "S" : "T"}${h}`; // ≤32자([0-9a-f])
 }

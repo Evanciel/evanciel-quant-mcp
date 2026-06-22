@@ -68,11 +68,14 @@ buy-side unknown이 unknownCount 미증가(fresh entry는 담을 상태가 null)
 ### ✅ #12 toss 인터벌 검증 — 수정 완료(Batch 3)
 토스는 캔들 1m/1d만 지원 → 그 외 인터벌 봇은 러너 getCandles throw로 '러닝이지만 평가 불가'한 유령봇(페이퍼·라이브 공통). create_bot이 사전 거절 + 러너 getCandles try/catch 안전망(generic crash 대신 명시 hold). 테스트 3.
 
-### 잔여 MEDIUM (개별 재검증 후 — 다수 opt-in/paper-only/UI라 현재 머니 노출 없음)
-**안전·비-라이브변이(추후 가능)**: #18 배너 broker-aware env/통화 표기(현 BINANCE_ENV만 참조 → KR-only 메인넷이 'testnet'·'USDT' 오표시, 운영자 인지 저하) · #15 getOpenOco 2-leg 검증(편다리/유령 OCO를 '보호됨' 오표시 → 재보호 차단) · #22 킬스위치 스캐너 심볼맵 청산(현 단일포지션 가정이라 스캐너 보유 미청산) · #25 스캐너 라이브 fill tx 원자화 · #16 protective coid 충돌내성(32bit→긴 해시) · 포트폴리오게이트 is_paper/통화 필터(realizedEquityCurve, opt-in).
-**라이브변이/검증 게이트(testnet 필요)**: #11 toss 세션게이트(장외 주문) · #14 트레일링 place-then-cancel(naked 창) · affordability 재확인 fail-closed · #20 TP intrabar 패리티(백테 통계 이동 → 신중) · #13 toss US FX 사이징 footgun(KRW capital÷USD).
+### ✅ Batch 4 — 안전 MEDIUM 3건 수정 완료
+- **#15 getOpenOco 2-leg 검증**: read-back에서 정확히 2-leg + 양가격>0일 때만 유효 OCO 인정, 그 외 null(편다리/유령 OCO를 '보호됨' 오표시 → placeProtective 재보호 거절/silent 미보호 차단). fail-closed.
+- **#16 protective coid 충돌내성**: 32비트 imul 해시 → sha256 앞 30자(120비트). fleet(한 계좌 다봇/심볼)에서 cross-bot 충돌(A의 cancel이 B 보호주문 취소=나체, 중복 cid 거부=편다리) 사실상 0. 결정적·거래소 한도 내. 테스트(봇/심볼별 cid 상이·결정적·charset).
+- **#18 배너 broker-aware env**: liveSettingsStatus.env를 설정된 브로커별 env 합산으로(BINANCE_ENV 단독 → KR-only 메인넷 'testnet' 오표시 방지) + 배너 하드코딩 'USDT' 제거. 테스트.
 
-> 다수가 opt-in(포트폴리오게이트)·paper-only(스캐너 라이브 거절됨)·UI 표기라 현재 머니 노출 없음. 우선순위·testnet 키 따라 후속.
+### ⏸ 잔여 MEDIUM (latent/paper-only/opt-in — 현재 머니 노출 없음, 우선순위·키 따라 후속)
+- **#22 킬스위치 스캐너 심볼맵 청산**: latent(스캐너 라이브 start_bot 거절로 도달 불가 — 방어적). #25 **스캐너 라이브 fill tx 원자화**: 스캐너 라이브 거절이라 paper-only(실손 무영향) + collect-then-commit 리팩토링 위험. 포트폴리오게이트 **is_paper/통화 필터**: opt-in(QUANT_MCP_PORTFOLIO_* 기본 OFF).
+- **라이브변이/testnet 게이트**: #11 toss 세션게이트 · #14 트레일링 place-then-cancel · affordability 재확인 · #20 TP intrabar 패리티(백테 통계 이동→신중) · #13 toss US FX 사이징.
 
 ---
 

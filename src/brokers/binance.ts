@@ -788,6 +788,11 @@ export class BinanceBrokerAdapter extends BaseBrokerAdapter {
       if (type.includes("STOP")) slPrice = parseFloat(String(o.stopPrice ?? o.price ?? "0"));
       else tpPrice = parseFloat(String(o.price ?? "0")); // LIMIT_MAKER 익절
     }
+    // 읽기 검증(적대검증 #15): placeOco는 생성 시 정확히 2-leg를 강제하나 read-back은 미검증이었다 → 한 다리만 남은
+    //   '편다리/유령' OCO(TP 체결/취소 후 listId 잔존, 또는 수동 단일 STOP에 listId 부여)를 active로 둔갑시켜
+    //   placeProtective가 재보호를 거절하거나 getProtective가 slPrice=0인데 '보호됨'으로 표시(silent 미보호)했다.
+    //   정확히 2-leg + 양 가격(>0)일 때만 유효 OCO로 인정, 그 외는 null(='보호 없음' → 재보호 허용, fail-closed).
+    if (legs.length !== 2 || !(tpPrice > 0) || !(slPrice > 0)) return null;
     return { orderListId: listId, tpPrice, slPrice };
   }
 }

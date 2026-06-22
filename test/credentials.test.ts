@@ -9,6 +9,7 @@ import { join } from "node:path";
 
 const KEYS = ["BINANCE_ENV", "BINANCE_API_KEY", "BINANCE_API_SECRET", "BINANCE_FUTURES_API_KEY", "BINANCE_FUTURES_API_SECRET",
   "KIS_ENV", "KIS_APPKEY", "KIS_APPSECRET", "KIS_ACCOUNT", "KIWOOM_ENV", "KIWOOM_APPKEY", "KIWOOM_SECRETKEY", "QUANT_MCP_DATA_DIR",
+  "TOSS_ENV", "TOSS_CLIENT_ID", "TOSS_CLIENT_SECRET", "TOSS_ACCOUNT_SEQ",
   "LIVE_TRADING_ENABLED", "LIVE_MAX_NOTIONAL", "LIVE_SYMBOL_ALLOWLIST", "LIVE_DAILY_LOSS_LIMIT"];
 
 let dir: string;
@@ -164,6 +165,20 @@ describe("checkLimits 통화 인식 안전 기본 캡(KRW 버그 수정)", () =>
     delete process.env.LIVE_TRADING_ENABLED;
     delete process.env.LIVE_MAX_NOTIONAL;
     expect(S.checkLimits({ symbol: "BTCUSDT", notional: 1e9 }).ok).toBe(true);
+  });
+});
+
+describe("liveSettingsStatus broker-aware env(#18 — KR-only 메인넷 testnet 오표시 방지)", () => {
+  it("설정된 브로커들의 env를 합쳐 표기 — 토스만 live여도 'toss:live'(BINANCE_ENV 단독 오표시 아님)", async () => {
+    const C = await load();
+    C.upsertCredentials({ TOSS_CLIENT_ID: "tid12345", TOSS_CLIENT_SECRET: "tsec6789", TOSS_ENV: "live" });
+    const s = C.liveSettingsStatus();
+    expect(s.env).toContain("toss:live");
+    expect(s.env).not.toBe("testnet"); // 종전 BINANCE_ENV 단독 폴백 오표시 방지
+  });
+  it("아무 브로커도 미설정이면 binance 기본(testnet) 폴백", async () => {
+    const C = await load();
+    expect(C.liveSettingsStatus().env).toBe("testnet");
   });
 });
 
