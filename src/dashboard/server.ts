@@ -878,18 +878,19 @@ export function startDashboard(port = 7788): Promise<{ url: string; port: number
         if (body.enable !== true) { send(400, { ok: false, error: "enable:true|false 명시 필요(빈 바디로 켜지지 않음 — fail-closed)" }); return; }
         const maxNotional = typeof body.maxNotional === "string" ? body.maxNotional : "";
         const allowlist = typeof body.allowlist === "string" ? body.allowlist : "";
-        const hash = orderHash({ kind: "live_enable", maxNotional, allowlist }); // 인자 해시 바인딩 — 프리뷰와 다른 인자로 확정 불가
+        const brokerAllowlist = typeof body.brokerAllowlist === "string" ? body.brokerAllowlist : ""; // #6 브로커별 옵트인(canary 격리)
+        const hash = orderHash({ kind: "live_enable", maxNotional, allowlist, brokerAllowlist }); // 인자 해시 바인딩 — 프리뷰와 다른 인자로 확정 불가
         const ct = typeof body.confirmToken === "string" ? body.confirmToken : undefined;
         if (!ct) {
           send(200, {
             ok: true, phase: "preview", needConfirm: true, confirmToken: mintToken(hash),
-            preview: { action: "enable_live", env: liveSettingsStatus().env, maxNotional: maxNotional || "(통화별 기본)", allowlist: allowlist || "(전체 허용)" },
+            preview: { action: "enable_live", env: liveSettingsStatus().env, maxNotional: maxNotional || "(통화별 기본)", allowlist: allowlist || "(전체 허용)", brokerAllowlist: brokerAllowlist || "(전체 브로커)" },
             note: "⚠️ 실거래 마스터 ON 프리뷰. 동일 인자+confirmToken으로 재호출해야 실제 켜짐(5분 TTL, 단일사용).",
           }); return;
         }
         if (!consumeToken(ct, hash)) { send(200, { ok: false, error: "확인토큰 무효/만료/불일치 → 거절(fail-closed). 프리뷰부터 다시." }); return; }
-        enableLive({ maxNotional: maxNotional || undefined, allowlist: allowlist || undefined });
-        audit({ event: "live_toggle", action: "enable", maxNotional: maxNotional || "(default)", allowlist: allowlist || "(all)", via: "dashboard" });
+        enableLive({ maxNotional: maxNotional || undefined, allowlist: allowlist || undefined, brokerAllowlist: brokerAllowlist || undefined });
+        audit({ event: "live_toggle", action: "enable", maxNotional: maxNotional || "(default)", allowlist: allowlist || "(all)", brokerAllowlist: brokerAllowlist || "(all)", via: "dashboard" });
         send(200, { ok: true, phase: "executed", live: liveSettingsStatus() });
       }).catch((e) => { res.writeHead(400, { "content-type": "application/json" }); res.end(JSON.stringify({ ok: false, error: e instanceof Error ? e.message : "bad request" })); });
       return;

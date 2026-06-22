@@ -48,6 +48,9 @@ export const LIVE_SETTING_KEYS = [
   //  enableLive/대시보드 폼으로 저장 불가였음 — 추가해 설정 경로 확보(LIVE_DAILY_LOSS_LIMIT_* 는 checkLimits 가 이미 참조).
   "LIVE_MAX_TOTAL_NOTIONAL", "LIVE_MAX_TOTAL_NOTIONAL_KRW", "LIVE_MAX_TOTAL_NOTIONAL_USDT",
   "LIVE_DAILY_LOSS_LIMIT_KRW", "LIVE_DAILY_LOSS_LIMIT_USDT",
+  // Task #6: 브로커별 라이브 옵트인(liveGate가 참조) — 마스터 ON이 전 브로커를 무장하는 걸 막음(canary는 토스 1개만).
+  //  QUANT_TICKBOT_MARKET_GATE: 라이브 전환 시 자동 ON 되는 장운영 게이트(runner). 저권한 POST 무장 방지 위해 여기 화이트리스트.
+  "LIVE_BROKER_ALLOWLIST", "QUANT_TICKBOT_MARKET_GATE",
 ] as const;
 
 /** 알림 설정. ALERT_WEBHOOK_URL은 토큰 포함 → 시크릿 취급(마스킹). ALERT_ENABLED=on/off. */
@@ -71,11 +74,14 @@ export const LIVE_DEFAULTS = { USDT: { cap: "100", dailyLoss: "50" }, KRW: { cap
  * 캡/서킷을 비우면 **저장하지 않음** → safety.ts가 통화별 안전 기본값 적용(KRW 봇에 USDT 캡 박히는 버그 방지).
  * 반환=실제 기록된 키.
  */
-export function enableLive(opts?: { maxNotional?: string; allowlist?: string; dailyLossLimit?: string }): { written: string[]; path: string } {
+export function enableLive(opts?: { maxNotional?: string; allowlist?: string; dailyLossLimit?: string; brokerAllowlist?: string }): { written: string[]; path: string } {
   const up: Record<string, string> = { LIVE_TRADING_ENABLED: "true" };
   if (opts?.maxNotional) up.LIVE_MAX_NOTIONAL = opts.maxNotional;       // 비우면 미저장 → 통화별 기본 캡
   if (opts?.dailyLossLimit) up.LIVE_DAILY_LOSS_LIMIT = opts.dailyLossLimit;
   if (opts?.allowlist) up.LIVE_SYMBOL_ALLOWLIST = opts.allowlist;
+  if (opts?.brokerAllowlist) up.LIVE_BROKER_ALLOWLIST = opts.brokerAllowlist; // #6 브로커별 옵트인(비우면 전체 — 하위호환)
+  // #6: 라이브 전환 시 장운영 게이트 자동 ON(라이브 봇이 장외에 실주문 발사하는 걸 차단). 이미 명시 설정돼 있으면 보존.
+  if ((process.env.QUANT_TICKBOT_MARKET_GATE ?? "").trim() === "") up.QUANT_TICKBOT_MARKET_GATE = "1";
   return upsertCredentials(up);
 }
 
@@ -85,7 +91,7 @@ export function disableLive(): { written: string[]; path: string } {
 }
 
 /** 라이브 운영 상태 요약(키 노출 0). 대시보드/마법사 표시용. */
-export function liveSettingsStatus(): { masterOn: boolean; env: string; maxNotional: string; allowlist: string; dailyLossLimit: string } {
+export function liveSettingsStatus(): { masterOn: boolean; env: string; maxNotional: string; allowlist: string; dailyLossLimit: string; brokerAllowlist: string; marketGate: boolean } {
   const T = (s?: string) => (s ?? "").trim();
   // env는 **설정된 브로커별**로 표기(적대검증 #18): 종전 BINANCE_ENV 단독 표기는 binance 미설정 KR-only(Toss/KIS/키움)
   //   메인넷 배포를 'testnet'으로 오표시 → 운영자가 실돈인데 testnet으로 오인(testnet-vs-live 인적 가드 무력화). 토스는
@@ -101,6 +107,8 @@ export function liveSettingsStatus(): { masterOn: boolean; env: string; maxNotio
     maxNotional: T(process.env.LIVE_MAX_NOTIONAL) || "통화별 기본(USDT 100 / KRW 150,000)",
     allowlist: T(process.env.LIVE_SYMBOL_ALLOWLIST) || "(전체 허용)",
     dailyLossLimit: T(process.env.LIVE_DAILY_LOSS_LIMIT) || "통화별 기본(USDT 50 / KRW 75,000)",
+    brokerAllowlist: T(process.env.LIVE_BROKER_ALLOWLIST) || "(전체 브로커)",
+    marketGate: T(process.env.QUANT_TICKBOT_MARKET_GATE) === "1",
   };
 }
 

@@ -10,7 +10,7 @@ import { loadCredentials, liveGate, checkLimits, orderHash, mintToken, consumeTo
 import { liveStatus } from "../src/mcp-server/live-handlers.js";
 import { db } from "../src/store/db.js";
 
-const KEYS = ["BINANCE_ENV", "BINANCE_API_KEY", "BINANCE_API_SECRET", "BINANCE_FUTURES_API_KEY", "BINANCE_FUTURES_API_SECRET", "LIVE_TRADING_ENABLED", "LIVE_MAX_NOTIONAL", "LIVE_SYMBOL_ALLOWLIST", "KIS_ENV", "KIS_APPKEY", "KIS_APPSECRET", "KIS_ACCOUNT", "LIVE_DAY_BOUNDARY_OFFSET_MIN"];
+const KEYS = ["BINANCE_ENV", "BINANCE_API_KEY", "BINANCE_API_SECRET", "BINANCE_FUTURES_API_KEY", "BINANCE_FUTURES_API_SECRET", "LIVE_TRADING_ENABLED", "LIVE_MAX_NOTIONAL", "LIVE_SYMBOL_ALLOWLIST", "LIVE_BROKER_ALLOWLIST", "KIS_ENV", "KIS_APPKEY", "KIS_APPSECRET", "KIS_ACCOUNT", "LIVE_DAY_BOUNDARY_OFFSET_MIN"];
 beforeEach(() => { for (const k of KEYS) delete process.env[k]; });
 
 describe("safety gate", () => {
@@ -44,6 +44,25 @@ describe("safety gate", () => {
   it("메인넷 키 + 마스터 ON이면 허용", () => {
     process.env.BINANCE_ENV = "live"; process.env.BINANCE_API_KEY = "k"; process.env.BINANCE_API_SECRET = "s"; process.env.LIVE_TRADING_ENABLED = "true";
     expect(liveGate("binance").allowed).toBe(true);
+  });
+
+  it("#6 브로커 옵트인: LIVE_BROKER_ALLOWLIST 미포함 브로커는 마스터 ON이어도 차단", () => {
+    process.env.BINANCE_ENV = "live"; process.env.BINANCE_API_KEY = "k"; process.env.BINANCE_API_SECRET = "s"; process.env.LIVE_TRADING_ENABLED = "true";
+    process.env.LIVE_BROKER_ALLOWLIST = "toss"; // 토스만 허용 → binance 차단(canary 격리)
+    const g = liveGate("binance");
+    expect(g.allowed).toBe(false);
+    expect(g.reason).toMatch(/미허용|LIVE_BROKER_ALLOWLIST/);
+  });
+
+  it("#6 브로커 옵트인: 목록에 포함된 브로커는 허용", () => {
+    process.env.BINANCE_ENV = "live"; process.env.BINANCE_API_KEY = "k"; process.env.BINANCE_API_SECRET = "s"; process.env.LIVE_TRADING_ENABLED = "true";
+    process.env.LIVE_BROKER_ALLOWLIST = "toss, binance"; // 공백·복수 허용
+    expect(liveGate("binance").allowed).toBe(true);
+  });
+
+  it("#6 브로커 옵트인 미설정이면 전체 허용(하위호환)", () => {
+    process.env.BINANCE_ENV = "live"; process.env.BINANCE_API_KEY = "k"; process.env.BINANCE_API_SECRET = "s"; process.env.LIVE_TRADING_ENABLED = "true";
+    expect(liveGate("binance").allowed).toBe(true); // LIVE_BROKER_ALLOWLIST 미설정
   });
 
   it("하드리밋: 노셔널 캡 초과 차단(메인넷 전용)", () => {

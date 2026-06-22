@@ -105,6 +105,7 @@ export function liveStatus() {
     limits: {
       maxNotional: process.env.LIVE_MAX_NOTIONAL || "무제한(미설정)",
       symbolAllowlist: process.env.LIVE_SYMBOL_ALLOWLIST || "전체(미설정)",
+      brokerAllowlist: process.env.LIVE_BROKER_ALLOWLIST || "전체 브로커(미설정)", // #6 브로커별 라이브 옵트인
       dailyLossLimit: process.env.LIVE_DAILY_LOSS_LIMIT || "없음(미설정)",
       dailyLossLimitUSDT: process.env.LIVE_DAILY_LOSS_LIMIT_USDT || "통화 기본값",
       dailyLossLimitKRW: process.env.LIVE_DAILY_LOSS_LIMIT_KRW || "통화 기본값",

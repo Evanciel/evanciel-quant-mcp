@@ -10,7 +10,8 @@ import { join } from "node:path";
 const KEYS = ["BINANCE_ENV", "BINANCE_API_KEY", "BINANCE_API_SECRET", "BINANCE_FUTURES_API_KEY", "BINANCE_FUTURES_API_SECRET",
   "KIS_ENV", "KIS_APPKEY", "KIS_APPSECRET", "KIS_ACCOUNT", "KIWOOM_ENV", "KIWOOM_APPKEY", "KIWOOM_SECRETKEY", "QUANT_MCP_DATA_DIR",
   "TOSS_ENV", "TOSS_CLIENT_ID", "TOSS_CLIENT_SECRET", "TOSS_ACCOUNT_SEQ",
-  "LIVE_TRADING_ENABLED", "LIVE_MAX_NOTIONAL", "LIVE_SYMBOL_ALLOWLIST", "LIVE_DAILY_LOSS_LIMIT"];
+  "LIVE_TRADING_ENABLED", "LIVE_MAX_NOTIONAL", "LIVE_SYMBOL_ALLOWLIST", "LIVE_DAILY_LOSS_LIMIT",
+  "LIVE_BROKER_ALLOWLIST", "QUANT_TICKBOT_MARKET_GATE"];
 
 let dir: string;
 function clearEnv() { for (const k of KEYS) delete process.env[k]; }
@@ -135,6 +136,24 @@ describe("enableLive / disableLive (라이브 친화 원스톱)", () => {
     C.disableLive();
     expect(process.env.LIVE_TRADING_ENABLED).toBe("false");
     expect(process.env.LIVE_MAX_NOTIONAL).toBe("30");
+  });
+  it("#6 enableLive: 라이브 전환 시 장운영 게이트(QUANT_TICKBOT_MARKET_GATE) 자동 ON", async () => {
+    const C = await load();
+    C.enableLive();
+    expect(process.env.QUANT_TICKBOT_MARKET_GATE).toBe("1"); // 미설정 시 자동 1
+  });
+  it("#6 enableLive: 이미 설정된 QUANT_TICKBOT_MARKET_GATE은 보존(덮어쓰지 않음)", async () => {
+    const C = await load();
+    process.env.QUANT_TICKBOT_MARKET_GATE = "0"; // 명시적으로 꺼둠
+    C.enableLive();
+    expect(process.env.QUANT_TICKBOT_MARKET_GATE).toBe("0"); // 보존
+  });
+  it("#6 enableLive(brokerAllowlist): 브로커 옵트인 저장 + 상태표기", async () => {
+    const C = await load();
+    C.enableLive({ brokerAllowlist: "toss" });
+    expect(process.env.LIVE_BROKER_ALLOWLIST).toBe("toss");
+    expect(C.liveSettingsStatus().brokerAllowlist).toBe("toss");
+    expect(C.liveSettingsStatus().marketGate).toBe(true);
   });
 });
 

@@ -90,7 +90,15 @@ export function liveGate(broker: Broker, market: "spot" | "futures" = "spot"): {
   const masterOn = trim(process.env.LIVE_TRADING_ENABLED) === "true";
   if (c.env === "live") {
     if (!masterOn) return { allowed: false, env: "live", reason: "메인넷 키지만 LIVE_TRADING_ENABLED!=true → 차단(마스터 OFF). 페이퍼로 유지." };
-    return { allowed: true, env: "live", reason: "메인넷 실거래 ON(마스터 스위치 + 메인넷 키)." };
+    // 브로커별 라이브 옵트인(#6): LIVE_BROKER_ALLOWLIST 설정 시 목록 브로커만 라이브 허용(미설정=전체, 하위호환).
+    //   글로벌 마스터 ON이 설정된 모든 브로커를 한꺼번에 무장하는 걸 막는다(예: 토스 canary만 켜고 binance/kis/키움은
+    //   메인넷 키가 있어도 페이퍼 유지). LIVE_SYMBOL_ALLOWLIST(종목)와 직교 — 둘을 함께 쓰면 '브로커 1 + 종목 1'로 좁힘.
+    const brokerAllow = trim(process.env.LIVE_BROKER_ALLOWLIST);
+    if (brokerAllow) {
+      const allowed = brokerAllow.split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
+      if (!allowed.includes(broker)) return { allowed: false, env: "live", reason: `${broker} 라이브 미허용(LIVE_BROKER_ALLOWLIST=${brokerAllow}) → 차단. 페이퍼로 유지.` };
+    }
+    return { allowed: true, env: "live", reason: "메인넷 실거래 ON(마스터 스위치 + 메인넷 키" + (brokerAllow ? ` + 브로커 허용:${broker}).` : ").") };
   }
   // testnet/mock: 키만 있으면 즉시 거래(가짜돈, 안전)
   return { allowed: true, env: c.env, reason: `${c.env} 거래 활성(키 present, 가짜돈).` };
