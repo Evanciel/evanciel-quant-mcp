@@ -85,7 +85,7 @@ const UNKNOWN_MAX_COUNT = (() => {
  *    (포지션 채널=페이퍼로 시작). '모호한' 실패(주문이 나갔을 수도)는 페이퍼 기록 금지 → failed:true 동결.
  *    다음 틱 같은 봉이면 동일 clientOrderId pre-check가 기존 체결을 입양해 이중주문을 막는다(binance 한정).
  */
-async function fillOrder(bot: store.BotRow, side: "buy" | "sell", qty: number, price: number, symbol: string = bot.symbol, opts?: { posLive?: boolean; barIso?: string; entry?: EntryExecPlan; allowKrLimit?: boolean }): Promise<FillResult> {
+async function fillOrder(bot: store.BotRow, side: "buy" | "sell", qty: number, price: number, symbol: string = bot.symbol, opts?: { posLive?: boolean; barIso?: string; entry?: EntryExecPlan; allowKrLimit?: boolean; prevBarIso?: string }): Promise<FillResult> {
   if (bot.mode !== "live") return { live: false, price, note: "페이퍼" };
   if (opts?.posLive === false) return { live: false, price, note: "페이퍼 채널(실주문 없음)" }; // 페이퍼 포지션은 페이퍼로만 변경
   const mustLive = opts?.posLive === true;
@@ -136,15 +136,29 @@ async function fillOrder(bot: store.BotRow, side: "buy" | "sell", qty: number, p
   const symTag = symbol.replace(/[^a-zA-Z0-9]/g, "").slice(0, 12);
   const cid = `o${bot.id.slice(0, 8)}${side[0]}${symTag}${(Number.isFinite(barMs) ? Math.floor(barMs / 1000) : Date.now()).toString(36)}`;
   // pre-check(입양): 이전 틱의 모호 실패 주문이 실제 나가 있으면 재주문 대신 그 체결을 채택.
+  //   ⚠️ 적대검증 #5(직전 봉 유령→이중매수): 진입 주문이 모호실패(거래소엔 체결됐으나 응답 유실)하면 장부=0인데
+  //   거래소엔 실포지션이 남는다. cid가 봉-결정적이라 다음 봉엔 '다른 cid'로 재매수 → 이중 진입. 신규 진입(fresh)일
+  //   때 한해 직전 봉 cid도 조회해 그 체결을 입양(재매수 대신)함으로써 이중매수를 차단한다. (추가매수/스케일인은
+  //   prevBarIso 미전달 → 현재 봉만 검사 = 직전 진입의 이중카운트 방지.)
+  const precheckCids = [cid];
+  if (side === "buy" && opts?.prevBarIso) {
+    const pMs = Date.parse(opts.prevBarIso);
+    const pSec = Number.isFinite(pMs) ? Math.floor(pMs / 1000) : NaN;
+    if (Number.isFinite(pSec) && pSec !== Math.floor(barMs / 1000)) {
+      precheckCids.push(`o${bot.id.slice(0, 8)}${side[0]}${symTag}${pSec.toString(36)}`);
+    }
+  }
   if (Number.isFinite(barMs) && got.adapter.getOrderByClientId) {
-    try {
-      const prev = await got.adapter.getOrderByClientId(symbol, cid);
-      const pv = classifyFillStatus(prev);
-      if (pv === "filled" || pv === "open") {
-        store.insertLog(bot.id, "live", `[${gate.env}] 기존 주문 입양(${pv}, ${prev?.orderId}) — 같은 봉 재시도 이중주문 방지`);
-        return { live: true, price: prev?.price || price, orderId: prev?.orderId, note: `${gate.env} 입양-${pv}`, filledQty: prev?.quantity || nq };
-      }
-    } catch { /* 조회 실패 → 신규 주문 경로 */ }
+    for (const checkCid of precheckCids) {
+      try {
+        const prev = await got.adapter.getOrderByClientId(symbol, checkCid);
+        const pv = classifyFillStatus(prev);
+        if (pv === "filled" || pv === "open") {
+          store.insertLog(bot.id, "live", `[${gate.env}] 기존 주문 입양(${pv}, ${prev?.orderId}, ${checkCid === cid ? "현재봉" : "직전봉"}) — 이중 진입/재주문 방지`);
+          return { live: true, price: prev?.price || price, orderId: prev?.orderId, note: `${gate.env} 입양-${pv}`, filledQty: prev?.quantity || nq };
+        }
+      } catch { /* 조회 실패 → 다음 cid / 신규 주문 경로 */ }
+    }
   }
   audit({ event: "bot_order_attempt", botId: bot.id, broker, env: gate.env, symbol, side, qty: nq, price });
   // 라이브 주문은 거래소 실보유를 바꾼다 → reconcile 계좌 캐시를 무효화(다음 reconcile은 fresh 조회).
@@ -520,10 +534,21 @@ async function forceReconcileOnUnknown(bot: store.BotRow, cur: PaperPosition | n
   let rec = reconcilePositionFromExchange(curQty > 1e-9 ? { qty: curQty } : null, exPos, bot.symbol);
   if (rec.action === "no_exchange_pos" && bot.broker === "binance") rec = reconcilePositionFromExchange(curQty > 1e-9 ? { qty: curQty } : null, exPos, baseAsset(bot.symbol));
   if (rec.action === "adopt" && rec.next) {
+    // 수동보유 오입양 방지(적대검증 #4, binance 경로): getPositions는 계좌 단위라 봇 체결분 + 사용자 수동보유가 섞인다.
+    //   binance는 자기 체결을 즉시 장부 기록(fillConfirmed)하므로 ledger/기존 보유(curQty)가 근거 상한 → 그 이상(=근거 없는
+    //   계좌 보유)은 수동 보유로 간주해 채택 안 함. (KR=reconcileLivePosition adopt는 pending→동결이라 ledger=0 자기체결이
+    //   존재 → 동일 캡 적용 불가, KR pending-order 추적기 후속. 이 함수는 binance 전용=adapterHasOrderQuery.)
+    const ledgerQty = store.liveOpenLedger(bot.id).qty;
+    const adoptQty = Math.min(rec.next.qty, Math.max(curQty, ledgerQty));
+    if (!(adoptQty > 1e-9)) {
+      store.insertLog(bot.id, "gate", `[${live.env}] 강제 reconcile: ${bot.symbol} 거래소 보유 ${rec.next.qty} 있으나 봇 라이브 체결 근거 0(curQty/ledger) → 수동 보유로 간주, 미채택(오입양 방지).`);
+      if (cur) { const next = { ...cur, unknownCount: 0 }; store.setBotPositionState(bot.id, next, true, false); return next; }
+      return cur;
+    }
     const entryAvg = rec.next.entryAvg > 0 ? rec.next.entryAvg : (cur?.entryAvg ?? 0);
-    const adopted: PaperPosition = { status: "open", entryAvg, qty: rec.next.qty, openedAt: cur?.openedAt ?? new Date().toISOString(), live: true, peakPrice: Math.max(cur?.peakPrice ?? entryAvg, entryAvg), protectiveIds: cur?.protectiveIds ?? [], protFails: cur?.protFails ?? 0, reconMisses: 0, unknownCount: 0 };
+    const adopted: PaperPosition = { status: "open", entryAvg, qty: adoptQty, openedAt: cur?.openedAt ?? new Date().toISOString(), live: true, peakPrice: Math.max(cur?.peakPrice ?? entryAvg, entryAvg), protectiveIds: cur?.protectiveIds ?? [], protFails: cur?.protFails ?? 0, reconMisses: 0, unknownCount: 0 };
     store.setBotPositionState(bot.id, adopted, true, false);
-    store.insertLog(bot.id, "live", `[${live.env}] unknown 누적 → 강제 reconcile 채택: ${bot.symbol} 장부 ${curQty}→${rec.next.qty}(평단 ${entryAvg})`);
+    store.insertLog(bot.id, "live", `[${live.env}] unknown 누적 → 강제 reconcile 채택: ${bot.symbol} 장부 ${curQty}→${adoptQty}(거래소 ${rec.next.qty}, 근거상한 ${Math.max(curQty, ledgerQty)}, 평단 ${entryAvg})`);
     return adopted;
   }
   // no_exchange_pos + 라이브 보유: 거래소 부재(주문 미발행 또는 외부청산). reconcileLivePosition의 clear 경로는
@@ -879,7 +904,9 @@ export async function tickBot(botId: string): Promise<{ action: "buy" | "sell" |
       : undefined;
     // 신규 진입 또는 추가매수(스케일인/피라미딩). entryAvg는 엔진 가중평단(want.entryAvg)으로 갱신.
     //   채널: 신규 진입=미정(undefined → 라이브 시도, 명확실패만 페이퍼) / 추가매수=기존 포지션 채널 고정.
-    const fill = await fillOrder(bot, "buy", buyQty, price, bot.symbol, { posLive: curQty > 1e-9 ? curLive : undefined, barIso: lastIso, entry: entryPlan });
+    // 신규 진입(추가매수/스케일인 아님)일 때만 직전 봉 cid 입양 검사(#5 이중매수 차단). 추가매수는 prevBarIso 미전달.
+    const freshEntry = curQty < 1e-9 && !plan.partial;
+    const fill = await fillOrder(bot, "buy", buyQty, price, bot.symbol, { posLive: curQty > 1e-9 ? curLive : undefined, barIso: lastIso, entry: entryPlan, prevBarIso: freshEntry && data.length > 1 ? data[data.length - 2].datetime : undefined });
     // 지정가 접수(호가 등록) → pendingEntry 영속 + hold. 다음 틱부터 resolvePendingEntry가 체결/타임아웃 추적(크래시 생존, cid 멱등).
     if (fill.pending && fill.cid && fill.limitPrice != null && entryPlan?.type === "limit") {
       const marker: PaperPosition = { status: "open", entryAvg: 0, qty: 0, openedAt: cur?.openedAt ?? new Date().toISOString(), live: false,

@@ -61,7 +61,8 @@ buy-side unknown이 unknownCount 미증가(fresh entry는 담을 상태가 null)
 ### #6 [HIGH] 상주 SL/TP 체결 Binance 미reconcile — ⏸ **binance testnet 검증 게이트 후속**
 상주 STOP/TP 체결을 binance 봇이 인지 못함(reconcile skip) → 유령보유·미기록 손익·오버셀. 수정=protectiveIds 잔존 시 getOpenOrders/getPositions 폴링으로 체결 장부화 + 라이브 SELL을 거래소 free로 캡. #1 봇 OCO 라우팅과 함께 testnet 검증.
 
-> ⏸ 후속 3건(#4/#5/#6)은 전부 **라이브 머니패스 변이**라, "검증 불가한 라이브 변이 코드를 미리 넣지 않는다"는 프로젝트 원칙(P1-5/P0-5와 동일)에 따라 testnet/KR-mock 검증을 전제로 설계만 확정·보존. 메인넷 OFF·해당 라이브 키 부재로 현재 노출 없음(latent).
+> **Batch 5 — fail-closed 디펜시브 부분 수정(키 불요·단위테스트)**: #4의 **binance forceReconcile adopt 근거 캡**(adoptQty=min(거래소, max(curQty,ledger)) → 수동보유 오입양 차단; binance는 자기체결을 즉시 장부 기록하므로 캡 안전. KR adopt는 pending→동결로 ledger=0 자기체결이라 동일 캡 적용 불가=KR pending-tracker 후속) + #5의 **fresh-entry 직전 봉 cid 선조회**(유령 입양→이중매수 차단). 둘 다 '더 보수적으로만' 동작하는 fail-closed 가드라 실거래소 거동 가정과 무관하게 안전 → 키 없이 적용·테스트(620 그린).
+> ⏸ **잔여 active-mechanism(testnet/KR-mock 키 필요)**: #4 KR pending-order 추적기 · #5 fresh-entry buy-unknown 카운터+유령 회수 · #6 상주스톱 체결 폴링 reconcile + 라이브 SELL 거래소-free 캡 · #1 봇 OCO 라우팅(상주 TP 복원) · #20 TP intrabar 패리티(#1과 결합). 전부 **실거래소 거동 검증이 전제**(#2 오탐이 증명: 거래소 거동 가정은 틀릴 수 있다 → 새 active 메커니즘은 testnet 없이 배선 금지). 메인넷 OFF·키 부재로 latent.
 
 ## Batch 3 — MEDIUM
 

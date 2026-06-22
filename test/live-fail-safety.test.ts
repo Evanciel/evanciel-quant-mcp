@@ -23,6 +23,8 @@ const calls = vi.hoisted(() => ({
   mode: "ok" as "ok" | "throwAll" | "rejectAll" | "throwProtective",
   getOrderThrows: false,            // true → getOrderByClientId throw → verdict unknown(모호)
   getOrderResult: null as unknown,  // null=not_placed(주문 안 나감 확정)
+  fillCids: null as Set<string> | null, // 설정 시 getOrderByClientId가 이 cid에만 체결 응답(직전봉 입양 #5 테스트용)
+  positions: null as unknown[] | null,  // 설정 시 getPositions가 이 계좌 보유 반환(강제 reconcile #4 테스트용)
 }));
 const klinesMock = vi.hoisted(() => vi.fn());
 
@@ -43,14 +45,15 @@ vi.mock("../src/brokers/index.js", () => ({
         }
         return { orderId: "oid-" + calls.placed.length, symbol: o.symbol, side: o.side, quantity: o.quantity, price: 100, status: "filled" as const, timestamp: new Date() };
       },
-      async getOrderByClientId() {
+      async getOrderByClientId(_sym: string, cid: string) {
         if (calls.getOrderThrows) throw new Error("inquiry unsupported(mock)");
+        if (calls.fillCids && !calls.fillCids.has(cid)) return null; // cid-aware: 지정 cid만 체결로 응답
         return calls.getOrderResult;
       },
       async cancelOrderByClientId() { return true; },
       async cancelOrder() { return true; },
       async getBalance() { return { totalAsset: 100000, cashBalance: 100000, currency: "USDT" }; },
-      async getPositions() { return []; },
+      async getPositions() { return calls.positions ?? []; },
     },
   }),
 }));
@@ -74,7 +77,7 @@ function mkLiveBot(name: string, stopLossPercent: number | null = 5) {
   const comp = store.insertComposite({ name, root_node: buyLowSellHigh, symbol: "BTCUSDT", market: "spot", leverage: 1, stop_loss_percent: stopLossPercent, take_profit_percent: null, tp_ladder: null, scale_in: null, pyramid: null, trailing_stop_percent: null });
   return store.insertBot({ name, symbol: "BTCUSDT", composite_strategy_id: comp.id, mode: "live", capital: 1000, broker: "binance", interval_seconds: 3600 }).id;
 }
-const reset = () => { calls.placed.length = 0; calls.mode = "ok"; calls.getOrderThrows = false; calls.getOrderResult = null; };
+const reset = () => { calls.placed.length = 0; calls.mode = "ok"; calls.getOrderThrows = false; calls.getOrderResult = null; calls.fillCids = null; calls.positions = null; };
 
 describe("P0-1 채널 고정: 라이브 실패의 조용한 페이퍼 기록 금지", () => {
   it("라이브 채널 포지션 매도 실패(not_placed 확정) → 동결: 기록 0 + 포지션 유지", async () => {
@@ -269,5 +272,37 @@ describe("cancelOrderById liveGate(HALT·master OFF 취소 차단)", () => {
     const r = await cancelOrderById({ broker: "binance", symbol: "BTCUSDT", orderId: "x" });
     expect(r.ok).toBe(true);
     expect(r.cancelled).toBe(true);
+  });
+});
+
+// ── 적대검증 #5/#4: 라이브 reconcile/유령 방어(fail-closed 디펜시브) ──
+describe("#5 직전 봉 진입 유령 입양(이중매수 차단) / #4 binance 강제 reconcile 근거 캡", () => {
+  it("#5 fresh entry: 현재봉 cid 미체결 + 직전봉 cid 체결(유령) → 직전봉 입양(신규 매수주문 0)", async () => {
+    reset();
+    const id = mkLiveBot("p05-ghost", null); // 보호주문 없이 진입에 집중
+    const bars = barsAt(50, () => 90); // 가격<95 → 매수 신호
+    klinesMock.mockResolvedValue(bars);
+    const data = bars.slice(0, -1); // tickBot이 보는 윈도우(형성봉 제거)
+    const prevIso = data[data.length - 2].datetime; // tickBot이 prevBarIso로 넘기는 직전 봉
+    const prevCid = `o${id.slice(0, 8)}b${"BTCUSDT".slice(0, 12)}${Math.floor(Date.parse(prevIso) / 1000).toString(36)}`;
+    calls.fillCids = new Set([prevCid]); // 직전 봉 주문만 거래소 체결로 응답(현재 봉 cid는 null)
+    calls.getOrderResult = { orderId: "ghost-prev", price: 90, quantity: 5, status: "filled" };
+    const r = await tickBot(id);
+    expect(r.action).toBe("buy"); // 유령 입양으로 보유 개시
+    expect(String(r.detail)).toContain("입양");
+    expect(calls.placed.filter((o) => o.type === "market" || o.type === "limit")).toHaveLength(0); // 신규 매수 0(이중매수 차단)
+  });
+
+  it("#4 binance forceReconcile adopt를 근거(curQty/ledger)로 캡 — 수동보유 오입양 차단", async () => {
+    reset();
+    const id = mkLiveBot("p04-cap", null);
+    // 봇 라이브 보유 0.01, unknownCount≥MAX → 첫 틱 forceReconcileOnUnknown. trades 0 → ledger 0.
+    store.setBotPositionState(id, { status: "open", entryAvg: 100, qty: 0.01, openedAt: new Date().toISOString(), live: true, unknownCount: 99 } satisfies PaperPosition);
+    calls.positions = [{ symbol: "BTC", quantity: 1.01, avgPrice: 100 }]; // 계좌: 사용자 수동 1 + 봇 0.01
+    klinesMock.mockResolvedValue(barsAt(50, () => 100)); // 무신호 → 보유 유지
+    await tickBot(id);
+    const st = store.getBot(id)?.position_state as PaperPosition;
+    expect(st.qty).toBeCloseTo(0.01, 8); // 거래소 1.01이나 근거(0.01)로 캡
+    expect(st.qty).toBeLessThan(1);       // 수동보유 1 미채택(오입양 차단)
   });
 });
