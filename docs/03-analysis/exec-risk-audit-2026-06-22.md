@@ -46,12 +46,22 @@
 
 ---
 
-## Batch 2 — HIGH 나머지 (reconcile/fill-flow, 진행 예정)
+## Batch 2 — reconcile/window cluster
 
-- **#4** reconcile 수동보유 오입양: reconcileLivePosition/forceReconcileOnUnknown adopt가 ledger 캡 없이 raw 거래소 수량 채택 → 사용자 수동보유 입양·매도. min(ledger/curQty) 캡. ⚠️ KR은 adopt가 자기 체결 인지 경로라 fillOrder 흐름 정밀 확인 후 적용.
-- **#5** Binance 진입 유령 + 봉롤오버 이중매수: buy-side unknown이 unknownCount 미증가 + Binance reconcile skip + boot-seed ledger 의존 → 유령 영구 + 이중매수.
-- **#6** 상주 SL/TP 체결 Binance 미reconcile: 유령보유·미기록 손익·오버셀. protectiveIds 잔존 시 reconcile 또는 getOpenOrders 폴링 + 매도 캡.
-- **#9** (B) 윈도우스크롤 가드 부족(P0-5 interim): trades.length===0만 방어 → 장기보유(진입봉 300봉 밖)에서 윈도우 내 buy+exit 사이클 있으면 전량청산/재매수. 가드 확대 + 스캐너 가드.
+### #9 [HIGH] (B) 윈도우스크롤 가드 — ✅ **수정 완료(Batch 2)**
+진입봉이 300봉 윈도우 밖으로 밀린 장기보유에서 엔진 넷(윈도우만 본)을 잘못 신뢰 → 윈도우 안 buy+exit 사이클을 '청산'으로 오인해 전량 덤핑, 또는 라더 축소분을 풀자본 재진입으로 오인해 초과 재매수(둘 다 trades.length>0이라 기존 가드 미포착). **수정**: `openedAt`이 윈도우의 가장 오래된 봉보다 앞서면(=스크롤아웃) 엔진 넷 보류·보유 유지(SL/TP는 거래소 상주 스톱이 계속 보호). 결정적 판정(엔진은 항상 flat 시작이라 'first action=buy' 휴리스틱은 무용 → 시간 비교로 정확). backtest≡live 유지(라이브 한정 보수 가드, 진입봉 in-window면 정상 동작). 테스트 2. 근본해결=엔진 포지션 시드(P0-5, 후속). 스캐너도 동일 갭(현재 paper-only·라이브 거절)=후속.
+
+### #4 [HIGH] reconcile 수동보유 오입양 — ⏸ **testnet/KR-mock 검증 게이트 후속(naive 캡 금지)**
+reconcileLivePosition(KR)/forceReconcileOnUnknown(binance) adopt가 ledger 캡 없이 raw 거래소 수량 채택 → 사용자 수동보유 입양·매도 위험.
+⚠️ **코드 검증 핵심 발견**: KR 시장가는 `pending`→fillOrder가 **동결(거래 미기록, fillOrder:186-189)** 하고, 봇이 자기 체결을 **reconcile adopt(ledger=0)로 인지**한다. 따라서 finding 제안의 naive `min(ledger,...)` 캡은 **KR 자기체결 인지 자체를 깨뜨린다**(KR 모의 E2E 회귀). binance forceReconcile은 자기체결이 즉시 기록(ledger>0)이라 캡이 안전하지만, KR은 **placed-but-pending 의도수량 추적기**(binance `pendingEntry` 유사)가 있어야 안전 → KR-mock E2E 검증 후 배선(P1-5와 동일 디시플린). 메인넷 OFF·KR 라이브 키 부재로 현재 latent.
+
+### #5 [HIGH] Binance 진입 유령 + 봉롤오버 이중매수 — ⏸ **binance testnet 검증 게이트 후속**
+buy-side unknown이 unknownCount 미증가(fresh entry는 담을 상태가 null) + Binance reconcile skip → 진입 유령 영구 + 다음 봉 다른 cid로 이중매수. 안전 수정=fresh-entry pending 마커 + 직전봉 cid 선조회(머니패스 라이브 변이 → testnet 검증 필요).
+
+### #6 [HIGH] 상주 SL/TP 체결 Binance 미reconcile — ⏸ **binance testnet 검증 게이트 후속**
+상주 STOP/TP 체결을 binance 봇이 인지 못함(reconcile skip) → 유령보유·미기록 손익·오버셀. 수정=protectiveIds 잔존 시 getOpenOrders/getPositions 폴링으로 체결 장부화 + 라이브 SELL을 거래소 free로 캡. #1 봇 OCO 라우팅과 함께 testnet 검증.
+
+> ⏸ 후속 3건(#4/#5/#6)은 전부 **라이브 머니패스 변이**라, "검증 불가한 라이브 변이 코드를 미리 넣지 않는다"는 프로젝트 원칙(P1-5/P0-5와 동일)에 따라 testnet/KR-mock 검증을 전제로 설계만 확정·보존. 메인넷 OFF·해당 라이브 키 부재로 현재 노출 없음(latent).
 
 ## Batch 3 — MEDIUM (개별 재검증 후)
 

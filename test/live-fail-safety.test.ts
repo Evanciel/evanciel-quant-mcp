@@ -229,6 +229,31 @@ describe("nextProtFails — SL(나체)만 비상 추적(현물 SL+TP 오청산 �
   });
 });
 
+// ── 적대검증 #9: (B) 윈도우스크롤 가드 — 진입봉이 300봉 윈도우 밖으로 밀린 장기보유는 엔진 넷(윈도우만 본)을
+//    신뢰하지 않고 보유 유지(전량 덤핑/초과 재매수 차단). SL/TP는 거래소 상주 스톱이 계속 보호. ──
+describe("(B) 윈도우스크롤 가드(P0-5 interim)", () => {
+  it("openedAt < 윈도우 oldest 봉 + 엔진 buy→sell 사이클(넷0) → 청산 안 함(보유 유지)", async () => {
+    reset(); // mode ok(체결 성공) — 가드 없으면 청산됨
+    const id = mkLiveBot("p05-scrolled", 5);
+    // 진입봉이 윈도우(2025 봉들)보다 한참 전(2024) → 스크롤아웃. 엔진은 윈도우 안 buy+sell만 봐 넷=0.
+    store.setBotPositionState(id, { status: "open", entryAvg: 90, qty: 5, openedAt: "2024-06-01T00:00:00.000Z", live: true } satisfies PaperPosition);
+    klinesMock.mockResolvedValue(barsAt(50, (i) => (i < 25 ? 90 : 110))); // 저가 진입→고가 청산 1사이클(엔진 넷 0)
+    const r = await tickBot(id);
+    expect(r.action).toBe("hold");
+    expect(r.detail).toContain("스크롤아웃");
+    expect(store.recentTrades(id, 10).filter((t) => t.side === "sell")).toHaveLength(0); // 전량 덤핑 안 함
+    expect((store.getBot(id)?.position_state as PaperPosition).qty).toBe(5); // 보유 유지
+  });
+  it("openedAt가 윈도우 안이면 정상 청산(엔진 넷 신뢰 — backtest≡live)", async () => {
+    reset();
+    const id = mkLiveBot("p05-inwindow", 5);
+    store.setBotPositionState(id, { status: "open", entryAvg: 90, qty: 5, openedAt: "2025-01-01T10:00:00.000Z", live: true } satisfies PaperPosition);
+    klinesMock.mockResolvedValue(barsAt(50, (i) => (i < 25 ? 90 : 110)));
+    const r = await tickBot(id);
+    expect(r.action).toBe("sell"); // 진입봉 윈도우 내 → 엔진 청산 신호 반영
+  });
+});
+
 // ── 적대검증 #17: cancelOrderById도 liveGate 경유 — 취소는 상주 보호주문(SL/TP)을 벗겨 리스크를 '증가'시킬 수
 //    있으므로 글로벌 킬스위치(LIVE_TRADING_HALT)·마스터 OFF에서 메인넷 취소가 나가면 안 된다. ──
 describe("cancelOrderById liveGate(HALT·master OFF 취소 차단)", () => {

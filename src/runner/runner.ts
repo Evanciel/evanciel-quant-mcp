@@ -826,11 +826,20 @@ export async function tickBot(botId: string): Promise<{ action: "buy" | "sell" |
     return { action: "hold", detail: "비상 청산 실패 — 수동 개입 필요" };
   }
 
-  // (B) 윈도우 안전장치: 보유 중인데 엔진이 윈도우(300봉) 내에서 어떤 체결도 못 봤다면(진입이 윈도우 밖으로 밀려남)
-  //  넷=0을 '청산 신호'로 오인해 전량 덤핑하지 말고 보유 유지(무정보 청산 방지). 실제 청산은 res.trades에 매도가 잡힐 때만.
-  if (curQty > 1e-9 && res.trades.length === 0) {
+  // (B) 윈도우 안전장치(P0-5 interim, audit 적대검증 #9): 엔진은 매 호출 flat에서 300봉 윈도우만 재시뮬한다.
+  //   진입 봉이 윈도우 밖으로 밀린 장기보유 포지션은 엔진이 진입을 못 봐 넷을 잘못 산출 → (a) 윈도우 안에 우연히
+  //   buy+exit 사이클이 있으면 넷=0을 '청산'으로 오인해 전량 덤핑, (b) 라더로 줄였던 포지션을 풀 자본 재진입으로
+  //   오인해 초과 재매수. 두 경우 모두 res.trades.length>0이라 기존 'trades===0' 가드로는 못 막았다(엔진은 항상
+  //   flat에서 시작하므로 'first action=buy' 같은 휴리스틱은 무용 — 진입봉이 윈도우 안이어도 참).
+  //   → 진입시각(openedAt)이 윈도우의 가장 오래된 봉보다 앞서면(=진입봉 스크롤아웃) 엔진 넷을 신뢰하지 않고 보유
+  //   유지: 전략신호 청산·라더 델타는 보류하되, SL/TP는 거래소 상주 스톱이 계속 보호한다(fail-closed=의심 시 보유).
+  //   진입봉이 윈도우 안에 들어올 때만 청산/델타 반영(엔진이 진입을 봐 backtest≡live). 근본해결=엔진 포지션 시드(P0-5 후속).
+  const oldestBarMs = data.length ? Date.parse(data[0].datetime) : NaN;
+  const entryScrolledOut = !!cur?.openedAt && Number.isFinite(oldestBarMs) && Date.parse(cur.openedAt) < oldestBarMs;
+  if (curQty > 1e-9 && (res.trades.length === 0 || entryScrolledOut)) {
     store.setBotPositionState(botId, cur);
-    return { action: "hold", detail: `보유 유지 ${curQty} @ ${price}(윈도우 내 신호 없음, 진입 봉 윈도우 밖 가능)` };
+    const why = res.trades.length === 0 ? "윈도우 내 신호 없음" : "진입봉 윈도우 밖(스크롤아웃) — 엔진 넷 신뢰 보류";
+    return { action: "hold", detail: `보유 유지 ${curQty} @ ${price}(${why}, 상주 스톱이 SL/TP 보호)` };
   }
   // 멱등키는 봉 오픈시각(datetime, 전체 ISO) 기준 — date(YYYY-MM-DD)면 인트라데이 봇이 하루 1회 매매만 기록되어
   // 같은 날 재진입이 영구 차단됨(backtest≠live). 스캐너 경로와 동일 granularity.
