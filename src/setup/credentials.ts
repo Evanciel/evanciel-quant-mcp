@@ -42,7 +42,13 @@ export const BROKER_FIELDS: Record<BrokerKey, { key: string; label: string; secr
 };
 
 /** 라이브 운영 설정(브로커 무관 글로벌). 마법사/대시보드가 키와 함께 저장 → "키만 넣으면 바로 매매" 친화. */
-export const LIVE_SETTING_KEYS = ["LIVE_TRADING_ENABLED", "LIVE_MAX_NOTIONAL", "LIVE_SYMBOL_ALLOWLIST", "LIVE_DAILY_LOSS_LIMIT"] as const;
+export const LIVE_SETTING_KEYS = [
+  "LIVE_TRADING_ENABLED", "LIVE_MAX_NOTIONAL", "LIVE_SYMBOL_ALLOWLIST", "LIVE_DAILY_LOSS_LIMIT",
+  // Task #3: 누적 예산상한('정해진 자금 이내') + 통화별 분리 한도(국내장+미국장 동시 운영). 화이트리스트에 없으면
+  //  enableLive/대시보드 폼으로 저장 불가였음 — 추가해 설정 경로 확보(LIVE_DAILY_LOSS_LIMIT_* 는 checkLimits 가 이미 참조).
+  "LIVE_MAX_TOTAL_NOTIONAL", "LIVE_MAX_TOTAL_NOTIONAL_KRW", "LIVE_MAX_TOTAL_NOTIONAL_USDT",
+  "LIVE_DAILY_LOSS_LIMIT_KRW", "LIVE_DAILY_LOSS_LIMIT_USDT",
+] as const;
 
 /** 알림 설정. ALERT_WEBHOOK_URL은 토큰 포함 → 시크릿 취급(마스킹). ALERT_ENABLED=on/off. */
 export const ALERT_SETTING_KEYS = ["ALERT_WEBHOOK_URL", "ALERT_ENABLED"] as const;

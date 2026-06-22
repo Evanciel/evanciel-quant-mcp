@@ -6,7 +6,7 @@
 import { createHash, randomBytes } from "node:crypto";
 import { appendFileSync } from "node:fs";
 import { join } from "node:path";
-import { dataDir, db } from "../store/db.js";
+import { dataDir, db, liveOpenLedger } from "../store/db.js";
 import type { BrokerCredentials } from "./types.js";
 import { isKrSymbol } from "./krx-tick.js";
 import { evaluatePortfolioRisk, type PortfolioPosition, type CircuitState } from "../core/risk/portfolio.js";
@@ -101,10 +101,11 @@ export function liveGate(broker: Broker, market: "spot" | "futures" = "spot"): {
  * 무제한이 아니라 이 값으로 보호. **통화 인식 필수**: Binance=USDT(달러), 한투/키움=KRW(원).
  * 이전 버그: KRW 봇에 USDT 기준 캡(50)을 적용 → 1주(수만 원)도 거부 → KR 거래 불가. 통화별 분기로 해결.
  */
-export const LIVE_DEFAULTS_BY_CCY: Record<string, { cap: number; dailyLoss: number }> = {
-  USDT: { cap: 100, dailyLoss: 50 },
-  USD: { cap: 100, dailyLoss: 50 },
-  KRW: { cap: 150_000, dailyLoss: 75_000 }, // 소액이되 KRW 주식 1주는 살 수 있게(원 단위)
+export const LIVE_DEFAULTS_BY_CCY: Record<string, { cap: number; dailyLoss: number; totalCap: number }> = {
+  // totalCap(Task #3) = '정해진 자금 이내' 누적 배치자금 상한 기본 예산. 주문당 cap 과 별개(envelope).
+  USDT: { cap: 100, dailyLoss: 50, totalCap: 1_000 },
+  USD: { cap: 100, dailyLoss: 50, totalCap: 1_000 },
+  KRW: { cap: 150_000, dailyLoss: 75_000, totalCap: 1_000_000 }, // 소액이되 KRW 주식 1주는 살 수 있게(원 단위)
 };
 const DEFAULT_CCY = "USDT";
 function ccyDefaults(quoteCurrency?: string) { return LIVE_DEFAULTS_BY_CCY[(quoteCurrency || DEFAULT_CCY).toUpperCase()] ?? LIVE_DEFAULTS_BY_CCY[DEFAULT_CCY]; }
@@ -115,7 +116,7 @@ export const DEFAULT_LIVE_MAX_NOTIONAL = LIVE_DEFAULTS_BY_CCY.USDT.cap;
  * 서버측 하드리밋(LLM 우회 불가 pre-trade). 노셔널캡 + 심볼 allowlist + 일일손실 서킷.
  * quoteCurrency: 주문 통화(USDT/KRW). 명시 캡/서킷 미설정 시 통화별 안전 기본값 적용(KRW 버그 방지).
  */
-export function checkLimits(order: { symbol: string; notional: number; quoteCurrency?: string }): { ok: boolean; reason: string } {
+export function checkLimits(order: { symbol: string; notional: number; quoteCurrency?: string; side?: "buy" | "sell" }): { ok: boolean; reason: string } {
   const liveActive = trim(process.env.LIVE_TRADING_ENABLED) === "true";
   // 하드리밋(노셔널 캡·심볼 allowlist·일일손실 서킷)은 **실제 돈(메인넷=마스터 ON)에서만** 강제(설계 의도 "메인넷=하드리밋").
   // testnet/모의(마스터 OFF)=가짜돈 → 무마찰 샌드박스로 통과. 메인넷 켜면 아래 설정값(또는 통화 기본값)이 자동 복귀.
@@ -143,6 +144,19 @@ export function checkLimits(order: { symbol: string; notional: number; quoteCurr
   const circuit = explicitSep || explicitSingle || (liveActive ? def.dailyLoss : 0);
   const circuitSrc = explicitSep ? `LIVE_DAILY_LOSS_LIMIT_${ccyU}` : explicitSingle ? "LIVE_DAILY_LOSS_LIMIT" : `${ccyU} 기본값`;
   if (circuit > 0 && dl <= -Math.abs(circuit)) return { ok: false, reason: `${ccyU} 일일 손실 ${dl} ≤ 서킷 -${circuit}(${circuitSrc}) → 거래중단` };
+  // 누적 예산상한(Task #3) — 신규 *매수*만. '정해진 자금 이내' 강제: 주문당 캡(위) 이하로 N회 반복하면 합계가
+  //  무제한이라 예산을 초과 매수할 수 있고, 일일손실 서킷은 *실현손실*만 봐서 '자본을 다 써서 보유로 묶이는'
+  //  시나리오를 못 막는다. 그래서 현재 배치자금(열린 라이브 포지션 원가)+이번 주문 ≤ 예산 이어야 신규 매수 허용.
+  //  매도는 배치액 감소라 면제. side 미지정(보호주문 등 reduceOnly)도 면제(undefined !== "buy").
+  if (order.side === "buy") {
+    const explicitTotal = posNum(ccyU === "KRW" ? process.env.LIVE_MAX_TOTAL_NOTIONAL_KRW : process.env.LIVE_MAX_TOTAL_NOTIONAL_USDT) || posNum(process.env.LIVE_MAX_TOTAL_NOTIONAL);
+    const totalCap = explicitTotal || (liveActive ? def.totalCap : 0);
+    if (totalCap > 0) {
+      const deployed = liveDeployedNotional(order.quoteCurrency);
+      if (deployed + order.notional > totalCap)
+        return { ok: false, reason: `${ccyU} 배치자금 ${Math.round(deployed)}+${Math.round(order.notional)} > 예산 ${totalCap}(LIVE_MAX_TOTAL_NOTIONAL${explicitTotal ? "" : ` ${ccyU} 기본값`}) → '정해진 자금 이내' 신규매수 차단` };
+    }
+  }
   return { ok: true, reason: "ok" };
 }
 
@@ -329,4 +343,28 @@ function sumTossPnlSince(since: string, ccy: "KRW" | "USD"): number {
     if ((ccy === "KRW" && kr) || (ccy === "USD" && !kr)) s += row.pnl;
   }
   return s;
+}
+
+/**
+ * Task #3: 통화별 '현재 배치된 자금' = 열린 라이브 포지션 원가(liveOpenLedger.qty × avgPrice) 합. checkLimits 의
+ * 누적 예산상한('정해진 자금 이내')에서 사용한다 — 주문당 캡만으론 캡 이하 반복매수로 예산을 초과하므로, 신규 매수 전
+ * (배치자금 + 이번 주문) ≤ 예산 인지 검사. 통화 버킷은 quoteCurrencyFor(broker,symbol) 단일 진실원으로 분리(토스
+ * KR=KRW / US=USD). is_paper=0 거래 기록이 있는 봇만 본다. ★조회 실패 = POSITIVE_INFINITY(fail-closed: 배치액
+ * 불명 → 예산이 가득 찬 것으로 간주해 신규 매수 차단 — dailyRealizedLoss 의 NEGATIVE_INFINITY 와 부호 반대).
+ */
+export function liveDeployedNotional(quoteCurrency?: string): number {
+  try {
+    const ccy = (quoteCurrency || DEFAULT_CCY).toUpperCase();
+    const bots = db().prepare(`SELECT DISTINCT b.id id, b.broker broker, b.symbol sym FROM bots b JOIN trades t ON t.bot_id=b.id WHERE t.is_paper=0`).all() as { id: string; broker: string; sym: string }[];
+    let sum = 0;
+    for (const b of bots) {
+      if (quoteCurrencyFor(b.broker as Broker, b.sym).toUpperCase() !== ccy) continue;
+      const led = liveOpenLedger(b.id);
+      if (led.qty > 0 && led.avgPrice > 0) sum += led.qty * led.avgPrice;
+    }
+    return sum;
+  } catch (e) {
+    try { process.stderr.write(`[quant-mcp] liveDeployedNotional 조회 실패 → 예산 fail-closed(신규매수 차단): ${e instanceof Error ? e.message : e}\n`); } catch { /* stderr 실패 무시 */ }
+    return Number.POSITIVE_INFINITY;
+  }
 }

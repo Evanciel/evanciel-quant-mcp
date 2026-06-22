@@ -138,7 +138,7 @@ export async function placeOrder(a: {
     if (type !== "market") return { ok: false, error: "금액기반 주문은 시장가(market)만 가능합니다." };
     if (quoteCurrencyFor(broker, a.symbol) !== "USD") return { ok: false, error: "금액기반 주문은 US 종목만 가능합니다(KR 불가)." };
     const notional = a.orderAmount;
-    const lim = checkLimits({ symbol: a.symbol, notional, quoteCurrency: "USD" });
+    const lim = checkLimits({ symbol: a.symbol, notional, quoteCurrency: "USD", side: a.side });
     if (!lim.ok) return { ok: false, error: `하드리밋 차단: ${lim.reason}` };
     const hash = orderHash({ broker, market, symbol: a.symbol, side: a.side, type, orderAmount: a.orderAmount, env: gate.env });
     if (!a.confirmToken) {
@@ -177,7 +177,7 @@ export async function placeOrder(a: {
   }
   if (!(effQty > 0)) return { ok: false, error: "정규화 후 수량 0(최소수량/스텝 미달)." };
   const notional = price * effQty;
-  const lim = checkLimits({ symbol: a.symbol, notional, quoteCurrency });
+  const lim = checkLimits({ symbol: a.symbol, notional, quoteCurrency, side: a.side });
   if (!lim.ok) return { ok: false, error: `하드리밋 차단: ${lim.reason}` };
 
   // 2단계 확인토큰(fail-CLOSED). INV-1: 해시 바인딩 수량 = 프리뷰 수량 = 실제 주문 수량(effQty).

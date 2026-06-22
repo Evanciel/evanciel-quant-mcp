@@ -126,7 +126,7 @@ async function fillOrder(bot: store.BotRow, side: "buy" | "sell", qty: number, p
   }
   if (!(nq > 0)) { store.insertLog(bot.id, "gate", `수량 정규화/잔고 0(${qty}→${nq})`); return blocked("수량0"); }
   // ① 하드리밋(노셔널캡 + allowlist + 일일손실 서킷)을 '최종 제출 수량(nq)'으로 검증 — minNotional 상향분이 캡 넘으면 차단(검증==제출).
-  const lim = checkLimits({ symbol, notional: price * nq, quoteCurrency });
+  const lim = checkLimits({ symbol, notional: price * nq, quoteCurrency, side }); // side: 누적 예산상한(Task #3)은 매수만
   if (!lim.ok) { store.insertLog(bot.id, "gate", `하드리밋(${symbol} ${lim.reason})`); return blocked("리밋"); }
   // clientOrderId ≤36자([a-zA-Z0-9-_]): botId 앞 8자 + side + symbol태그 + base36 봉시각. 봉 기준 '결정적' cid라
   // 같은 봉의 재시도가 같은 cid를 재사용 → 모호실패 후 재시도 시 거래소측 기존 주문을 조회/입양 가능(이중주문 방지).
