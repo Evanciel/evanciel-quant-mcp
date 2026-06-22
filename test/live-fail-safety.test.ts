@@ -19,8 +19,8 @@ process.env.BINANCE_API_SECRET = "y".repeat(64);
 
 const calls = vi.hoisted(() => ({
   placed: [] as Array<Record<string, unknown>>,
-  // ok=전부 체결 / throwAll=전 주문 throw / rejectAll=시장가 rejected 반환 / throwProtective=보호주문만 throw
-  mode: "ok" as "ok" | "throwAll" | "rejectAll" | "throwProtective",
+  // ok=전부 체결 / throwAll=전 주문 throw / rejectAll=시장가 rejected 반환 / throwProtective=보호주문만 throw / throwTpOnly=TP leg만 throw(SL 성공)
+  mode: "ok" as "ok" | "throwAll" | "rejectAll" | "throwProtective" | "throwTpOnly",
   getOrderThrows: false,            // true → getOrderByClientId throw → verdict unknown(모호)
   getOrderResult: null as unknown,  // null=not_placed(주문 안 나감 확정)
   fillCids: null as Set<string> | null, // 설정 시 getOrderByClientId가 이 cid에만 체결 응답(직전봉 입양 #5 테스트용)
@@ -40,6 +40,8 @@ vi.mock("../src/brokers/index.js", () => ({
         const prot = o.type === "stop_market" || o.type === "take_profit_market";
         if (calls.mode === "throwAll") throw new Error("network boom(mock)");
         if (calls.mode === "throwProtective" && prot) throw new Error("prot-fail(mock)");
+        if (calls.mode === "throwTpOnly" && o.type === "take_profit_market") throw new Error("tp-fail(mock)"); // SL(stop_market)은 성공, TP만 실패
+
         if (calls.mode === "rejectAll" && !prot) {
           return { orderId: "", symbol: o.symbol, side: o.side, quantity: o.quantity, price: 0, status: "rejected" as const, timestamp: new Date() };
         }
@@ -73,8 +75,8 @@ const buyLowSellHigh: StrategyNode = { id: "l", type: "leaf", name: "bls", strat
     { id: "se", action: "sell", conditions: [{ id: "c2", indicator: "sma", params: { period: 1 }, operator: "gt", value: 105 }], quantityPercent: 100 },
   ], isActive: true, createdAt: new Date(), updatedAt: new Date() } };
 
-function mkLiveBot(name: string, stopLossPercent: number | null = 5) {
-  const comp = store.insertComposite({ name, root_node: buyLowSellHigh, symbol: "BTCUSDT", market: "spot", leverage: 1, stop_loss_percent: stopLossPercent, take_profit_percent: null, tp_ladder: null, scale_in: null, pyramid: null, trailing_stop_percent: null });
+function mkLiveBot(name: string, stopLossPercent: number | null = 5, takeProfitPercent: number | null = null) {
+  const comp = store.insertComposite({ name, root_node: buyLowSellHigh, symbol: "BTCUSDT", market: "spot", leverage: 1, stop_loss_percent: stopLossPercent, take_profit_percent: takeProfitPercent, tp_ladder: null, scale_in: null, pyramid: null, trailing_stop_percent: null });
   return store.insertBot({ name, symbol: "BTCUSDT", composite_strategy_id: comp.id, mode: "live", capital: 1000, broker: "binance", interval_seconds: 3600 }).id;
 }
 const reset = () => { calls.placed.length = 0; calls.mode = "ok"; calls.getOrderThrows = false; calls.getOrderResult = null; calls.fillCids = null; calls.positions = null; };
@@ -255,6 +257,34 @@ describe("(B) 윈도우스크롤 가드(P0-5 interim)", () => {
     const r = await tickBot(id);
     expect(r.action).toBe("sell"); // 진입봉 윈도우 내 → 엔진 청산 신호 반영
   });
+
+  it("off-by-one 경계(#9): 진입봉이 윈도우 첫 봉 '직전'(openedAt=oldestBar open)이면 스크롤아웃 즉시 발동(첫 틱 오청산 차단)", async () => {
+    reset();
+    const id = mkLiveBot("p09-boundary", 5); // interval 3600s
+    // 진입 봉 = data[0] 직전 봉(2024-12-31T23:00). 체결 openedAt = 그 봉 close = data[0] open(2025-01-01T00:00).
+    //   종전 `openedAt < oldestBar`(00:00<00:00=false)면 미발동→오청산. intervalMs 보정(openedAt-1봉<oldestBar)으로 발동→보유유지.
+    store.setBotPositionState(id, { status: "open", entryAvg: 90, qty: 5, openedAt: "2025-01-01T00:00:00.000Z", live: true } satisfies PaperPosition);
+    klinesMock.mockResolvedValue(barsAt(50, (i) => (i < 25 ? 90 : 110))); // 엔진 넷 0(buy+sell) — 종전이면 전량청산
+    const r = await tickBot(id);
+    expect(r.action).toBe("hold"); // 스크롤아웃 즉시 발동 → 보유 유지(오청산 차단)
+    expect(store.recentTrades(id, 10).filter((t) => t.side === "sell")).toHaveLength(0);
+    expect((store.getBot(id)?.position_state as PaperPosition).qty).toBe(5);
+  });
+});
+
+// ── 적대검증 #1 통합: 현물 SL+TP에서 TP leg만 실패해도 건강한(SL 정상) 포지션을 비상청산하지 않는다(엔드투엔드) ──
+describe("#1 통합: TP-only 실패는 비상청산 안 함", () => {
+  it("SL 성공·TP 실패 반복 → protFails 0 유지·비상 시장가 청산 없음·포지션 유지", async () => {
+    reset(); calls.mode = "throwTpOnly"; // SL(stop_market) 성공, TP(take_profit_market)만 throw
+    const id = mkLiveBot("p01-tponly", 5, 10); // SL 5% + TP 10%
+    klinesMock.mockResolvedValue(barsAt(50, () => 90)); // 진입 후 보유(SL 85.5·TP 99 미발동)
+    const r1 = await tickBot(id);
+    expect(r1.action).toBe("buy");
+    expect((store.getBot(id)?.position_state as PaperPosition).protFails ?? 0).toBe(0); // TP-only 실패는 비상 카운터 미증가
+    for (let i = 0; i < 4; i++) { const r = await tickBot(id); expect(r.action).not.toBe("sell"); } // 여러 틱 — 비상청산 없음(종전 버그면 누적→청산)
+    expect(store.getBot(id)?.position_state).not.toBeNull(); // 포지션 유지
+    expect(store.recentTrades(id, 20).filter((t) => String(t.reason).includes("비상"))).toHaveLength(0);
+  });
 });
 
 // ── 적대검증 #17: cancelOrderById도 liveGate 경유 — 취소는 상주 보호주문(SL/TP)을 벗겨 리스크를 '증가'시킬 수
@@ -273,24 +303,34 @@ describe("cancelOrderById liveGate(HALT·master OFF 취소 차단)", () => {
     expect(r.ok).toBe(true);
     expect(r.cancelled).toBe(true);
   });
+  it("메인넷 키 + master OFF → 취소 차단(#17 헤드라인: 상주 보호주문 박탈 방지)", async () => {
+    reset();
+    const savedEnv = process.env.BINANCE_ENV;
+    process.env.BINANCE_ENV = "live"; delete process.env.LIVE_TRADING_ENABLED; // 메인넷 키, 마스터 OFF
+    const r = await cancelOrderById({ broker: "binance", symbol: "BTCUSDT", orderId: "x" });
+    process.env.BINANCE_ENV = savedEnv; // 복구(다른 테스트 격리)
+    expect(r.ok).toBe(false);
+    expect(String(r.error)).toContain("마스터"); // 마스터 OFF 차단 사유
+  });
 });
 
-// ── 적대검증 #5/#4: 라이브 reconcile/유령 방어(fail-closed 디펜시브) ──
-describe("#5 직전 봉 진입 유령 입양(이중매수 차단) / #4 binance 강제 reconcile 근거 캡", () => {
-  it("#5 fresh entry: 현재봉 cid 미체결 + 직전봉 cid 체결(유령) → 직전봉 입양(신규 매수주문 0)", async () => {
+// ── 적대검증 #4/#5: 라이브 reconcile/유령 방어(fail-closed 디펜시브) ──
+describe("#4 binance 강제 reconcile 근거 캡 / #5 직전봉 오입양 회귀가드", () => {
+  it("#5 후속(라운드트립 회귀): 직전 봉 cid가 거래소에 체결돼 있어도 현재 봉 fresh 매수는 신규 주문(직전봉 오입양 금지)", async () => {
+    // prevBar 입양은 정상 라운드트립(매수→청산→재매수)을 유령으로 오입양하는 회귀를 만들어 되돌렸다(같은 봉 cid만 입양).
+    //   이 테스트는 'prevBar 입양'이 재도입되면 실패한다(현재 동작=신규 주문). reset();
     reset();
-    const id = mkLiveBot("p05-ghost", null); // 보호주문 없이 진입에 집중
-    const bars = barsAt(50, () => 90); // 가격<95 → 매수 신호
+    const id = mkLiveBot("p05-roundtrip", null);
+    const bars = barsAt(50, () => 90);
     klinesMock.mockResolvedValue(bars);
-    const data = bars.slice(0, -1); // tickBot이 보는 윈도우(형성봉 제거)
-    const prevIso = data[data.length - 2].datetime; // tickBot이 prevBarIso로 넘기는 직전 봉
+    const data = bars.slice(0, -1);
+    const prevIso = data[data.length - 2].datetime;
     const prevCid = `o${id.slice(0, 8)}b${"BTCUSDT".slice(0, 12)}${Math.floor(Date.parse(prevIso) / 1000).toString(36)}`;
-    calls.fillCids = new Set([prevCid]); // 직전 봉 주문만 거래소 체결로 응답(현재 봉 cid는 null)
-    calls.getOrderResult = { orderId: "ghost-prev", price: 90, quantity: 5, status: "filled" };
+    calls.fillCids = new Set([prevCid]); // 직전 봉 cid만 거래소 체결로 존재(=이미 청산된 정상 라운드트립 진입)
+    calls.getOrderResult = { orderId: "prev-roundtrip", price: 90, quantity: 5, status: "filled" };
     const r = await tickBot(id);
-    expect(r.action).toBe("buy"); // 유령 입양으로 보유 개시
-    expect(String(r.detail)).toContain("입양");
-    expect(calls.placed.filter((o) => o.type === "market" || o.type === "limit")).toHaveLength(0); // 신규 매수 0(이중매수 차단)
+    expect(r.action).toBe("buy"); // 합법 재진입
+    expect(calls.placed.filter((o) => o.type === "market")).toHaveLength(1); // 직전봉 입양이 아니라 '신규 시장가 매수'(prevBar 오입양 금지 회귀가드)
   });
 
   it("#4 binance forceReconcile adopt를 근거(curQty/ledger)로 캡 — 수동보유 오입양 차단", async () => {
@@ -304,5 +344,17 @@ describe("#5 직전 봉 진입 유령 입양(이중매수 차단) / #4 binance �
     const st = store.getBot(id)?.position_state as PaperPosition;
     expect(st.qty).toBeCloseTo(0.01, 8); // 거래소 1.01이나 근거(0.01)로 캡
     expect(st.qty).toBeLessThan(1);       // 수동보유 1 미채택(오입양 차단)
+  });
+
+  it("#4 reject 분기: 봇 라이브 체결 근거 0(curQty 0 + ledger 0) + 거래소 보유>0 → 수동보유 미채택", async () => {
+    reset();
+    const id = mkLiveBot("p04-reject", null);
+    // 근거 0: 로컬 보유 0 + 거래내역 0(ledger 0). unknownCount≥MAX로 forceReconcile 진입.
+    store.setBotPositionState(id, { status: "open", entryAvg: 0, qty: 0, openedAt: new Date().toISOString(), live: true, unknownCount: 99 } satisfies PaperPosition);
+    calls.positions = [{ symbol: "BTC", quantity: 1.01, avgPrice: 100 }]; // 거래소엔 사용자 수동보유만
+    klinesMock.mockResolvedValue(barsAt(50, () => 100)); // 무신호
+    await tickBot(id);
+    const st = store.getBot(id)?.position_state as PaperPosition | null;
+    expect(st == null || !(st.qty > 1e-9)).toBe(true); // 거래소 1.01 미채택(근거 0 → 수동보유로 간주)
   });
 });

@@ -80,5 +80,20 @@ buy-side unknown이 unknownCount 미증가(fresh entry는 담을 상태가 null)
 
 ---
 
+## Batch 6 — 자가 적대검증 라운드(shipped 수정을 다시 공격)
+
+gentle 울트라코드 검증 워크플로우(8 에이전트)로 Batch 1~5 수정을 적대 재검토 → 1/8 영역만 clean, **내 수정에서 실버그 5건 + fake-green 테스트 다수 색출**. 검증이 핵심이었다(#2처럼 '내가 옳다고 가정한 것'을 깨는 단계).
+
+수정한 실버그(코드):
+- **#9 off-by-one(HIGH)**: `openedAt < oldestBar` 직접비교가 진입봉 스크롤아웃 '첫 틱'을 1봉 놓쳐(openedAt은 진입봉 '닫힌 뒤' 기록=≈다음봉 오픈) 그 틱에 오청산 가능 → `(openedAt − intervalMs) < oldestBar`로 보정(entryBar.open 기준).
+- **#5 revert**: 직전 봉 cid 입양이 정상 라운드트립 진입(매수→청산→재매수=스캘퍼 흔함)을 유령으로 오입양 → 합법 재진입 누락+유령 포지션. 직전봉 입양 철회(같은 봉 cid만), 회귀가드 테스트 추가. #5 유령회수는 testnet 후속.
+- **#9 트레일링 동결**: (B)가드 early-return이 트레일링 재동기화·protFails 갱신을 막아 장기보유 트레일링이 고정스탑으로 무음 퇴화 → 가드 분기에서 트레일링 재동기화 유지.
+- **#9 bootSeed**: 크래시 복구 adopt가 openedAt=now로 (B)가드를 무력화(스크롤아웃 미탐지) → 과거 센티넬(epoch0)로 fail-closed 보유.
+- **#4 캡 binance 한정**: adopt 캡이 브로커 무관 적용(주석은 'binance 전용' 주장) → KR own-fill을 수동보유로 오인할 잠재 회귀 → adapterHasOrderQuery(=binance) 명시 분기, KR은 raw 채택.
+
+추가 회귀가드 테스트: #9 off-by-one 경계, #1 TP-only 통합(SL 정상·TP만 실패→비상청산 없음), #5 라운드트립 오입양 금지, #16 sha256 형식 단언, #17 master-OFF 취소, #4 reject 분기. tsc 0, vitest 624.
+
+> 잔여 테스트커버리지 갭(코드는 정상, 회귀가드만 부재): #15 getOpenOco fetch-stub 단위테스트 · #12 getCandles tickBot throw 경로 · #10 /api/credentials authed-POST 통합(HTTP 하니스). 후속.
+
 ## 불변
 메인넷 실거래 OFF 유지. 전 수정 backtest≡live·fail-closed 보존. 각 배치 tsc 0 + vitest 그린 후 커밋(author=eshurei 고정).

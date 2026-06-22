@@ -85,7 +85,7 @@ const UNKNOWN_MAX_COUNT = (() => {
  *    (포지션 채널=페이퍼로 시작). '모호한' 실패(주문이 나갔을 수도)는 페이퍼 기록 금지 → failed:true 동결.
  *    다음 틱 같은 봉이면 동일 clientOrderId pre-check가 기존 체결을 입양해 이중주문을 막는다(binance 한정).
  */
-async function fillOrder(bot: store.BotRow, side: "buy" | "sell", qty: number, price: number, symbol: string = bot.symbol, opts?: { posLive?: boolean; barIso?: string; entry?: EntryExecPlan; allowKrLimit?: boolean; prevBarIso?: string }): Promise<FillResult> {
+async function fillOrder(bot: store.BotRow, side: "buy" | "sell", qty: number, price: number, symbol: string = bot.symbol, opts?: { posLive?: boolean; barIso?: string; entry?: EntryExecPlan; allowKrLimit?: boolean }): Promise<FillResult> {
   if (bot.mode !== "live") return { live: false, price, note: "페이퍼" };
   if (opts?.posLive === false) return { live: false, price, note: "페이퍼 채널(실주문 없음)" }; // 페이퍼 포지션은 페이퍼로만 변경
   const mustLive = opts?.posLive === true;
@@ -135,30 +135,19 @@ async function fillOrder(bot: store.BotRow, side: "buy" | "sell", qty: number, p
   const barMs = opts?.barIso ? Date.parse(opts.barIso) : NaN;
   const symTag = symbol.replace(/[^a-zA-Z0-9]/g, "").slice(0, 12);
   const cid = `o${bot.id.slice(0, 8)}${side[0]}${symTag}${(Number.isFinite(barMs) ? Math.floor(barMs / 1000) : Date.now()).toString(36)}`;
-  // pre-check(입양): 이전 틱의 모호 실패 주문이 실제 나가 있으면 재주문 대신 그 체결을 채택.
-  //   ⚠️ 적대검증 #5(직전 봉 유령→이중매수): 진입 주문이 모호실패(거래소엔 체결됐으나 응답 유실)하면 장부=0인데
-  //   거래소엔 실포지션이 남는다. cid가 봉-결정적이라 다음 봉엔 '다른 cid'로 재매수 → 이중 진입. 신규 진입(fresh)일
-  //   때 한해 직전 봉 cid도 조회해 그 체결을 입양(재매수 대신)함으로써 이중매수를 차단한다. (추가매수/스케일인은
-  //   prevBarIso 미전달 → 현재 봉만 검사 = 직전 진입의 이중카운트 방지.)
-  const precheckCids = [cid];
-  if (side === "buy" && opts?.prevBarIso) {
-    const pMs = Date.parse(opts.prevBarIso);
-    const pSec = Number.isFinite(pMs) ? Math.floor(pMs / 1000) : NaN;
-    if (Number.isFinite(pSec) && pSec !== Math.floor(barMs / 1000)) {
-      precheckCids.push(`o${bot.id.slice(0, 8)}${side[0]}${symTag}${pSec.toString(36)}`);
-    }
-  }
+  // pre-check(입양): 같은 봉의 모호 실패 주문이 실제 나가 있으면 재주문 대신 그 체결을 채택(같은 봉 cid 한정).
+  //   ⚠️ 적대검증 #5 후속: '직전 봉' cid로 확장하면 정상 완료된 라운드트립 진입(매수→청산→재매수, 스캘퍼/평균회귀에서 흔함)을
+  //   유령으로 오입양해 합법 재진입을 누락하고 유령 포지션을 만든다(거동 가정 오류=#2 교훈). 유령↔이미-청산된-실체결 구분은
+  //   거래소 거동 검증이 필요 → 직전봉 입양/유령 회수는 testnet-게이트 active-mechanism(#5)으로 보류. 여기선 같은 봉만(원래 안전 동작).
   if (Number.isFinite(barMs) && got.adapter.getOrderByClientId) {
-    for (const checkCid of precheckCids) {
-      try {
-        const prev = await got.adapter.getOrderByClientId(symbol, checkCid);
-        const pv = classifyFillStatus(prev);
-        if (pv === "filled" || pv === "open") {
-          store.insertLog(bot.id, "live", `[${gate.env}] 기존 주문 입양(${pv}, ${prev?.orderId}, ${checkCid === cid ? "현재봉" : "직전봉"}) — 이중 진입/재주문 방지`);
-          return { live: true, price: prev?.price || price, orderId: prev?.orderId, note: `${gate.env} 입양-${pv}`, filledQty: prev?.quantity || nq };
-        }
-      } catch { /* 조회 실패 → 다음 cid / 신규 주문 경로 */ }
-    }
+    try {
+      const prev = await got.adapter.getOrderByClientId(symbol, cid);
+      const pv = classifyFillStatus(prev);
+      if (pv === "filled" || pv === "open") {
+        store.insertLog(bot.id, "live", `[${gate.env}] 기존 주문 입양(${pv}, ${prev?.orderId}) — 같은 봉 재시도 이중주문 방지`);
+        return { live: true, price: prev?.price || price, orderId: prev?.orderId, note: `${gate.env} 입양-${pv}`, filledQty: prev?.quantity || nq };
+      }
+    } catch { /* 조회 실패 → 신규 주문 경로 */ }
   }
   audit({ event: "bot_order_attempt", botId: bot.id, broker, env: gate.env, symbol, side, qty: nq, price });
   // 라이브 주문은 거래소 실보유를 바꾼다 → reconcile 계좌 캐시를 무효화(다음 reconcile은 fresh 조회).
@@ -497,7 +486,10 @@ async function bootSeedLivePosition(bot: store.BotRow, cur: PaperPosition | null
     const entryAvg = rec.next.entryAvg > 0 ? rec.next.entryAvg : ledger.avgPrice;
     const adopted: PaperPosition = {
       status: "open", entryAvg, qty,
-      openedAt: new Date().toISOString(), live: true,
+      // 진입시각 불명(크래시/재시작 복구) → 과거 센티넬(epoch 0)로 기록. (B) 윈도우스크롤 가드가 이 포지션을 '스크롤아웃=보유유지'로
+      //   fail-closed 처리(엔진 윈도우-블라인드 넷 불신, 상주 SL/TP가 보호) — openedAt=now면 가드가 '윈도우 내'로 오인해 장기보유를
+      //   오청산할 수 있다(적대검증 #9 후속). 실제 진입봉이 윈도우 안이어도 보수적 보유가 안전(엔진 시드=P0-5 전까지).
+      openedAt: new Date(0).toISOString(), live: true,
       peakPrice: entryAvg, protectiveIds: [], protFails: 0, reconMisses: 0,
     };
     store.setBotPositionState(bot.id, adopted, true, false);
@@ -534,21 +526,27 @@ async function forceReconcileOnUnknown(bot: store.BotRow, cur: PaperPosition | n
   let rec = reconcilePositionFromExchange(curQty > 1e-9 ? { qty: curQty } : null, exPos, bot.symbol);
   if (rec.action === "no_exchange_pos" && bot.broker === "binance") rec = reconcilePositionFromExchange(curQty > 1e-9 ? { qty: curQty } : null, exPos, baseAsset(bot.symbol));
   if (rec.action === "adopt" && rec.next) {
-    // 수동보유 오입양 방지(적대검증 #4, binance 경로): getPositions는 계좌 단위라 봇 체결분 + 사용자 수동보유가 섞인다.
-    //   binance는 자기 체결을 즉시 장부 기록(fillConfirmed)하므로 ledger/기존 보유(curQty)가 근거 상한 → 그 이상(=근거 없는
-    //   계좌 보유)은 수동 보유로 간주해 채택 안 함. (KR=reconcileLivePosition adopt는 pending→동결이라 ledger=0 자기체결이
-    //   존재 → 동일 캡 적용 불가, KR pending-order 추적기 후속. 이 함수는 binance 전용=adapterHasOrderQuery.)
-    const ledgerQty = store.liveOpenLedger(bot.id).qty;
-    const adoptQty = Math.min(rec.next.qty, Math.max(curQty, ledgerQty));
-    if (!(adoptQty > 1e-9)) {
-      store.insertLog(bot.id, "gate", `[${live.env}] 강제 reconcile: ${bot.symbol} 거래소 보유 ${rec.next.qty} 있으나 봇 라이브 체결 근거 0(curQty/ledger) → 수동 보유로 간주, 미채택(오입양 방지).`);
-      if (cur) { const next = { ...cur, unknownCount: 0 }; store.setBotPositionState(bot.id, next, true, false); return next; }
-      return cur;
+    // 수동보유 오입양 방지(적대검증 #4) — **binance 전용 캡**(가드를 코드로 강제). getPositions는 계좌 단위라 봇 체결분 +
+    //   사용자 수동보유가 섞인다. binance는 자기 체결을 즉시 장부 기록(fillConfirmed)하므로 ledger/curQty가 근거 상한 →
+    //   그 이상(근거 없는 계좌 보유)은 수동보유로 간주해 미채택. ⚠️ KR(kis/키움/toss)은 시장가 pending→동결이라 ledger=0
+    //   자기체결이 존재 → 동일 캡을 적용하면 KR own-fill을 수동보유로 오인·미채택(인지 붕괴)한다. forceReconcile은 브로커
+    //   무관 호출되므로(unknownCount 누적) KR이 도달할 수 있어, 캡을 adapterHasOrderQuery(=binance)로 **명시 분기**한다
+    //   (KR은 종전대로 raw 채택; KR pending-order 추적기는 testnet/KR-mock 후속).
+    const adapterHasOrderQuery = (live.adapter as { getOrderByClientId?: unknown }).getOrderByClientId !== undefined;
+    let adoptQty = rec.next.qty;
+    if (adapterHasOrderQuery) {
+      const ledgerQty = store.liveOpenLedger(bot.id).qty;
+      adoptQty = Math.min(rec.next.qty, Math.max(curQty, ledgerQty));
+      if (!(adoptQty > 1e-9)) {
+        store.insertLog(bot.id, "gate", `[${live.env}] 강제 reconcile: ${bot.symbol} 거래소 보유 ${rec.next.qty} 있으나 봇 라이브 체결 근거 0(curQty/ledger) → 수동 보유로 간주, 미채택(오입양 방지).`);
+        if (cur) { const next = { ...cur, unknownCount: 0 }; store.setBotPositionState(bot.id, next, true, false); return next; }
+        return cur;
+      }
     }
     const entryAvg = rec.next.entryAvg > 0 ? rec.next.entryAvg : (cur?.entryAvg ?? 0);
     const adopted: PaperPosition = { status: "open", entryAvg, qty: adoptQty, openedAt: cur?.openedAt ?? new Date().toISOString(), live: true, peakPrice: Math.max(cur?.peakPrice ?? entryAvg, entryAvg), protectiveIds: cur?.protectiveIds ?? [], protFails: cur?.protFails ?? 0, reconMisses: 0, unknownCount: 0 };
     store.setBotPositionState(bot.id, adopted, true, false);
-    store.insertLog(bot.id, "live", `[${live.env}] unknown 누적 → 강제 reconcile 채택: ${bot.symbol} 장부 ${curQty}→${adoptQty}(거래소 ${rec.next.qty}, 근거상한 ${Math.max(curQty, ledgerQty)}, 평단 ${entryAvg})`);
+    store.insertLog(bot.id, "live", `[${live.env}] unknown 누적 → 강제 reconcile 채택: ${bot.symbol} 장부 ${curQty}→${adoptQty}(거래소 ${rec.next.qty}, 평단 ${entryAvg})`);
     return adopted;
   }
   // no_exchange_pos + 라이브 보유: 거래소 부재(주문 미발행 또는 외부청산). reconcileLivePosition의 clear 경로는
@@ -750,6 +748,15 @@ export async function tickBot(botId: string): Promise<{ action: "buy" | "sell" |
     return tickLimitBracket(bot, comp.root_node as LimitBracketNode);
   }
 
+  // 개장시간 게이트(Task #4): 일반 전략봇도 장중에만 평가/주문. binance=24/7(항상 open), KR/US(토스·키움·한투)는
+  //  장마감·장외·주말엔 skip(hold) → '개장 시점 매매' 의미 보존 + 장외 주문시도·거부 로그 폭주 방지. limit_bracket
+  //  봇은 이미 isMarketOpen 사용 — 일관화. KR/US는 장외 체결 자체가 없어 장외 전체-틱 skip 이 안전.
+  //  ★opt-in(default OFF, QUANT_TICKBOT_MARKET_GATE=1) + 라이브 봇 한정 — 라이브 전환(go-live, #6 enableLive)에서
+  //   켠다. 페이퍼/테스트(mode!=live 또는 env 미설정)는 미적용 → 무회귀. 휴장일 미반영은 거래소 거부 fail-safe.
+  if (process.env.QUANT_TICKBOT_MARKET_GATE === "1" && bot.mode === "live" && !isMarketOpen(bot.broker as Broker, new Date(), bot.symbol)) {
+    return { action: "hold", detail: "장 마감(개장시간 외) — 라이브 평가/주문 skip" };
+  }
+
   const interval = secsToInterval(bot.interval_seconds); // 폴링 주기 → kline 타임프레임(인트라데이 자동). 시간대 조건 해금.
   // 데이터 소스 broker-aware: 크립토=Binance public klines, KR(키움/한투)=브로커 어댑터 getCandles(일봉).
   //   KR 종목코드는 Binance에 없으므로 어댑터에서 OHLCV를 가져와야 지표 평가 가능(없으면 빈 배열→데이터부족 hold).
@@ -868,11 +875,28 @@ export async function tickBot(botId: string): Promise<{ action: "buy" | "sell" |
   //   유지: 전략신호 청산·라더 델타는 보류하되, SL/TP는 거래소 상주 스톱이 계속 보호한다(fail-closed=의심 시 보유).
   //   진입봉이 윈도우 안에 들어올 때만 청산/델타 반영(엔진이 진입을 봐 backtest≡live). 근본해결=엔진 포지션 시드(P0-5 후속).
   const oldestBarMs = data.length ? Date.parse(data[0].datetime) : NaN;
-  const entryScrolledOut = !!cur?.openedAt && Number.isFinite(oldestBarMs) && Date.parse(cur.openedAt) < oldestBarMs;
+  // openedAt(체결=벽시계)은 진입 봉이 '닫힌 뒤'(≈다음 봉 오픈)에 기록되므로 entryBar.open ≈ openedAt − 1봉(intervalMs).
+  //   진입봉 open < oldestBar(윈도우 첫 봉) 이면 스크롤아웃. ⚠️ 적대검증 #9: 종전 `openedAt < oldestBar` 직접비교는
+  //   off-by-one(openedAt≈oldestBar+ε)으로 진입봉이 막 윈도우를 벗어난 '첫 틱'을 놓쳐 그 1틱 동안 오청산이 가능했다.
+  //   intervalMs 보정으로 진입봉이 벗어나는 즉시 가드 발동.
+  const intervalMs = Math.max(1, bot.interval_seconds) * 1000;
+  const openedMs = cur?.openedAt ? Date.parse(cur.openedAt) : NaN;
+  const entryScrolledOut = Number.isFinite(openedMs) && Number.isFinite(oldestBarMs) && (openedMs - intervalMs) < oldestBarMs;
   if (curQty > 1e-9 && (res.trades.length === 0 || entryScrolledOut)) {
-    store.setBotPositionState(botId, cur);
+    // 보유 유지하되 트레일링/protFails는 계속 갱신: 고정 SL뿐 아니라 '트레일링 스탑'도 고점 추종(래칫업)해야 한다.
+    //   ⚠️ 적대검증 #9 후속: 종전 bare hold(early-return)는 하단 트레일링 재동기화(line~1007) 도달을 막아 장기보유 동안
+    //   트레일링이 마지막 값에 동결(고정스탑 퇴화)되고 protFails 감지도 멈췄다 — 무음 리스크통제 저하. 여기서 직접 재동기화.
     const why = res.trades.length === 0 ? "윈도우 내 신호 없음" : "진입봉 윈도우 밖(스크롤아웃) — 엔진 넷 신뢰 보류";
-    return { action: "hold", detail: `보유 유지 ${curQty} @ ${price}(${why}, 상주 스톱이 SL/TP 보호)` };
+    if (curLive && cur) {
+      const peakPrice = Math.max(cur.peakPrice ?? cur.entryAvg, price);
+      const ps = await syncBotProtective(bot, curLive, bot.symbol, curQty, cur.entryAvg, peakPrice, risk, cur.protectiveIds ?? []);
+      const pf = nextProtFails(cur.protFails, ps, (risk.stopLossPercent != null || risk.trailingStopPercent != null));
+      if (ps.failed > 0) noteProtectiveFailure(botId, pf);
+      store.setBotPositionState(botId, { ...cur, peakPrice, protectiveIds: ps.ids, protFails: pf });
+    } else {
+      store.setBotPositionState(botId, cur);
+    }
+    return { action: "hold", detail: `보유 유지 ${curQty} @ ${price}(${why}, 트레일링/상주 스톱 갱신)` };
   }
   // 멱등키는 봉 오픈시각(datetime, 전체 ISO) 기준 — date(YYYY-MM-DD)면 인트라데이 봇이 하루 1회 매매만 기록되어
   // 같은 날 재진입이 영구 차단됨(backtest≠live). 스캐너 경로와 동일 granularity.
@@ -904,9 +928,7 @@ export async function tickBot(botId: string): Promise<{ action: "buy" | "sell" |
       : undefined;
     // 신규 진입 또는 추가매수(스케일인/피라미딩). entryAvg는 엔진 가중평단(want.entryAvg)으로 갱신.
     //   채널: 신규 진입=미정(undefined → 라이브 시도, 명확실패만 페이퍼) / 추가매수=기존 포지션 채널 고정.
-    // 신규 진입(추가매수/스케일인 아님)일 때만 직전 봉 cid 입양 검사(#5 이중매수 차단). 추가매수는 prevBarIso 미전달.
-    const freshEntry = curQty < 1e-9 && !plan.partial;
-    const fill = await fillOrder(bot, "buy", buyQty, price, bot.symbol, { posLive: curQty > 1e-9 ? curLive : undefined, barIso: lastIso, entry: entryPlan, prevBarIso: freshEntry && data.length > 1 ? data[data.length - 2].datetime : undefined });
+    const fill = await fillOrder(bot, "buy", buyQty, price, bot.symbol, { posLive: curQty > 1e-9 ? curLive : undefined, barIso: lastIso, entry: entryPlan });
     // 지정가 접수(호가 등록) → pendingEntry 영속 + hold. 다음 틱부터 resolvePendingEntry가 체결/타임아웃 추적(크래시 생존, cid 멱등).
     if (fill.pending && fill.cid && fill.limitPrice != null && entryPlan?.type === "limit") {
       const marker: PaperPosition = { status: "open", entryAvg: 0, qty: 0, openedAt: cur?.openedAt ?? new Date().toISOString(), live: false,

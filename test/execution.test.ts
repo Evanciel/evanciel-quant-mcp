@@ -44,7 +44,7 @@ describe("planProtectiveOrders", () => {
     expect(a).not.toEqual(cids("bot-bbbbbbbb-2222", "BTCUSDT")); // 다른 봇 → 다른 cid(교차봇 취소 사고 차단)
     expect(a).not.toEqual(cids("bot-aaaaaaaa-1111", "ETHUSDT")); // 다른 심볼 → 다른 cid
     expect(a).toEqual(cids("bot-aaaaaaaa-1111", "BTCUSDT"));     // 같은 입력 → 결정적 동일(멱등 슬롯, 트레일링 외 안정)
-    for (const id of a) { expect(id.length).toBeLessThanOrEqual(36); expect(id).toMatch(/^[a-zA-Z0-9_-]+$/); } // 거래소 charset/길이
+    for (const id of a) { expect(id).toMatch(/^p[ST][0-9a-f]{30}$/); expect(id.length).toBe(32); } // sha256 30hex(120비트) — 구 32비트 imul(≤10자 base36)이면 실패=충돌내성 회귀가드
   });
 });
 
