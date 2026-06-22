@@ -63,11 +63,16 @@ buy-side unknown이 unknownCount 미증가(fresh entry는 담을 상태가 null)
 
 > ⏸ 후속 3건(#4/#5/#6)은 전부 **라이브 머니패스 변이**라, "검증 불가한 라이브 변이 코드를 미리 넣지 않는다"는 프로젝트 원칙(P1-5/P0-5와 동일)에 따라 testnet/KR-mock 검증을 전제로 설계만 확정·보존. 메인넷 OFF·해당 라이브 키 부재로 현재 노출 없음(latent).
 
-## Batch 3 — MEDIUM (개별 재검증 후)
+## Batch 3 — MEDIUM
 
-toss 세션게이트(#11)·toss 인터벌 검증(#12)·트레일링 place-then-cancel(#14)·getOpenOco 2-leg 검증(#15)·protective coid 충돌내성(#16)·affordability 재확인 fail-closed·포트폴리오게이트 is_paper/통화 필터(#runner4/#store24)·스캐너 intra-tick heat(#21)·스캐너 tx 원자성(#25)·킬스위치 스캐너맵(#22)·TP intrabar 패리티(#20)·배너 broker-aware env/통화(#18)·#13 toss US FX 사이징 footgun.
+### ✅ #12 toss 인터벌 검증 — 수정 완료(Batch 3)
+토스는 캔들 1m/1d만 지원 → 그 외 인터벌 봇은 러너 getCandles throw로 '러닝이지만 평가 불가'한 유령봇(페이퍼·라이브 공통). create_bot이 사전 거절 + 러너 getCandles try/catch 안전망(generic crash 대신 명시 hold). 테스트 3.
 
-> 각 MEDIUM은 Batch 1의 #2처럼 코드로 재검증 후 진행(오탐/이미완화 가능). 다수가 opt-in(포트폴리오게이트) 또는 현재 미도달(스캐너 라이브 거절됨) = latent.
+### 잔여 MEDIUM (개별 재검증 후 — 다수 opt-in/paper-only/UI라 현재 머니 노출 없음)
+**안전·비-라이브변이(추후 가능)**: #18 배너 broker-aware env/통화 표기(현 BINANCE_ENV만 참조 → KR-only 메인넷이 'testnet'·'USDT' 오표시, 운영자 인지 저하) · #15 getOpenOco 2-leg 검증(편다리/유령 OCO를 '보호됨' 오표시 → 재보호 차단) · #22 킬스위치 스캐너 심볼맵 청산(현 단일포지션 가정이라 스캐너 보유 미청산) · #25 스캐너 라이브 fill tx 원자화 · #16 protective coid 충돌내성(32bit→긴 해시) · 포트폴리오게이트 is_paper/통화 필터(realizedEquityCurve, opt-in).
+**라이브변이/검증 게이트(testnet 필요)**: #11 toss 세션게이트(장외 주문) · #14 트레일링 place-then-cancel(naked 창) · affordability 재확인 fail-closed · #20 TP intrabar 패리티(백테 통계 이동 → 신중) · #13 toss US FX 사이징 footgun(KRW capital÷USD).
+
+> 다수가 opt-in(포트폴리오게이트)·paper-only(스캐너 라이브 거절됨)·UI 표기라 현재 머니 노출 없음. 우선순위·testnet 키 따라 후속.
 
 ---
 

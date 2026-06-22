@@ -289,8 +289,8 @@ export interface PaperPosition {
   pendingEntry?: { cid: string; limitPrice: number; origQty: number; filledQty: number; placedBarIso: string; timeoutBars: number; maxSlippagePct: number };
 }
 
-/** 폴링 주기(초) → Binance kline 타임프레임. 인트라데이 봉이라야 시간대(hour) 조건이 의미. */
-function secsToInterval(s: number): string {
+/** 폴링 주기(초) → Binance kline 타임프레임. 인트라데이 봉이라야 시간대(hour) 조건이 의미. (export: create_bot 인터벌 검증 공유) */
+export function secsToInterval(s: number): string {
   if (s <= 60) return "1m"; if (s <= 180) return "3m"; if (s <= 300) return "5m"; if (s <= 900) return "15m";
   if (s <= 1800) return "30m"; if (s <= 3600) return "1h"; if (s <= 14400) return "4h"; if (s <= 86400) return "1d"; return "1d";
 }
@@ -734,7 +734,15 @@ export async function tickBot(botId: string): Promise<{ action: "buy" | "sell" |
     fetched = await fetchKlines(bot.symbol, interval, 300);
   } else if (dataBroker === "kiwoom" || dataBroker === "toss") {
     const da = getAdapter(dataBroker, "spot")?.adapter as { getCandles?: (s: string, i: string, c: number) => Promise<Bar[]> } | undefined;
-    fetched = da?.getCandles ? await da.getCandles(bot.symbol, interval, 300) : [];
+    try {
+      fetched = da?.getCandles ? await da.getCandles(bot.symbol, interval, 300) : [];
+    } catch (e) {
+      // getCandles throw(예: 토스는 1m/1d만 지원 → 그 외 인터벌은 매 틱 throw)이 Runner.run의 generic catch까지
+      // 흘러 '러닝인데 평가 불가'한 유령봇이 되는 것을 차단(적대검증 #12): 명시 로그 + hold. create_bot에서도 사전 거절.
+      store.insertLog(botId, "error", `${dataBroker} 캔들 조회 실패(${interval}) — ${e instanceof Error ? e.message : e}${dataBroker === "toss" ? " (토스는 1m/1d만 지원)" : ""}. 평가 보류.`);
+      store.setBotPositionState(botId, bot.position_state);
+      return { action: "hold", detail: `${dataBroker} 캔들 조회 실패 — 평가 보류` };
+    }
   } else {
     // KIS 캔들 API 미연동(audit P1-22) — 조용한 빈배열 hold(데이터 부족으로 위장) 대신 명시 고지 후 hold(fail-closed honesty).
     store.insertLog(botId, "error", `${dataBroker} 캔들 데이터 미지원 — 현재 Binance 공개 데이터만 사용 가능(이 봇은 평가 불가). 종목/브로커 확인 필요.`);

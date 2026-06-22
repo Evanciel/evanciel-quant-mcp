@@ -4,7 +4,7 @@
  */
 import { validateBotRoot } from "../core/validation/composite-node.js";
 import * as store from "../store/db.js";
-import { runner, cancelLimitBracketRestingOrders } from "../runner/runner.js";
+import { runner, cancelLimitBracketRestingOrders, secsToInterval } from "../runner/runner.js";
 import { startDashboard } from "../dashboard/server.js";
 import { liveGate, type Broker } from "../brokers/safety.js";
 import type { RiskSizingConfig } from "../core/risk/order-sizing.js";
@@ -37,9 +37,18 @@ export function createBot(a: { name: string; compositeStrategyId: string; symbol
   if (!comp) return { ok: false, error: `복합전략 없음: ${a.compositeStrategyId}` };
   const mode = a.mode === "live" ? "live" : "paper";
   const broker: Broker = a.broker || "binance";
+  const intervalSeconds = a.intervalSeconds ?? 60;
+  // 토스는 캔들 1m/1d만 지원(getCandles) → 그 외 인터벌은 러너에서 매 틱 throw로 '러닝이지만 평가 불가'한 유령봇이
+  //   된다(적대검증 #12). 생성 시점에 거절(fail-closed honesty, 페이퍼·라이브 공통). 러너에도 try/catch 안전망 존재.
+  if (broker === "toss") {
+    const iv = secsToInterval(intervalSeconds);
+    if (iv !== "1m" && iv !== "1d") {
+      return { ok: false, error: `토스 봇은 캔들 1m/1d만 지원 — intervalSeconds=${intervalSeconds}(→${iv})는 미지원. 60초 이하(1m) 또는 1일(>14400초)로 설정하세요.` };
+    }
+  }
   const bot = store.insertBot({
     name: a.name, symbol: a.symbol || comp.symbol, composite_strategy_id: a.compositeStrategyId,
-    mode, capital: a.capital ?? 1_000_000, broker, interval_seconds: a.intervalSeconds ?? 60,
+    mode, capital: a.capital ?? 1_000_000, broker, interval_seconds: intervalSeconds,
   });
   // 라이브 모드면 현재 게이트 상태를 알려줌(실행은 가동 시 게이트가 통제 — 키없으면 페이퍼 폴백).
   let note = "mode=paper. start_bot으로 가동.";
