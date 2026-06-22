@@ -101,4 +101,11 @@ export interface BrokerAdapter {
   getOpenOco?(symbol: string): Promise<{ orderListId: string; tpPrice: number; slPrice: number } | null>;
   // 거래소 권위 base 자산(비표준 quote 페어 정확). 미구현 어댑터=undefined → 호출측 정규식 폴백.
   baseAssetOf?(symbol: string): Promise<string>;
+  // 판매 가능 수량(매도 오버셀 가드, #5). 일반 SELL은 placeProtective와 달리 보유검증이 없어 -2010/insufficient 위험 →
+  //   placeOrder SELL 경로가 typeof로 가드해 사전 차단. 미구현 어댑터=undefined(거래소가 최종 -2010 방어).
+  getSellableQuantity?(symbol: string): Promise<number>;
+  // 당일 상/하한가(지정가 범위 검증, #5). null=무제한(US/제한없음). 미구현=undefined → 검증 스킵(거래소 최종 방어).
+  getPriceLimit?(symbol: string): Promise<{ upper: number | null; lower: number | null; currency: string }>;
+  // 장 운영 캘린더(휴장일 판정, #5). open=당일 거래가능. 미구현=undefined. 정적 RTH 게이트(runner)를 동적 공휴일로 보완.
+  getMarketCalendar?(market: "KR" | "US"): Promise<{ open: boolean; date: string }>;
 }

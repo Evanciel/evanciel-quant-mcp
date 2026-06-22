@@ -451,6 +451,53 @@ export class TossBrokerAdapter extends BaseBrokerAdapter {
     return Math.max(0, quantity);
   }
 
+  // ── 안전 보조 조회(읽기 전용, #5 실거래 준비). 전부 GET 멱등 → getJson(withRetry). 주문 쓰기 경로 무관. ──
+
+  /**
+   * 판매 가능 수량(GET /api/v1/sellable-quantity?symbol=, account 헤더). 일반 매도(placeOrder SELL)의 오버셀 가드용 —
+   * placeProtective는 실보유 검증이 있으나 평범한 SELL엔 없어 잔고초과 매도→거래소 거부(insufficient) 위험. 사전 차단.
+   * 응답 { sellableQuantity:"100" }(KR 정수 / US 소수, 부호없는 decimal 문자열). "0"=판매가능 없음(정상, 0 반환).
+   * fail-closed: result/sellableQuantity 부재 = 비정형 → throw(빈 응답을 '0 판매가능'으로 둔갑 금지 — 호출측이 차단).
+   */
+  async getSellableQuantity(symbol: string): Promise<number> {
+    const sym = symbol.trim();
+    const r = (await this.getJson(`/api/v1/sellable-quantity?symbol=${encodeURIComponent(sym)}`, true)) as { sellableQuantity?: unknown } | null;
+    if (!r || r.sellableQuantity == null) throw new Error(`Toss sellable-quantity 응답 비정형(${sym}) — fail-closed`);
+    return Math.max(0, toNum(r.sellableQuantity));
+  }
+
+  /**
+   * 당일 상/하한가(GET /api/v1/price-limits?symbol=, account 불요 — Market Data). 지정가 주문 범위 검증용(price-out-of-range 사전 차단).
+   * 응답 { upperLimitPrice:"93000"|null, lowerLimitPrice:"50400"|null, currency }. US는 가격제한이 없어 null(무제한) — 정상.
+   * fail-closed: result 부재 = throw. 단 null/0 리밋은 '제한 없음'으로 정상 처리(null 반환) — 0을 상한으로 오인해 전량 거절 방지.
+   */
+  async getPriceLimit(symbol: string): Promise<{ upper: number | null; lower: number | null; currency: string }> {
+    const sym = symbol.trim();
+    const r = (await this.getJson(`/api/v1/price-limits?symbol=${encodeURIComponent(sym)}`)) as { upperLimitPrice?: unknown; lowerLimitPrice?: unknown; currency?: unknown } | null;
+    if (!r) throw new Error(`Toss price-limits 응답 비정형(${sym}) — fail-closed`);
+    const up = r.upperLimitPrice == null ? 0 : toNum(r.upperLimitPrice);
+    const lo = r.lowerLimitPrice == null ? 0 : toNum(r.lowerLimitPrice);
+    return { upper: up > 0 ? up : null, lower: lo > 0 ? lo : null, currency: String(r.currency ?? "").trim() };
+  }
+
+  /**
+   * 장 운영 캘린더(GET /api/v1/market-calendar/{KR|US}, account 불요 — Market Info). 휴장일 판정.
+   * KR: today.integrated===null → 휴장(KRX·NXT 둘 다 휴장). US: today의 4세션(day/pre/regular/after) 모두 null → 휴장.
+   * fail-closed: today 부재 = throw(휴장 여부 불명 → 호출측이 보수적 차단/스킵). 정적 RTH(runner #4)를 동적 공휴일로 보완.
+   */
+  async getMarketCalendar(market: "KR" | "US"): Promise<{ open: boolean; date: string }> {
+    const m = market === "US" ? "US" : "KR";
+    const r = (await this.getJson(`/api/v1/market-calendar/${m}`)) as { today?: unknown } | null;
+    const today = r?.today;
+    if (!today || typeof today !== "object") throw new Error(`Toss market-calendar/${m} 응답 비정형 — fail-closed`);
+    const t = today as Record<string, unknown>;
+    const date = String(t.date ?? "").trim();
+    const open = m === "KR"
+      ? t.integrated != null
+      : (t.dayMarket != null || t.preMarket != null || t.regularMarket != null || t.afterMarket != null);
+    return { open, date };
+  }
+
   // getOrderByClientId / cancelOrderByClientId / placeOco / cancelOco / getOpenOco / baseAssetOf:
   //   **의도적 미구현(undefined)** — getOrderByClientId 부재가 reconcile 라우팅 근거(불변식). OCO/보호주문은 토스 미지원.
 }

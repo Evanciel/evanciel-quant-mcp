@@ -130,6 +130,16 @@ export async function placeOrder(a: {
   const gate = liveGate(broker, market);
   if (!gate.allowed) return { ok: false, error: gate.reason, gate };
 
+  // ── #5 휴장일 게이트(opt-in, QUANT_TOSS_HOLIDAY_GATE=1) — 라이브 주문 전 당일 휴장이면 거절. 정적 RTH(runner #4)를
+  //   동적 공휴일/임시휴장으로 보완. 기본 OFF(주문당 추가 호출·가용성 의존 회피). 조회 실패=fail-closed(차단). 금액·수량 양 경로 공통. ──
+  if (process.env.QUANT_TOSS_HOLIDAY_GATE === "1" && typeof got.adapter.getMarketCalendar === "function") {
+    const mkt = quoteCurrencyFor(broker, a.symbol) === "USD" ? "US" : "KR";
+    try {
+      const cal = await got.adapter.getMarketCalendar(mkt);
+      if (!cal.open) return { ok: false, error: `${mkt} 시장 휴장(${cal.date || "당일"}) → 주문 거절(QUANT_TOSS_HOLIDAY_GATE).` };
+    } catch (e) { return { ok: false, error: `휴장일 조회 실패 → 주문 거절(fail-closed): ${e instanceof Error ? e.message : e}` }; }
+  }
+
   // ── 금액기반 주문(US MARKET 전용, 수동 한정): quantity 대신 달러 금액. notional=orderAmount → 정규화/현재가 산출 스킵. ──
   //   동일 안전 골격 재사용: liveGate → checkLimits(USD) → 2단계 confirmToken(orderAmount 해시 바인딩) → audit → adapter.
   if (a.orderAmount != null && a.orderAmount > 0) {
@@ -179,6 +189,26 @@ export async function placeOrder(a: {
   const notional = price * effQty;
   const lim = checkLimits({ symbol: a.symbol, notional, quoteCurrency, side: a.side });
   if (!lim.ok) return { ok: false, error: `하드리밋 차단: ${lim.reason}` };
+
+  // ── #5 매도 오버셀 가드(fail-CLOSED) — 일반 SELL은 placeProtective와 달리 보유검증이 없어 잔고초과 매도→거래소
+  //   거부(insufficient)/부분참사 위험. 어댑터가 판매가능수량을 제공하면(현재 토스) effQty 검증. 조회 실패=거절(차단).
+  //   매수는 면제(side!=="sell"). 거래소 거부 '전에' 차단해 머니패스를 단정하게 유지. ──
+  if (a.side === "sell" && typeof got.adapter.getSellableQuantity === "function") {
+    let sellable: number;
+    try { sellable = await got.adapter.getSellableQuantity(a.symbol); }
+    catch (e) { return { ok: false, error: `판매가능수량 조회 실패 → 매도 거절(fail-closed): ${e instanceof Error ? e.message : e}` }; }
+    if (!(sellable > 0)) return { ok: false, error: `${a.symbol} 판매가능수량 0(미보유/주문잠김) → 매도 거절.` };
+    if (effQty > sellable + 1e-9) return { ok: false, error: `매도수량 ${effQty} > 판매가능 ${sellable} → 오버셀 차단(보유분만 매도 가능).` };
+  }
+  // ── #5 지정가 상/하한가 가드(fail-OPEN) — 범위 밖 지정가의 price-out-of-range를 사전 차단(fat-finger 방어). 조회
+  //   실패는 진행(거래소가 최종 거부 — 읽기 가용성 우선). US/제한없음은 null이라 통과. ──
+  if (type === "limit" && a.price != null && a.price > 0 && typeof got.adapter.getPriceLimit === "function") {
+    try {
+      const pl = await got.adapter.getPriceLimit(a.symbol);
+      if (pl.upper != null && a.price > pl.upper) return { ok: false, error: `지정가 ${a.price} > 당일 상한가 ${pl.upper} → 거절(price-out-of-range 사전차단).` };
+      if (pl.lower != null && a.price < pl.lower) return { ok: false, error: `지정가 ${a.price} < 당일 하한가 ${pl.lower} → 거절(price-out-of-range 사전차단).` };
+    } catch { /* 상하한가 조회 실패 → 진행(거래소 최종 방어). fail-open 의도(가격 검증은 보조). */ }
+  }
 
   // 2단계 확인토큰(fail-CLOSED). INV-1: 해시 바인딩 수량 = 프리뷰 수량 = 실제 주문 수량(effQty).
   const hash = orderHash({ broker, market, symbol: a.symbol, side: a.side, type, quantity: effQty, price: a.price ?? null, env: gate.env });
