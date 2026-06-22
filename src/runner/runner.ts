@@ -965,13 +965,21 @@ export async function tickBot(botId: string): Promise<{ action: "buy" | "sell" |
 }
 
 /**
- * 보호주문 연속실패 카운터 갱신(audit P1-4/P1-9). 성공=0 리셋. SL leg 실패 + 손절 설정 포지션이면
- * 한도로 즉시 점프 — 'TP만 걸리고 SL 없는 편다리'를 3틱(기본 180초) 들고 있지 않고 다음 틱에 비상 청산.
+ * 보호주문 연속실패 카운터 갱신(audit P1-4/P1-9). 비상 청산(line 810)은 **손절(SL) 보호 부재 = 나체 포지션**만
+ * 대상이다(TP는 이익실현이지 리스크 통제가 아님). 따라서 이 카운터도 SL leg 실패만 누적해야 한다.
+ *  - SL leg 실패 + 손절 설정 → 즉시 한도(다음 틱 비상): 'SL 없는 나체'를 3틱 들고 있지 않는다(원동작 유지).
+ *  - SL은 정상/이미 상주인데 **다른 leg(TP)만 실패** → 나체가 아니다 → 카운터 0(비상 금지).
+ *    ⚠️ 버그 수정(적대검증): 종전 `prev+1` 누적은, 현물(spot)에서 SL+TP를 동시에 걸 때 TP 매도주문이 base 잔량을
+ *    SL이 이미 예약해 -2010으로 매 틱 실패하면 protFails가 누적→MAX→**건강한(SL 정상) 포지션을 비상 시장가 청산**
+ *    하던 치명 버그를 유발했다. 현물 SL+TP의 거래소 상주 공존은 OCO(placeOco)가 정답이며, 봇 경로 OCO 배선은
+ *    testnet 검증 후속(현재 manual 경로만 OCO). 그 전까지 TP leg는 거래소 미상주여도 엔진(종가기준 TP)이 청산을
+ *    수행하므로 backtest≡live·안전 불변.
  */
-function nextProtFails(prev: number | undefined, ps: { failed: number; slFailed: boolean }, hasStop: boolean): number {
+export function nextProtFails(prev: number | undefined, ps: { failed: number; slFailed: boolean }, hasStop: boolean): number {
   if (ps.failed <= 0) return 0;
-  if (ps.slFailed && hasStop) return PROTECTIVE_MAX_FAILS;
-  return (prev ?? 0) + 1;
+  if (ps.slFailed && hasStop) return PROTECTIVE_MAX_FAILS; // 손절 leg 실패=나체 → 즉시 비상
+  if (hasStop) return 0; // 손절 정상/상주, 다른 leg(TP 등)만 실패 → 나체 아님 → 비상 카운터 리셋(현물 SL+TP -2010 오청산 차단)
+  return (prev ?? 0) + 1; // 손절 미설정(비상 대상 아님, line 810 게이트가 hasStop 요구) — 일반 실패 카운트만 유지
 }
 
 /** 보호주문 동기화 실패 기록(P0-2) — 연속 실패 수를 로그+감사. PROTECTIVE_MAX_FAILS 도달 시 다음 틱에 비상 청산. */

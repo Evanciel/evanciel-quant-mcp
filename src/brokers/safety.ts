@@ -291,20 +291,42 @@ export function dailyRealizedLoss(quoteCurrency?: string): number {
   try {
     const since = dayBoundaryIso();
     const ccy = quoteCurrency ? quoteCurrency.toUpperCase() : null;
-    let r: { s: number } | undefined;
     if (ccy === "USDT" || ccy === "USD") {
-      // 토스 US(USD) 손익도 이 서킷에. ⚠️ 토스는 KR+US가 같은 broker='toss'라 KR/US를 SQL로 분리하지 않고 양 통화 버킷에
-      //   모두 합산(coarse IN) — 과집계는 서킷을 '더 일찍' 발화시키는 fail-safe. GLOB로 심볼 분리하면 /^\d{6}$/와 미세 불일치 시
-      //   silent fail-open 위험이라 의도적으로 coarse 채택(설계 강화①).
-      r = db().prepare(`SELECT COALESCE(SUM(t.pnl),0) s FROM trades t JOIN bots b ON b.id=t.bot_id WHERE t.is_paper=0 AND t.ts >= ? AND b.broker IN ('binance','toss')`).get(since) as { s: number } | undefined;
+      // binance(USDT) + 토스 US(USD)만. ⚠️ 토스는 KR+US가 같은 broker='toss'라, 종전 coarse `IN ('binance','toss')`은
+      //   토스 KR(KRW) 손익까지 USD 버킷에 합산했다. pnl은 부호 있는 통화별 실수라 (a) 토스 KR '이익'이 binance USD '손실'을
+      //   가려 서킷이 fail-OPEN(audit 적대검증), (b) 토스 KR '손실'이 USD 서킷을 오발화(P1-6 통화분리 위반)했다.
+      //   → 토스 행을 심볼 통화(isKrSymbol, 단일 진실원=quoteCurrencyFor와 동일)로 분리 합산해 통화 격리.
+      return sumPnlSince(since, "b.broker='binance'") + sumTossPnlSince(since, "USD");
     } else if (ccy === "KRW") {
-      r = db().prepare(`SELECT COALESCE(SUM(t.pnl),0) s FROM trades t JOIN bots b ON b.id=t.bot_id WHERE t.is_paper=0 AND t.ts >= ? AND b.broker IN ('kis','kiwoom','toss')`).get(since) as { s: number } | undefined;
-    } else {
-      r = db().prepare(`SELECT COALESCE(SUM(pnl),0) s FROM trades WHERE is_paper=0 AND ts >= ?`).get(since) as { s: number } | undefined;
+      return sumPnlSince(since, "b.broker IN ('kis','kiwoom')") + sumTossPnlSince(since, "KRW");
     }
+    // 통화 미지정(하위호환): 전체 실거래 합산(조인 없이 — 종전과 바이트 동일)
+    const r = db().prepare(`SELECT COALESCE(SUM(pnl),0) s FROM trades WHERE is_paper=0 AND ts >= ?`).get(since) as { s: number } | undefined;
     return r?.s ?? 0;
   } catch (e) {
     try { process.stderr.write(`[quant-mcp] dailyRealizedLoss 조회 실패 → 서킷 안전 발화(fail-closed): ${e instanceof Error ? e.message : e}\n`); } catch { /* stderr 실패 무시 */ }
     return Number.NEGATIVE_INFINITY; // fail-closed: 손실 불명 → 무한 손실로 간주해 서킷 차단
   }
+}
+
+/** is_paper=0 + 오늘(일경계 since) + brokerCond 의 실거래 pnl 합(통화 격리용 헬퍼). */
+function sumPnlSince(since: string, brokerCond: string): number {
+  const r = db().prepare(`SELECT COALESCE(SUM(t.pnl),0) s FROM trades t JOIN bots b ON b.id=t.bot_id WHERE t.is_paper=0 AND t.ts >= ? AND (${brokerCond})`).get(since) as { s: number } | undefined;
+  return r?.s ?? 0;
+}
+
+/**
+ * 토스 실거래 pnl을 심볼 통화로 분리 합산(KR 6자리→KRW / US 티커→USD). isKrSymbol = quoteCurrencyFor와 동일 규약이라
+ * 주문시 통화 판정과 집계시 버킷이 일치. JS 분류라 GLOB/^\d{6}$ 불일치로 인한 통화 오분류가 없다. 전체는 try/catch 안에서
+ * 호출돼 조회 실패 시 NEGATIVE_INFINITY(fail-closed) 유지.
+ */
+function sumTossPnlSince(since: string, ccy: "KRW" | "USD"): number {
+  // 심볼은 trades에 없고 bots(b.symbol)에 있음. 단일종목 토스 라이브 봇 가정(스캐너 라이브는 거절됨)이라 b.symbol=거래 심볼.
+  const rows = db().prepare(`SELECT b.symbol sym, COALESCE(t.pnl,0) pnl FROM trades t JOIN bots b ON b.id=t.bot_id WHERE t.is_paper=0 AND t.ts >= ? AND b.broker='toss'`).all(since) as { sym: string; pnl: number }[];
+  let s = 0;
+  for (const row of rows) {
+    const kr = isKrSymbol(row.sym);
+    if ((ccy === "KRW" && kr) || (ccy === "USD" && !kr)) s += row.pnl;
+  }
+  return s;
 }

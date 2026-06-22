@@ -56,7 +56,8 @@ vi.mock("../src/brokers/index.js", () => ({
 }));
 
 import * as store from "../src/store/db.js";
-import { tickBot, type PaperPosition } from "../src/runner/runner.js";
+import { tickBot, nextProtFails, type PaperPosition } from "../src/runner/runner.js";
+import { cancelOrderById } from "../src/mcp-server/live-handlers.js";
 import type { StrategyNode } from "../src/core/types/strategy.js";
 
 const bar = (i: number, c: number) => { const iso = new Date(Date.UTC(2025, 0, 1) + i * 3600000).toISOString(); return { date: iso.slice(0, 10), datetime: iso, open: c, high: c + 0.5, low: c - 0.5, close: c, volume: 1000 }; };
@@ -206,5 +207,42 @@ describe("P0-3 키움: 응답 신뢰성 + KST 타임스탬프", () => {
     expect(bars).toHaveLength(1);
     expect(bars[0].datetime).toBe("2026-06-10T00:00:00+09:00");
     expect(Date.parse(bars[0].datetime)).toBe(Date.UTC(2026, 5, 9, 15, 0, 0)); // KST 자정 = 전일 15:00 UTC
+  });
+});
+
+// ── 적대검증 #1: 비상 청산 카운터는 '손절(SL) 부재(나체)'만 추적 — 현물 SL+TP 동시 설정에서 TP leg가 base 잔량
+//    부족(-2010)으로 매 틱 실패해도 SL이 정상이면 건강한 포지션을 비상 시장가 청산하지 않는다(치명 버그 수정). ──
+describe("nextProtFails — SL(나체)만 비상 추적(현물 SL+TP 오청산 차단)", () => {
+  it("실패 0 → 카운터 0 리셋", () => {
+    expect(nextProtFails(2, { failed: 0, slFailed: false }, true)).toBe(0);
+  });
+  it("SL leg 실패 + 손절 설정 → 즉시 한도(다음 틱 비상, 나체 방지) — 원동작 유지", () => {
+    expect(nextProtFails(0, { failed: 1, slFailed: true }, true)).toBe(3); // PROTECTIVE_MAX_FAILS 기본 3
+  });
+  it("SL 정상 + TP만 실패(현물 SL+TP -2010) + 손절 설정 → 카운터 0(비상 금지) — 버그 수정", () => {
+    // 종전: prev+1 누적 → 3틱 뒤 SL 정상인 건강 포지션을 비상청산. 수정 후: 0 유지(나체 아님).
+    expect(nextProtFails(2, { failed: 1, slFailed: false }, true)).toBe(0);
+    expect(nextProtFails(0, { failed: 1, slFailed: false }, true)).toBe(0);
+  });
+  it("손절 미설정(hasStop=false)에서 보호 leg 실패는 누적(비상 게이트가 hasStop 요구라 미발동)", () => {
+    expect(nextProtFails(1, { failed: 1, slFailed: false }, false)).toBe(2);
+  });
+});
+
+// ── 적대검증 #17: cancelOrderById도 liveGate 경유 — 취소는 상주 보호주문(SL/TP)을 벗겨 리스크를 '증가'시킬 수
+//    있으므로 글로벌 킬스위치(LIVE_TRADING_HALT)·마스터 OFF에서 메인넷 취소가 나가면 안 된다. ──
+describe("cancelOrderById liveGate(HALT·master OFF 취소 차단)", () => {
+  it("LIVE_TRADING_HALT=true면 취소 차단(상주 보호주문 박탈 방지)", async () => {
+    process.env.LIVE_TRADING_HALT = "true";
+    const r = await cancelOrderById({ broker: "binance", symbol: "BTCUSDT", orderId: "x" });
+    delete process.env.LIVE_TRADING_HALT;
+    expect(r.ok).toBe(false);
+    expect(String(r.error)).toContain("HALT");
+  });
+  it("게이트 통과(testnet 키)면 정상 취소", async () => {
+    reset();
+    const r = await cancelOrderById({ broker: "binance", symbol: "BTCUSDT", orderId: "x" });
+    expect(r.ok).toBe(true);
+    expect(r.cancelled).toBe(true);
   });
 });

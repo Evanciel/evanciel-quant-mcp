@@ -139,6 +139,20 @@ export function upsertCredentials(updates: Record<string, string | undefined>): 
   return { written, path };
 }
 
+/**
+ * 저권한 자격증명 POST(대시보드 /api/credentials)에서 허용할 업데이트만 추림(라이브 무장 키 드롭).
+ * LIVE_SETTING_KEYS(LIVE_TRADING_ENABLED/캡/allowlist/일일손실)는 2단계 confirmToken + audit를 강제하는
+ * /api/live(enableLive) 전용이다. 저권한 키저장 POST로 이들을 설정하면 메인넷 마스터스위치를 무장하거나
+ * 하드리밋 캡을 부풀리는/allowlist를 비우는 권한상승(감사로그·확인 우회)이 된다(적대검증) → 여기서 드롭.
+ * 브로커 자격증명·ENV·알림 키만 통과(upsertCredentials가 ALL_KEYS로 한 번 더 화이트리스트 필터).
+ */
+export function sanitizeCredentialPost(body: Record<string, unknown>): Record<string, string> {
+  const live = new Set<string>(LIVE_SETTING_KEYS as readonly string[]);
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(body)) if (typeof v === "string" && !live.has(k)) out[k] = v;
+  return out;
+}
+
 /** 기동 시 credentials.env → process.env 로드(이미 설정된 키는 안 덮음 = MCP 설정 env 우선). */
 export function loadCredentialsFile(): number {
   const env = parseEnvFile(credentialsPath());

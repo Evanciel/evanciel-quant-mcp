@@ -17,7 +17,7 @@ import { readFileSync, writeFileSync, chmodSync, existsSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import * as store from "../store/db.js";
-import { BROKER_FIELDS, upsertCredentials, credentialStatus, credentialsPath, enableLive, disableLive, liveSettingsStatus, dataDir, type BrokerKey } from "../setup/credentials.js";
+import { BROKER_FIELDS, sanitizeCredentialPost, upsertCredentials, credentialStatus, credentialsPath, enableLive, disableLive, liveSettingsStatus, dataDir, type BrokerKey } from "../setup/credentials.js";
 import { fetchKlines, fetchSpotSymbols } from "../data/binance-public.js";
 import { getAdapter } from "../brokers/index.js";
 import { placeOrder, placeProtective, cancelProtective, getProtective, getAccount, getOpenOrders, getOrderStatus, cancelOrderById, getQuote } from "../mcp-server/live-handlers.js"; // 수동주문·OCO보호주문·실계정조회·미체결조회/취소 — 안전경로 재사용
@@ -853,8 +853,9 @@ export function startDashboard(port = 7788): Promise<{ url: string; port: number
       }
       if (req.method === "POST") {
         readJsonBody(req).then((body) => {
-          const updates: Record<string, string> = {};
-          for (const [k, v] of Object.entries(body)) if (typeof v === "string") updates[k] = v; // upsert가 화이트리스트로 재차 필터
+          // 라이브 무장 키(LIVE_TRADING_ENABLED/캡/allowlist/일일손실)는 /api/credentials로 설정 금지 — 2단계 confirmToken+audit를
+          //   강제하는 /api/live 전용(저권한 자격증명 POST로 메인넷 무장·캡 부풀리기 권한상승 차단, 적대검증). sanitizeCredentialPost가 드롭.
+          const updates = sanitizeCredentialPost(body);
           const { written } = upsertCredentials(updates); // 키값 로깅/에코 안 함
           res.writeHead(200, { "content-type": "application/json" });
           res.end(JSON.stringify({ ok: true, written: written.length, status: credentialStatus(), live: liveSettingsStatus() })); // 마스킹 상태만 반환

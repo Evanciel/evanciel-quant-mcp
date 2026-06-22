@@ -63,6 +63,27 @@ describe("upsertCredentials", () => {
   });
 });
 
+describe("sanitizeCredentialPost (대시보드 /api/credentials 라이브키 차단)", () => {
+  it("라이브 무장 키(LIVE_TRADING_ENABLED/캡/allowlist/일일손실)는 드롭 — 브로커 키/ENV만 통과", async () => {
+    const C = await load();
+    const out = C.sanitizeCredentialPost({
+      BINANCE_API_KEY: "k", BINANCE_ENV: "live",
+      LIVE_TRADING_ENABLED: "true", LIVE_MAX_NOTIONAL: "9999999", LIVE_SYMBOL_ALLOWLIST: "", LIVE_DAILY_LOSS_LIMIT: "999999",
+      num: 1, // 비문자열은 무시
+    });
+    expect(out).toEqual({ BINANCE_API_KEY: "k", BINANCE_ENV: "live" });
+    expect(out.LIVE_TRADING_ENABLED).toBeUndefined();
+    expect(out.LIVE_MAX_NOTIONAL).toBeUndefined();
+  });
+  it("upsert와 결합: 라이브키를 실은 POST는 라이브 마스터스위치를 켜지 못함(권한상승 차단)", async () => {
+    const C = await load();
+    C.upsertCredentials(C.sanitizeCredentialPost({ BINANCE_API_KEY: "k2", LIVE_TRADING_ENABLED: "true", LIVE_MAX_NOTIONAL: "9999999" }));
+    expect(process.env.BINANCE_API_KEY).toBe("k2");
+    expect(process.env.LIVE_TRADING_ENABLED).toBeUndefined(); // /api/credentials 경유로는 무장 불가(/api/live 전용)
+    expect(process.env.LIVE_MAX_NOTIONAL).toBeUndefined();
+  });
+});
+
 describe("parseEnvFile", () => {
   it("KEY=VALUE 파싱 + 주석 무시 + 따옴표 제거", async () => {
     const C = await load();

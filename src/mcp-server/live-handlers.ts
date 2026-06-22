@@ -76,11 +76,18 @@ export async function getOrderStatus(a: { broker?: Broker; market?: "spot" | "fu
   } catch (e) { return { ok: false, error: e instanceof Error ? e.message : String(e) }; }
 }
 
-/** 미체결 주문 취소(audit P1-19). 리스크 감소 방향 조작이라 2단계 토큰 없이 허용 — 감사로그는 남김. */
+/**
+ * 미체결 주문 취소(audit P1-19). 2단계 토큰은 불필요(주문 신규 아님)하나 **liveGate는 필수** —
+ * 취소는 항상 리스크 감소가 아니다: 상주 보호주문(SL/TP/OCO 다리)·limit-bracket 잔존주문을 취소하면 포지션이
+ * 나체가 되어 리스크가 '증가'한다. 따라서 글로벌 킬스위치(LIVE_TRADING_HALT)·마스터 OFF 시 차단해야 한다
+ * (종전 무게이트는 HALT·master OFF에서도 메인넷 취소가 나가 보호주문을 벗길 수 있었음 — 적대검증). cancelProtective와 동일 게이트.
+ */
 export async function cancelOrderById(a: { broker?: Broker; market?: "spot" | "futures"; symbol: string; orderId: string }) {
   const broker = a.broker || "binance", market = a.market || "spot";
   const got = getAdapter(broker, market);
   if (!got) return { ok: false, error: `${broker} 키 미설정(env).` };
+  const gate = liveGate(broker, market);
+  if (!gate.allowed) return { ok: false, error: gate.reason, gate };
   try {
     const cancelled = await got.adapter.cancelOrder(a.orderId, a.symbol);
     audit({ event: "manual_cancel", broker, env: got.env, symbol: a.symbol, orderId: a.orderId, cancelled });

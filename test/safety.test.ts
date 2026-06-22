@@ -212,6 +212,12 @@ describe("P1-6 일일손실 통화 분리", () => {
     db().prepare(`INSERT INTO bots (id,name,symbol,composite_strategy_id,status,mode,capital,broker,interval_seconds,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)`)
       .run(id, id, broker === "binance" ? "BTCUSDT" : "005930", `c-${id}`, "running", "live", 1000, broker, 60, new Date().toISOString());
   }
+  function mkBotSym(id: string, broker: string, symbol: string) {
+    db().prepare(`INSERT INTO composite_strategies (id,name,root_node,symbol,market,leverage,created_at) VALUES (?,?,?,?,?,?,?)`)
+      .run(`c-${id}`, id, "{}", symbol, "spot", 1, new Date().toISOString());
+    db().prepare(`INSERT INTO bots (id,name,symbol,composite_strategy_id,status,mode,capital,broker,interval_seconds,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)`)
+      .run(id, id, symbol, `c-${id}`, "running", "live", 1000, broker, 60, new Date().toISOString());
+  }
   function rawTrade(botId: string, ts: string, pnl: number) {
     db().prepare(`INSERT INTO trades (id,bot_id,ts,side,price,qty,pnl,is_paper,reason,idempotency_key) VALUES (?,?,?,?,?,?,?,?,?,?)`)
       .run(`t-${Math.random()}`, botId, ts, "sell", 100, 1, pnl, 0, "test", `i-${Math.random()}`);
@@ -237,13 +243,32 @@ describe("P1-6 일일손실 통화 분리", () => {
     expect(dailyRealizedLoss()).toBe(-50030); // 미지정=전체(하위호환)
   });
 
-  it("토스 거래는 KRW·USDT 양 버킷에 over-count(강화①, fail-safe — 절대 fail-open 아님)", () => {
-    mkBot("ts", "toss");
+  // ── 적대검증 수정: 토스 행을 심볼 통화(isKrSymbol)로 분리 — 종전 양 버킷 이중계상은 통화 마스킹/오발화 유발(fail-open). ──
+  it("토스 KR(6자리) 손익은 KRW 버킷에만 — USD 버킷 불오염(이중계상 제거)", () => {
+    mkBot("ts", "toss"); // 심볼 005930(KR)
     rawTrade("ts", "2026-06-09T16:00:00.000Z", -10000); // toss KR 손실
-    // 토스는 broker='toss' 단일이라 KR/US를 SQL 분리 안 하고 양 통화 버킷에 합산(과집계=서킷 조기발화). 적대검증으로 추가.
-    expect(dailyRealizedLoss("KRW")).toBe(-60000);  // kw(-50000) + ts(-10000)
-    expect(dailyRealizedLoss("USDT")).toBe(-10030); // bn(-30) + ts(-10000)
-    expect(dailyRealizedLoss("USD")).toBe(-10030);  // USD도 동일 버킷
+    expect(dailyRealizedLoss("KRW")).toBe(-60000);  // kw(-50000) + ts-KR(-10000)
+    expect(dailyRealizedLoss("USDT")).toBe(-30);    // bn만 (toss KR은 USD 버킷에서 제외)
+    expect(dailyRealizedLoss("USD")).toBe(-30);
+  });
+
+  it("토스 US(티커) 손익은 USD 버킷에만 — KRW 버킷 불오염", () => {
+    mkBotSym("tsus", "toss", "AAPL"); // toss US
+    rawTrade("tsus", "2026-06-09T16:00:00.000Z", -40); // toss US 손실(USD)
+    expect(dailyRealizedLoss("USD")).toBe(-70);    // bn(-30) + tsus(-40)
+    expect(dailyRealizedLoss("USDT")).toBe(-70);
+    expect(dailyRealizedLoss("KRW")).toBe(-50000); // kw만 (toss US는 KRW 버킷 불오염)
+  });
+
+  it("FAIL-OPEN 회귀: 토스 KR '이익'이 binance USD '손실'을 가리지 않는다(서킷 정상 발화)", () => {
+    process.env.LIVE_TRADING_ENABLED = "true";
+    mkBot("ts", "toss");
+    rawTrade("ts", "2026-06-09T16:00:00.000Z", 100000); // toss KR 큰 이익(KRW)
+    rawTrade("bn", "2026-06-09T16:00:00.000Z", -40);    // binance 추가 손실 → USDT 총 -70
+    // 종전(이중계상): dl(USDT)=-70+100000=+99930 → `99930<=-50` 거짓 → 서킷 미발화(fail-open, 메인넷 보호 무력화).
+    // 수정 후: toss KR은 USD 버킷 제외 → dl(USDT)=-70 → 기본 서킷 50 → -70<=-50 → 차단.
+    expect(dailyRealizedLoss("USDT")).toBe(-70);
+    expect(checkLimits({ symbol: "BTCUSDT", notional: 50, quoteCurrency: "USDT" }).ok).toBe(false);
   });
 
   it("KRW 서킷 도달이 USDT 주문을 막지 않음(독립 서킷)", () => {
