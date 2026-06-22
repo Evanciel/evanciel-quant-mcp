@@ -7,6 +7,7 @@ import { z } from "zod";
 const symbol = z.string().default("BTCUSDT").describe("거래쌍 (예: BTCUSDT, ETHUSDT)");
 const interval = z.string().default("1d").describe("봉 주기 (1m,5m,15m,1h,4h,1d 등)");
 const days = z.number().int().positive().default(200).describe("백테스트 봉 수(과거)");
+const broker = z.enum(["binance", "toss", "kiwoom", "kis"]).default("binance").describe("데이터 브로커. 코인=binance(기본), 국내/미국 주식=toss(토스 캔들로 백테스트). ★toss는 1m/1d 인터벌만, 스프레드·MTF 조건 미지원.");
 
 // 봇 지정가 진입(audit P1-5). 미지정=시장가(레거시). limit은 Binance 봇 한정(KR은 start_bot서 fail-closed 거절).
 //   리스크 통제(슬리피지 캡)지 알파 아님. clamp 범위 검증(엔진 resolveEntryFill이 런타임 재클램프=방어).
@@ -23,14 +24,14 @@ export const validateStrategyShape = {
 
 export const backtestShape = {
   tree: z.unknown().describe("검증·백테스트할 전략 트리"),
-  symbol, interval, days,
+  symbol, interval, days, broker,
   gapHandling: z.enum(["close", "worst"]).optional().describe("손절 갭 모델(audit P1-12). close(기본)=종가 판정 — 갭다운 손실 과소평가 가능. worst=봉 저가 터치 발동+min(시가,손절선) 체결(실거래 상주 STOP_MARKET에 근접한 보수 모델)."),
   entryExecution: entryExecutionSchema.optional().describe("봇 지정가 진입 모델(audit P1-5). limit이면 maker-first 지정가+N봉 타임아웃→시장가(캡) 폴백을 백테에 반영 → 라이브와 동일 체결모델로 OOS/DSR 검증(미설정=시장가). 라이브 limit 봇은 이 모델로 재검증 필수."),
 };
 
 export const backtestShortShape = {
   tree: z.unknown().describe("숏 백테스트할 전략 트리 (sell=숏진입, buy=커버)"),
-  symbol, interval, days,
+  symbol, interval, days, broker,
   risk: z.object({
     stopLossPercent: z.number().optional(),
     takeProfitPercent: z.number().optional(),

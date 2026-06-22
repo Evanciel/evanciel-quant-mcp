@@ -21,6 +21,8 @@ import { collectEventCalendars, buildEventCalendars, BUILTIN_CALENDARS } from ".
 import { rankUniverse, computeRankMetric, type RankBar, type RankMetric } from "../core/scanner/rank.js";
 import { fetchKlines, fetchDerivatives, buildAuxSeries, type Bar } from "../data/binance-public.js";
 import { validateCandleContiguity } from "../util/candle.js";
+import { getAdapter } from "../brokers/index.js";
+import type { Broker } from "../brokers/safety.js";
 
 const cfg = (d: Bar[], symbol: string, interval: string, auxSeries?: Record<string, number[]>, mtfSeries?: Record<string, number[]>, eventCalendars?: Record<string, number[]>, mtfRegimeSeries?: Record<string, MtfRegimeSeries>): BacktestConfig => ({
   strategyId: "quant-mcp", symbol, startDate: d[0].date, endDate: d[d.length - 1].date,
@@ -55,6 +57,23 @@ async function fetchKlinesChecked(symbol: string, interval: string, days: number
   const contig = validateCandleContiguity(data, interval, "crypto");
   if (!contig.valid) throw new Error(`캔들 무결성 실패(${symbol} ${interval}): ${contig.reason}`);
   return data;
+}
+
+/** broker-aware 백테스트 캔들 페치(Task #2, KR/US 검증 복구). broker=binance(기본)면 binance public klines
+ *  (crypto 엄격연속), toss/kiwoom/kis면 브로커 어댑터 getCandles(주식=세션 갭 허용 'kr' 모드). 토스 getCandles
+ *  반환은 Bar({date,datetime,ohlcv})와 동일 형태라 매핑 불필요. 어댑터 미설정/캔들0/형식깨짐 시 throw(상위
+ *  핸들러 guard가 ok:false 로 변환). 이로써 토스 KR/US 종목도 동일 백테스트 엔진으로 검증 가능. */
+async function fetchBarsChecked(broker: string | undefined, symbol: string, interval: string, days: number): Promise<Bar[]> {
+  if (broker && broker !== "binance") {
+    const da = getAdapter(broker as Broker, "spot")?.adapter as { getCandles?: (s: string, i: string, c: number) => Promise<Bar[]> } | undefined;
+    if (!da?.getCandles) throw new Error(`${broker} 어댑터 미설정 또는 getCandles 미지원 — 키(예: TOSS_*) 설정 필요`);
+    const data = await da.getCandles(symbol, interval, Math.max(20, days));
+    if (!data.length) throw new Error(`${broker} 캔들 0개(${symbol} ${interval}) — 종목/인터벌 확인(토스는 1m/1d만 지원)`);
+    const contig = validateCandleContiguity(data, interval, "kr"); // 주식=장중만·세션 갭 허용(중앙값 기반)
+    if (!contig.valid) throw new Error(`캔들 무결성 실패(${symbol} ${interval}): ${contig.reason}`);
+    return data;
+  }
+  return fetchKlinesChecked(symbol, interval, days);
 }
 
 // ── 1. validate_strategy ──
@@ -127,14 +146,20 @@ export async function scanUniverse(args: { universe: string[]; metric?: RankMetr
 }
 
 // ── 2. backtest (70/30 hold-out OOS + PSR) ── 단일 홀드아웃 분할(롤링/확장 워크포워드 아님: split=floor(len*0.7), train=앞 70%, test=뒤 30%).
-export async function backtest(args: { tree: StrategyNode; symbol?: string; interval?: string; days?: number; gapHandling?: "close" | "worst"; entryExecution?: EntryExecution }) {
+export async function backtest(args: { tree: StrategyNode; symbol?: string; interval?: string; days?: number; gapHandling?: "close" | "worst"; entryExecution?: EntryExecution; broker?: string }) {
   // 지정가 브래킷 봇은 백테 비대상(가격기반 주문관리 — OHLCV로 재현할 신호전략 아님). 조용한 빈결과 대신 loud reject(적대검증).
   if ((args.tree as { type?: string })?.type === "limit_bracket") return { ok: false, error: "지정가 브래킷 봇은 백테스트 비대상입니다 — 인디케이터 엔진 대응물이 없는 주문관리 봇입니다." };
   const err = validateRootNode(args.tree);
   if (err) return { ok: false, error: `검증 실패: ${err}` };
   const symbol = args.symbol || "BTCUSDT", interval = args.interval || "1d", days = Number(args.days || 200);
-  const data = await fetchKlinesChecked(symbol, interval, days);
+  const data = await fetchBarsChecked(args.broker, symbol, interval, days);
   if (data.length < 30) return { ok: false, error: `데이터 부족(${data.length}봉)` };
+  // broker-aware(Task #2): 비-binance(토스) 백테스트는 단일 심볼·단일 TF만 — 보조심볼/MTF 데이터 소스 미연동.
+  //  silent 하게 binance 로 폴백하지 않고 명시 거부(fail-closed): 아래 MTF/스프레드 빌드가 fetchKlines(binance)라.
+  if (args.broker && args.broker !== "binance" &&
+      (collectSpreadSymbols(args.tree).length || collectMtfConditions(args.tree).length || collectMtfRegimeConditions(args.tree).length)) {
+    return { ok: false, error: `${args.broker} 백테스트는 단일 심볼·단일 타임프레임만 지원(스프레드/MTF 조건은 binance 전용 — 보조심볼 데이터 미연동).` };
+  }
   // 스프레드/MTF 조건이 있으면 상대심볼·상위TF를 동일 봉에 정렬해 주입(전체→슬라이스). 없으면 undefined(기존 동작).
   const spreadSyms = collectSpreadSymbols(args.tree);
   const aux = spreadSyms.length ? await buildAuxSeries(data, spreadSyms, interval) : undefined;
@@ -168,12 +193,12 @@ export async function backtest(args: { tree: StrategyNode; symbol?: string; inte
 }
 
 // ── 3. backtest_short (sell=숏진입, buy=커버) ──
-export async function backtestShort(args: { tree: StrategyNode; symbol?: string; interval?: string; days?: number; risk?: Parameters<typeof runShortBacktest>[3] }) {
+export async function backtestShort(args: { tree: StrategyNode; symbol?: string; interval?: string; days?: number; risk?: Parameters<typeof runShortBacktest>[3]; broker?: string }) {
   if ((args.tree as { type?: string })?.type === "limit_bracket") return { ok: false, error: "지정가 브래킷 봇은 백테스트 비대상입니다 — 인디케이터 엔진 대응물이 없는 주문관리 봇입니다." };
   const err = validateRootNode(args.tree);
   if (err) return { ok: false, error: `검증 실패: ${err}` };
   const symbol = args.symbol || "BTCUSDT", interval = args.interval || "1d", days = Number(args.days || 200);
-  const data = await fetchKlinesChecked(symbol, interval, days);
+  const data = await fetchBarsChecked(args.broker, symbol, interval, days);
   if (data.length < 30) return { ok: false, error: `데이터 부족(${data.length}봉)` };
   const res = runShortBacktest(args.tree, data, cfg(data, symbol, interval), args.risk ?? {});
   return {
