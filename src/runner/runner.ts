@@ -574,6 +574,71 @@ async function forceReconcileOnUnknown(bot: store.BotRow, cur: PaperPosition | n
   return cur;
 }
 
+/**
+ * #6 상주 보호주문(SL/TP) 거래소 체결 reconcile — **바이낸스 라이브 단일봇 한정**.
+ *
+ * 왜(명제 핵심): syncBotProtective가 건 거래소 상주 STOP/TP가 거래소에서 발동·체결되면 getOpenOrders에서 사라진다
+ *   (OPEN만 반환). 그런데 바이낸스는 reconcileLivePosition을 스킵(getOrderByClientId 보유)하므로, 봇 장부는 그
+ *   체결을 **영영 못 잡고** 유령 보유로 남는다(실현손익 미기록 + 다음 신호의 재매도 -2010 루프). '거래소 상주 스톱'이
+ *   리스크통제의 핵심 가치인데 그 체결이 장부에 안 잡히면 가치가 무너진다 → 이 함수가 메운다.
+ *
+ * 동작: 라이브 보유 포지션의 각 protectiveIds cid를 getOrderByClientId로 조회 → filled면 SELL을 멱등 기록
+ *   (idempotency_key=botId:prot:cid) + 포지션 차감/정리 + 잔여 leg 취소(고아 방지). 한 틱에 하나만 처리(보통 SL/TP 중 하나).
+ * 가드: 라이브 보유(live=true, qty>0) + protectiveIds 존재 + getOrderByClientId 지원(=바이낸스; KR은 미적용).
+ * 멱등/fail-closed: cid 기준 멱등키라 재조회해도 no-op. 조회 실패/모호(open/unknown)는 보유 유지(다음 틱 재시도).
+ * backtest≡live 영향 없음: 거래소가 실제 발동한 체결을 장부에 사후 반영할 뿐(새 진입/청산 결정 아님).
+ */
+async function reconcileProtectiveFills(bot: store.BotRow, cur: PaperPosition | null, lastIso: string): Promise<PaperPosition | null> {
+  if (!cur || cur.status !== "open" || !(cur.qty > 1e-9) || !cur.live) return cur;
+  const ids = cur.protectiveIds ?? [];
+  if (ids.length === 0) return cur;
+  const live = liveAdapterFor(bot);
+  if (!live) return cur;
+  const adapter = live.adapter as {
+    getOrderByClientId?: (s: string, c: string) => Promise<{ status: "filled" | "pending" | "rejected"; executedQty: number; price: number } | null>;
+    cancelOrderByClientId?: (s: string, c: string) => Promise<boolean>;
+  };
+  const getOrder = adapter.getOrderByClientId?.bind(adapter);
+  if (!getOrder) return cur; // KR(키움/한투/토스)은 조회 미지원 → 미적용(거래소 상주 스톱 자체가 없음)
+
+  let filledCid: string | null = null, fillPrice = 0, fillQty = 0;
+  for (const cid of ids) {
+    let o: Awaited<ReturnType<typeof getOrder>>;
+    try { o = await getOrder(bot.symbol, cid); }
+    catch (e) { store.insertLog(bot.id, "error", `[${live.env}] 보호주문 체결조회 실패(${cid}: ${e instanceof Error ? e.message : e}) → 보유 유지(다음 틱)`); continue; } // fail-closed
+    if (classifyFillStatus(o) === "filled" && o && o.executedQty > 1e-9) {
+      filledCid = cid;
+      fillPrice = o.price > 0 ? o.price : cur.entryAvg;
+      fillQty = Math.min(o.executedQty, cur.qty);
+      break; // 한 틱에 하나만(보통 SL 또는 TP 한 다리만 체결; 나머지는 아래에서 취소)
+    }
+  }
+  if (!filledCid) return cur;
+
+  // 잔여 leg 취소(체결 안 된 다른 보호주문). 거래소 OCO면 자동취소되나 별도 STOP+TP는 명시 취소(고아 방지).
+  //   취소 실패분만 remainIds로 추적(다음 틱 syncBotProtective/재시도가 정리).
+  const remainIds: string[] = [];
+  for (const cid of ids) {
+    if (cid === filledCid) continue;
+    try { const ok = adapter.cancelOrderByClientId ? await adapter.cancelOrderByClientId(bot.symbol, cid) : false; if (!ok) remainIds.push(cid); }
+    catch { remainIds.push(cid); }
+  }
+  const remainQty = +(cur.qty - fillQty).toFixed(8);
+  const stillOpen = remainQty > 1e-9;
+  const pnl = (fillPrice - cur.entryAvg) * fillQty;
+  const next: PaperPosition | null = stillOpen ? { ...cur, qty: remainQty, protectiveIds: remainIds } : null;
+  // 체결 기록 + 장부 갱신 원자화(멱등키=cid → 재조회/크래시 재시도에도 1회만). 중복(insertTrade null)이면 상태 변경 안 함.
+  const booked = store.tx(() => {
+    const t0 = store.insertTrade({ bot_id: bot.id, side: "sell", price: fillPrice, qty: fillQty, pnl, is_paper: 0, reason: "상주 SL/TP 거래소 체결(reconcile)", idempotency_key: `${bot.id}:prot:${filledCid}` });
+    if (t0) store.setBotPositionState(bot.id, next, true, true);
+    return t0;
+  });
+  if (!booked) return cur; // 이미 기록됨(멱등) → 현 상태 유지(이중 정리 방지)
+  audit({ event: "protective_fill_reconciled", botId: bot.id, env: live.env, cid: filledCid, qty: fillQty, price: fillPrice, pnl, remainQty });
+  store.insertLog(bot.id, "sell", `[실거래] 상주 보호주문 거래소 체결 reconcile -${fillQty} @${fillPrice} (pnl=${pnl.toFixed(2)})${stillOpen ? ` — 잔여 ${remainQty} 보유` : " — 청산 완료"}`);
+  return next;
+}
+
 // ── 지정가 진입 대기(pendingEntry) 상태머신 (audit P1-5, binance 라이브 한정) ──
 // 신호 봉에 LIMIT 배치 → 매 틱 resolvePendingEntry로 추적: 체결→개시 / 타임아웃→취소+캡게이트 시장가 폴백 / 거절→해제 / 조회실패→유지.
 // backtest≡live: 백테 게이트(handlers.backtest)가 동일 worse-of 모델 검증. 라이브 체결가(limit 또는 캡 시장가) ≤ 게이트 모델 → never-optimistic.
@@ -839,6 +904,9 @@ export async function tickBot(botId: string): Promise<{ action: "buy" | "sell" |
   // P1-2: 주문 결과불명(unknown)이 임계 누적 → 강제 getPositions reconcile(바이낸스 가드 우회)로 1회 수렴.
   //   reconcileLivePosition(KR 전용)이 못 덮는 바이낸스 발산을 보완. 스캐너는 별도 경로(여기 미도달).
   if ((cur?.unknownCount ?? 0) >= UNKNOWN_MAX_COUNT) cur = await forceReconcileOnUnknown(bot, cur);
+  // #6: 거래소 상주 SL/TP가 거래소에서 체결됐는지 확인해 장부에 사후 기록(바이낸스 라이브 한정, 신호평가 전).
+  //   바이낸스는 위 reconcile들이 스킵하므로 상주 스톱 체결을 여기서만 잡는다. KR은 상주 스톱 미지원이라 no-op.
+  cur = await reconcileProtectiveFills(bot, cur, lastIso);
 
   const curQty = cur && cur.status === "open" ? cur.qty : 0;
   // 체결 채널: 라이브로 연 포지션인가. 레거시 상태(live 필드 없음)는 페이퍼로 보수 처리(실주문 안 나감 — 안전측).
