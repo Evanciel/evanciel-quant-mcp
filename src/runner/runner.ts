@@ -592,55 +592,66 @@ async function forceReconcileOnUnknown(bot: store.BotRow, cur: PaperPosition | n
  * 멱등/fail-closed: cid 기준 멱등키라 재조회해도 no-op. 조회 실패/모호(open/unknown)는 보유 유지(다음 틱 재시도).
  * backtest≡live 영향 없음: 거래소가 실제 발동한 체결을 장부에 사후 반영할 뿐(새 진입/청산 결정 아님).
  */
-async function reconcileProtectiveFills(bot: store.BotRow, cur: PaperPosition | null, lastIso: string): Promise<PaperPosition | null> {
-  if (!cur || cur.status !== "open" || !(cur.qty > 1e-9) || !cur.live) return cur;
+async function reconcileProtectiveFills(bot: store.BotRow, cur: PaperPosition | null, lastIso: string): Promise<{ position: PaperPosition | null; booked: boolean }> {
+  if (!cur || cur.status !== "open" || !(cur.qty > 1e-9) || !cur.live) return { position: cur, booked: false };
   const ids = cur.protectiveIds ?? [];
-  if (ids.length === 0) return cur;
+  if (ids.length === 0) return { position: cur, booked: false };
   const live = liveAdapterFor(bot);
-  if (!live) return cur;
+  if (!live) return { position: cur, booked: false };
   const adapter = live.adapter as {
     getOrderByClientId?: (s: string, c: string) => Promise<{ status: "filled" | "pending" | "rejected"; executedQty: number; price: number } | null>;
     cancelOrderByClientId?: (s: string, c: string) => Promise<boolean>;
   };
   const getOrder = adapter.getOrderByClientId?.bind(adapter);
-  if (!getOrder) return cur; // KR(키움/한투/토스)은 조회 미지원 → 미적용(거래소 상주 스톱 자체가 없음)
+  if (!getOrder) return { position: cur, booked: false }; // KR(키움/한투/토스)은 조회 미지원 → 미적용(거래소 상주 스톱 자체가 없음)
 
-  let filledCid: string | null = null, fillPrice = 0, fillQty = 0;
+  // 모든 보호 leg 조회 → 체결분 **합산**(적대검증 F3: 다중 leg가 같은 틱에 체결되면 한 다리만 기록하던 break는 나머지 체결분을
+  //   유실 → 장부 과대·오버셀 위험). 미체결/조회실패 leg는 분류해 잔존/취소 처리.
+  const filledCids: string[] = [];
+  let filledQtySum = 0, fillNotional = 0;
+  const openCids: string[] = [];     // pending/rejected 등 아직 체결 아님 → 잔여 포지션이면 취소
+  const queryFailed: string[] = [];  // 조회 실패 → 상태 불명, 잔존 추적(체결로 오기록 금지, fail-closed)
   for (const cid of ids) {
     let o: Awaited<ReturnType<typeof getOrder>>;
     try { o = await getOrder(bot.symbol, cid); }
-    catch (e) { store.insertLog(bot.id, "error", `[${live.env}] 보호주문 체결조회 실패(${cid}: ${e instanceof Error ? e.message : e}) → 보유 유지(다음 틱)`); continue; } // fail-closed
+    catch (e) { store.insertLog(bot.id, "error", `[${live.env}] 보호주문 체결조회 실패(${cid}: ${e instanceof Error ? e.message : e}) → 상태 불명, 잔존 추적`); queryFailed.push(cid); continue; }
     if (classifyFillStatus(o) === "filled" && o && o.executedQty > 1e-9) {
-      filledCid = cid;
-      fillPrice = o.price > 0 ? o.price : cur.entryAvg;
-      fillQty = Math.min(o.executedQty, cur.qty);
-      break; // 한 틱에 하나만(보통 SL 또는 TP 한 다리만 체결; 나머지는 아래에서 취소)
+      filledCids.push(cid);
+      const q = o.executedQty;
+      filledQtySum += q;
+      fillNotional += (o.price > 0 ? o.price : cur.entryAvg) * q;
+    } else {
+      openCids.push(cid); // 미체결(pending/rejected/not_placed/unknown) — 체결로 보지 않음(fail-closed)
     }
   }
-  if (!filledCid) return cur;
+  if (filledCids.length === 0) return { position: cur, booked: false };
 
-  // 잔여 leg 취소(체결 안 된 다른 보호주문). 거래소 OCO면 자동취소되나 별도 STOP+TP는 명시 취소(고아 방지).
-  //   취소 실패분만 remainIds로 추적(다음 틱 syncBotProtective/재시도가 정리).
+  const totalFilled = Math.min(filledQtySum, cur.qty);                              // 포지션 초과 캡(reduceOnly 안전)
+  const fillPrice = filledQtySum > 0 ? fillNotional / filledQtySum : cur.entryAvg;  // 수량가중 평균 체결가
+  const remainQty = +(cur.qty - totalFilled).toFixed(8);
+  const stillOpen = remainQty > 1e-9;
+
+  // 미체결 leg 취소(체결 leg는 이미 소멸). 취소 실패분 + 조회 실패분은 remainIds로 추적(다음 틱 재조회/재시도).
   const remainIds: string[] = [];
-  for (const cid of ids) {
-    if (cid === filledCid) continue;
+  for (const cid of openCids) {
     try { const ok = adapter.cancelOrderByClientId ? await adapter.cancelOrderByClientId(bot.symbol, cid) : false; if (!ok) remainIds.push(cid); }
     catch { remainIds.push(cid); }
   }
-  const remainQty = +(cur.qty - fillQty).toFixed(8);
-  const stillOpen = remainQty > 1e-9;
-  const pnl = (fillPrice - cur.entryAvg) * fillQty;
+  remainIds.push(...queryFailed);
+
+  const pnl = (fillPrice - cur.entryAvg) * totalFilled;
   const next: PaperPosition | null = stillOpen ? { ...cur, qty: remainQty, protectiveIds: remainIds } : null;
-  // 체결 기록 + 장부 갱신 원자화(멱등키=cid → 재조회/크래시 재시도에도 1회만). 중복(insertTrade null)이면 상태 변경 안 함.
+  // 체결 기록 + 장부 갱신 원자화(멱등키=체결 cid 정렬조인 → 재조회/크래시 재시도에도 1회만). 중복이면 상태 변경 안 함.
+  const idemKey = `${bot.id}:prot:${[...filledCids].sort().join("+")}`;
   const booked = store.tx(() => {
-    const t0 = store.insertTrade({ bot_id: bot.id, side: "sell", price: fillPrice, qty: fillQty, pnl, is_paper: 0, reason: "상주 SL/TP 거래소 체결(reconcile)", idempotency_key: `${bot.id}:prot:${filledCid}` });
+    const t0 = store.insertTrade({ bot_id: bot.id, side: "sell", price: fillPrice, qty: totalFilled, pnl, is_paper: 0, reason: "상주 SL/TP 거래소 체결(reconcile)", idempotency_key: idemKey });
     if (t0) store.setBotPositionState(bot.id, next, true, true);
     return t0;
   });
-  if (!booked) return cur; // 이미 기록됨(멱등) → 현 상태 유지(이중 정리 방지)
-  audit({ event: "protective_fill_reconciled", botId: bot.id, env: live.env, cid: filledCid, qty: fillQty, price: fillPrice, pnl, remainQty });
-  store.insertLog(bot.id, "sell", `[실거래] 상주 보호주문 거래소 체결 reconcile -${fillQty} @${fillPrice} (pnl=${pnl.toFixed(2)})${stillOpen ? ` — 잔여 ${remainQty} 보유` : " — 청산 완료"}`);
-  return next;
+  if (!booked) return { position: cur, booked: false }; // 이미 기록됨(멱등) → 현 상태 유지(이중 정리 방지)
+  audit({ event: "protective_fill_reconciled", botId: bot.id, env: live.env, cids: filledCids, qty: totalFilled, price: fillPrice, pnl, remainQty });
+  store.insertLog(bot.id, "sell", `[실거래] 상주 보호주문 거래소 체결 reconcile -${totalFilled} @${fillPrice.toFixed(2)} (pnl=${pnl.toFixed(2)})${stillOpen ? ` — 잔여 ${remainQty} 보유` : " — 청산 완료"}`);
+  return { position: next, booked: true };
 }
 
 // ── 지정가 진입 대기(pendingEntry) 상태머신 (audit P1-5, binance 라이브 한정) ──
@@ -751,11 +762,28 @@ async function resolveUnknownEntry(bot: store.BotRow, cur: PaperPosition, lastIs
   if (typeof adapter.getPositions !== "function") { store.setBotPositionState(bot.id, null, true, false); return null; } // 조회 불가 어댑터 → 마커만 해제(보수: 억제 무한지속 금지)
   let exPos: ExchangePos[];
   try { exPos = await getReconcilePositions(bot.broker, live.env, () => (adapter.getPositions as () => Promise<ExchangePos[]>)()); }
-  catch (e) { store.insertLog(bot.id, "error", `[${live.env}] 진입 결과불명 reconcile 조회 실패(${e instanceof Error ? e.message : e}) → 마커 유지(다음 틱)`); store.setBotPositionState(bot.id, cur, true, false); return cur; }
+  catch (e) {
+    // 적대검증 F9: 조회 실패(rate-limit/broker down)도 '미확인'으로 카운트 → 무한 억제 금지. 임계 연속 실패 시 마커 해제.
+    const m = (pue.misses ?? 0) + 1;
+    if (m >= RECON_CLEAR_MISSES) {
+      store.setBotPositionState(bot.id, null, true, false);
+      store.insertLog(bot.id, "error", `[${live.env}] 진입 결과불명 조회 ${RECON_CLEAR_MISSES}회 연속 실패(${e instanceof Error ? e.message : e}) → 마커 해제(재진입 허용, 무한 억제 금지)`);
+      return null;
+    }
+    const kept: PaperPosition = { ...cur, pendingUnknownEntry: { ...pue, misses: m } };
+    store.setBotPositionState(bot.id, kept, true, false);
+    store.insertLog(bot.id, "error", `[${live.env}] 진입 결과불명 조회 실패(${m}/${RECON_CLEAR_MISSES}, ${e instanceof Error ? e.message : e}) → 마커 유지`);
+    return kept;
+  }
   let rec = reconcilePositionFromExchange(null, exPos, bot.symbol);
   if (rec.action === "no_exchange_pos" && bot.broker === "binance") rec = reconcilePositionFromExchange(null, exPos, baseAsset(bot.symbol));
 
-  if (rec.action === "adopt" && rec.next && rec.next.qty > 1e-9) {
+  // 적대검증 F8: 같은 심볼 다중 포지션 매칭(ambiguous)이면 봇 귀속 모호(수동/타봇 혼재 가능) → 입양 거부(fail-closed).
+  //   아래 misses 누적 경로로 빠져 결국 마커 해제. (1봇1심볼 가정 — reconcilePositionFromExchange와 동일 전제.)
+  if (rec.action === "adopt" && rec.ambiguous) {
+    store.insertLog(bot.id, "gate", `[${live.env}] 진입 결과불명 입양 보류: ${bot.symbol} 거래소 다중 포지션(모호) — 오입양 방지`);
+  }
+  if (rec.action === "adopt" && !rec.ambiguous && rec.next && rec.next.qty > 1e-9) {
     const adoptQty = Math.min(rec.next.qty, pue.intendedQty); // 의도수량 한도 — 수동보유 초과분은 미입양(오입양 방지)
     if (adoptQty > 1e-9) {
       const entryAvg = rec.next.entryAvg > 0 ? rec.next.entryAvg : (price > 0 ? price : 0);
@@ -767,10 +795,17 @@ async function resolveUnknownEntry(bot: store.BotRow, cur: PaperPosition, lastIs
         if (t0) store.setBotPositionState(bot.id, { status: "open", entryAvg, qty: adoptQty, openedAt, live: true, peakPrice, protectiveIds: [], protFails: 0 } satisfies PaperPosition, true, true);
         return t0;
       });
-      if (!booked) { // 이미 입양됨(멱등) — 현 거래소 보유를 그대로 포지션화(마커만 제거)
-        const adopted: PaperPosition = { status: "open", entryAvg, qty: adoptQty, openedAt, live: true, peakPrice, protectiveIds: cur.protectiveIds ?? [], protFails: 0 };
-        store.setBotPositionState(bot.id, adopted, true, false);
-        return adopted;
+      if (!booked) {
+        // 멱등 중복(이미 입양됨) — 적대검증 F1/F7: 현재 거래소 qty로 덮으면 장부≠포지션 발산·나체 위험.
+        //   **장부 진실(liveOpenLedger)**로 포지션 재구성해 trades≡position_state 보장. 마커 제거.
+        const led = store.liveOpenLedger(bot.id);
+        if (led.qty > 1e-9) {
+          const adopted: PaperPosition = { status: "open", entryAvg: led.avgPrice, qty: led.qty, openedAt, live: true, peakPrice: Math.max(led.avgPrice, price), protectiveIds: cur.protectiveIds ?? [], protFails: cur.protFails ?? 0 };
+          store.setBotPositionState(bot.id, adopted, true, false);
+          return adopted;
+        }
+        store.setBotPositionState(bot.id, null, true, false); // 장부도 0 → 마커만 해제(유령 없음)
+        return null;
       }
       const ps = await syncBotProtective(bot, true, bot.symbol, adoptQty, entryAvg, peakPrice, risk, []);
       const protFails = nextProtFails(0, ps, (risk.stopLossPercent != null || risk.trailingStopPercent != null));
@@ -980,7 +1015,13 @@ export async function tickBot(botId: string): Promise<{ action: "buy" | "sell" |
   if ((cur?.unknownCount ?? 0) >= UNKNOWN_MAX_COUNT) cur = await forceReconcileOnUnknown(bot, cur);
   // #6: 거래소 상주 SL/TP가 거래소에서 체결됐는지 확인해 장부에 사후 기록(바이낸스 라이브 한정, 신호평가 전).
   //   바이낸스는 위 reconcile들이 스킵하므로 상주 스톱 체결을 여기서만 잡는다. KR은 상주 스톱 미지원이라 no-op.
-  cur = await reconcileProtectiveFills(bot, cur, lastIso);
+  const pfill = await reconcileProtectiveFills(bot, cur, lastIso);
+  cur = pfill.position;
+  if (pfill.booked) {
+    // 적대검증 F4: 상주 보호주문이 이번 봉에 체결됐으면 같은 봉 재진입/재매매 금지(백테 sltpExited 미러 — 백테는 SL/TP
+    //   청산 봉에 재진입 안 함). 다음 틱(다음 봉)에 재평가. 잔여 보유분 보호주문은 다음 틱 hold 경로가 재배치.
+    return { action: "sell", detail: "상주 보호주문 거래소 체결 — 같은 봉 청산(재진입은 다음 틱)" };
+  }
 
   const curQty = cur && cur.status === "open" ? cur.qty : 0;
   // 체결 채널: 라이브로 연 포지션인가. 레거시 상태(live 필드 없음)는 페이퍼로 보수 처리(실주문 안 나감 — 안전측).
