@@ -97,3 +97,43 @@ gentle 울트라코드 검증 워크플로우(8 에이전트)로 Batch 1~5 수�
 
 ## 불변
 메인넷 실거래 OFF 유지. 전 수정 backtest≡live·fail-closed 보존. 각 배치 tsc 0 + vitest 그린 후 커밋(author=eshurei 고정).
+
+---
+
+# 후속 마무리 (2026-06-23) — testnet 키 가용으로 보류분 해소
+
+> 방법: 울트라코드 UNDERSTAND 워크플로우(7맵+합성, 48항목 매핑)로 전 보류항목을 현재 코드에 매핑 + 검증가능성 분류.
+> BINANCE_ENV=testnet·KIWOOM_ENV=mock 키가 둘 다 존재 → 보류분 다수 검증 가능. 메인넷 OFF 유지.
+
+## ✅ 완료(코드+검증)
+- **#6 상주 SL/TP 거래소 체결 reconcile**(커밋 c49407b): 바이낸스 라이브 단일봇이 건 거래소 상주 STOP/TP가 거래소에서
+  체결되면 getOpenOrders에서 사라져(OPEN만 반환) 봇 장부가 영영 못 잡던 구멍(바이낸스는 reconcileLivePosition 스킵)을 메움.
+  `reconcileProtectiveFills`(신호평가 전): protectiveIds 각 cid를 getOrderByClientId로 조회→filled면 SELL 멱등기록
+  +잔여 leg 취소+포지션 정리. **단위테스트 + testnet E2E 7/0**(상주 NEW 오기록 0 + 실 filled 응답 계약).
+- **#5 신규 진입 결과불명(unknown) 회수**(커밋 024f891): fresh-entry 시장가 placeOrder가 unknown으로 끝나면 pendingUnknownEntry
+  마커 영속(intendedQty 기록, 유령 거래 미기록)→resolveUnknownEntry가 거래소 실보유를 의도수량 한도로 입양 또는 3틱 부재 시
+  해제. 미해소 동안 재진입 억제(바 롤오버 이중매수 차단). **Batch-6이 되돌린 '직전봉 cid 입양'은 재도입 안 함.** 단위테스트 4.
+- **#15 getOpenOco read-back 단위테스트**(커밋 c49407b): 편다리/0가격/3leg/선물/빈배열 8케이스(코드는 기존 정상).
+- **P0-4-F 지정가 진입 testnet E2E**(scripts/verify-limit-entry-testnet): 4/0(배치→pending→조회 open→취소→rejected).
+- **울트라코드 적대검증 5건 수정**(커밋 ae608a9): 6에이전트→9발견 중 진짜 5 수정(F3 다중leg합산·F4 같은봉 재진입억제·
+  F1/F7 멱등폴백 장부정합·F9 throw시 마커정체·F8 ambiguous 입양거부) + 2 오탐(F2/F5). #6 testnet E2E 7/0 재검증.
+
+## ✅ 검증(코드 기존, 재검증)
+- **#4 KR 지연체결 adopt**: 로직은 kiwoom-reconcile.test.ts 단위 + 이전 키움 모의 E2E 4/4(커밋 2377be9)로 검증됨.
+  6/23 라이브 재실행은 kiwoom mock의 getPositions **429 rate-limit**(환경 제약, 코드 결함 아님)으로 보류.
+
+## ⛔ 드롭(오탐 — 행동 전 검증으로 회피)
+- **P0-3.1 스캐너 상주스톱 배선**: UNDERSTAND 워크플로우가 1순위로 올렸으나, bot-handlers.ts:99 **스캐너 라이브는 명시 거절**
+  (audit P1-23)이라 라이브 포지션 도달 불가 = 실 머니패스 리스크 아님. 라이브에만 상주스톱 달면 backtest≡live도 깨짐(스캐너 백테는
+  compositeRisk 미적용). #22/#25가 올바르게 차단으로 분류. (#2 오탐 교훈: 거래소/도달성 가정은 검증 후 행동.)
+
+## ⏸ 연기(후속, 사유 명시)
+- **P0-5 엔진 포지션 시딩**: runCompositeBacktest(깊은 상태함수)에 라이브 포지션 시딩 = backtest≡live 불변식을 조용히 깰 위험.
+  interim 가드(audit #9, Batch-6 하드닝)가 이미 **안전**을 확보하므로 안전 구멍 아님(정확도 개선). 전용 패리티 하니스와 함께 후속.
+- **여전히 차단(키/거래소 부재)**: #1 KR OCO·#20 TP intrabar(KR 상주스톱 미지원)·#14 트레일링 레이스(KR)·#13 Toss FX·
+  #11 Toss 세션게이트(Toss sandbox 없음)·#4 일반 KR pending tracker(KIS getOpenOrders throw, P1-10)·#22/#25 스캐너 라이브(fail-closed).
+
+## 운영 메모
+- **C: 디스크 0 바이트 위기**: E2E 스크립트가 tmpdir() 데이터 디렉토리를 정리 안 해 926개(~52GB) 누적 → C: 100% 충만.
+  정리함. node/npm/tsx의 TEMP/TMP를 E:로 우회해 ENOSPC 회피. 후속: E2E 스크립트에 temp 정리 추가(verify-testnet-protective-fill-e2e는 추가됨) 또는 CLAUDE_CODE_TMPDIR.
+- vitest 667, tsc 0. 커밋 c49407b·024f891·ae608a9. 메인넷 실거래 OFF.
