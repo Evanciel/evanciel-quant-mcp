@@ -318,8 +318,10 @@ export function planPositionDelta(
 }
 
 /** 백테스트 결과의 trade 시퀀스에서 "현재 보유 여부 + 평단/수량"을 도출(net). (export: 라더 평단 패리티 테스트용 — audit P1-11) */
-export function derivePosition(trades: { action: string; price: number; quantity: number }[]): { holding: boolean; entryAvg: number; qty: number } {
-  let qty = 0, cost = 0;
+export function derivePosition(trades: { action: string; price: number; quantity: number }[], seed?: { qty: number; entryAvg: number }): { holding: boolean; entryAvg: number; qty: number } {
+  // P0-5: 시드(라이브 보유)로 시작하면 윈도우 트레이드를 그 위에 적용 → 엔진 시드 재실행 결과와 정합(backtest≡live).
+  let qty = seed && seed.qty > 1e-9 ? seed.qty : 0;
+  let cost = seed && seed.qty > 1e-9 ? seed.qty * seed.entryAvg : 0;
   for (const t of trades) {
     if (t.action === "buy") { cost += t.price * t.quantity; qty += t.quantity; }
     else { const sell = Math.min(t.quantity, qty); if (qty > 0) cost -= (cost / qty) * sell; qty -= sell; if (qty <= 1e-9) { qty = 0; cost = 0; } }
@@ -985,7 +987,7 @@ export async function tickBot(botId: string): Promise<{ action: "buy" | "sell" |
     trailingStopPercent: comp.trailing_stop_percent,
   };
   const res = runCompositeBacktest(root, data as unknown as Parameters<typeof runCompositeBacktest>[1], cfg, 0, risk);
-  const want = derivePosition(res.trades);
+  let want = derivePosition(res.trades);
   let cur = bot.position_state as PaperPosition | null;
   const lastIso = data[data.length - 1].datetime;
 
@@ -1065,7 +1067,18 @@ export async function tickBot(botId: string): Promise<{ action: "buy" | "sell" |
   const intervalMs = Math.max(1, bot.interval_seconds) * 1000;
   const openedMs = cur?.openedAt ? Date.parse(cur.openedAt) : NaN;
   const entryScrolledOut = Number.isFinite(openedMs) && Number.isFinite(oldestBarMs) && (openedMs - intervalMs) < oldestBarMs;
-  if (curQty > 1e-9 && (res.trades.length === 0 || entryScrolledOut)) {
+  // P0-5 근본해결: 진입봉 스크롤아웃 + 단순 SL/TP 경로(라더/스케일인/피라미딩 아님)면 엔진을 라이브 포지션으로 시드 재실행 →
+  //   want가 청산/보유를 정확히 산출(엔진이 '이미 보유 중'으로 봐 backtest≡live). 보수적 hold(아래)는 라더류·in-window 무신호에만.
+  const tpL = comp.tp_ladder as { length?: number } | null;
+  const scI = comp.scale_in as { ladder?: unknown[] } | null;
+  const pyr = comp.pyramid as { ladder?: unknown[] } | null;
+  const simplePath = !(tpL && (tpL.length ?? 0) > 0) && !((scI?.ladder?.length ?? 0) > 0) && !((pyr?.ladder?.length ?? 0) > 0);
+  if (curQty > 1e-9 && entryScrolledOut && simplePath && cur) {
+    const seededRes = runCompositeBacktest(root, data as unknown as Parameters<typeof runCompositeBacktest>[1], cfg, 0, risk, { position: curQty, avgEntryPrice: cur.entryAvg });
+    want = derivePosition(seededRes.trades, { qty: curQty, entryAvg: cur.entryAvg });
+    store.insertLog(botId, "gate", `[P0-5] 진입봉 스크롤아웃 → 엔진 포지션 시드 재평가: ${want.holding ? `보유 유지 ${want.qty}` : "청산 신호"}`);
+    // early-return 하지 않고 아래 정상 델타 경로로 진행(want가 청산이면 매도, 보유면 hold).
+  } else if (curQty > 1e-9 && (res.trades.length === 0 || entryScrolledOut)) {
     // 보유 유지하되 트레일링/protFails는 계속 갱신: 고정 SL뿐 아니라 '트레일링 스탑'도 고점 추종(래칫업)해야 한다.
     //   ⚠️ 적대검증 #9 후속: 종전 bare hold(early-return)는 하단 트레일링 재동기화(line~1007) 도달을 막아 장기보유 동안
     //   트레일링이 마지막 값에 동결(고정스탑 퇴화)되고 protFails 감지도 멈췄다 — 무음 리스크통제 저하. 여기서 직접 재동기화.

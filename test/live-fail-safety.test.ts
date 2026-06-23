@@ -237,20 +237,32 @@ describe("nextProtFails — SL(나체)만 비상 추적(현물 SL+TP 오청산 �
   });
 });
 
-// ── 적대검증 #9: (B) 윈도우스크롤 가드 — 진입봉이 300봉 윈도우 밖으로 밀린 장기보유는 엔진 넷(윈도우만 본)을
-//    신뢰하지 않고 보유 유지(전량 덤핑/초과 재매수 차단). SL/TP는 거래소 상주 스톱이 계속 보호. ──
-describe("(B) 윈도우스크롤 가드(P0-5 interim)", () => {
-  it("openedAt < 윈도우 oldest 봉 + 엔진 buy→sell 사이클(넷0) → 청산 안 함(보유 유지)", async () => {
-    reset(); // mode ok(체결 성공) — 가드 없으면 청산됨
-    const id = mkLiveBot("p05-scrolled", 5);
-    // 진입봉이 윈도우(2025 봉들)보다 한참 전(2024) → 스크롤아웃. 엔진은 윈도우 안 buy+sell만 봐 넷=0.
+// ── P0-5 엔진 포지션 시드(근본해결): 진입봉이 윈도우 밖으로 스크롤아웃돼도 단순 SL/TP 경로면 라이브 포지션으로 엔진을
+//    시드 재실행 → 청산 신호가 있으면 정확히 청산, 없으면 보유 유지(오청산/오매수 0). backtest≡live(seed-parity.test.ts 증명).
+//    interim 보수 가드(무조건 보유)는 라더/스케일인/피라미딩·in-window 무신호에만 잔존. ──
+describe("(B) P0-5 윈도우 스크롤아웃 시드 재평가", () => {
+  it("스크롤아웃 + 윈도우 청산 신호 → 시드 재평가로 정확히 청산(보유 5 전량, P0-5)", async () => {
+    reset(); // mode ok(체결 성공)
+    const id = mkLiveBot("p05-scrolled-exit", 5);
+    // 진입봉이 윈도우(2025)보다 한참 전(2024) → 스크롤아웃. 시드(5@90) 보유 시작 → 바25 가격110에서 청산 신호.
     store.setBotPositionState(id, { status: "open", entryAvg: 90, qty: 5, openedAt: "2024-06-01T00:00:00.000Z", live: true } satisfies PaperPosition);
-    klinesMock.mockResolvedValue(barsAt(50, (i) => (i < 25 ? 90 : 110))); // 저가 진입→고가 청산 1사이클(엔진 넷 0)
+    klinesMock.mockResolvedValue(barsAt(50, (i) => (i < 25 ? 90 : 110)));
     const r = await tickBot(id);
-    expect(r.action).toBe("hold");
-    expect(r.detail).toContain("스크롤아웃");
-    expect(store.recentTrades(id, 10).filter((t) => t.side === "sell")).toHaveLength(0); // 전량 덤핑 안 함
-    expect((store.getBot(id)?.position_state as PaperPosition).qty).toBe(5); // 보유 유지
+    expect(r.action).toBe("sell"); // 시드 엔진이 보유→청산 신호 인식 → 정확히 청산(이전 interim은 보수적으로 보유만 했음)
+    const sells = store.recentTrades(id, 10).filter((t) => t.side === "sell");
+    expect(sells).toHaveLength(1);
+    expect(sells[0].qty).toBe(5); // 보유 전량(초과/과소 아님)
+    expect(store.getBot(id)?.position_state).toBeNull();
+  });
+  it("스크롤아웃 + 청산 신호 없음(보유 신호만) → 시드 재평가로 보유 유지(오청산 0)", async () => {
+    reset();
+    const id = mkLiveBot("p05-scrolled-hold", 5);
+    store.setBotPositionState(id, { status: "open", entryAvg: 90, qty: 5, openedAt: "2024-06-01T00:00:00.000Z", live: true } satisfies PaperPosition);
+    klinesMock.mockResolvedValue(barsAt(50, () => 90)); // 전부 저가(매수 신호) — 시드 보유 중이라 재매수 차단, 청산 신호 없음
+    const r = await tickBot(id);
+    expect(r.action).toBe("hold"); // 보유 유지(오청산 없음)
+    expect(store.recentTrades(id, 10).filter((t) => t.side === "sell")).toHaveLength(0);
+    expect((store.getBot(id)?.position_state as PaperPosition).qty).toBe(5); // 5 유지(엔진 사이징 ~11로 재매수하지 않음)
   });
   it("openedAt가 윈도우 안이면 정상 청산(엔진 넷 신뢰 — backtest≡live)", async () => {
     reset();
@@ -261,16 +273,16 @@ describe("(B) 윈도우스크롤 가드(P0-5 interim)", () => {
     expect(r.action).toBe("sell"); // 진입봉 윈도우 내 → 엔진 청산 신호 반영
   });
 
-  it("off-by-one 경계(#9): 진입봉이 윈도우 첫 봉 '직전'(openedAt=oldestBar open)이면 스크롤아웃 즉시 발동(첫 틱 오청산 차단)", async () => {
+  it("off-by-one 경계(#9): 진입봉이 윈도우 첫 봉 '직전'이면 스크롤아웃 즉시 발동 → 시드 재평가(보유 신호만이면 보유 유지, 오매수 0)", async () => {
     reset();
     const id = mkLiveBot("p09-boundary", 5); // interval 3600s
-    // 진입 봉 = data[0] 직전 봉(2024-12-31T23:00). 체결 openedAt = 그 봉 close = data[0] open(2025-01-01T00:00).
-    //   종전 `openedAt < oldestBar`(00:00<00:00=false)면 미발동→오청산. intervalMs 보정(openedAt-1봉<oldestBar)으로 발동→보유유지.
+    // 진입 봉 = data[0] 직전 봉. openedAt = data[0] open(2025-01-01T00:00). intervalMs 보정으로 스크롤아웃 발동 → 시드.
+    //   off-by-one 버그(미발동)면 시드 미적용 → 비시드 윈도우가 자본 사이징(~11)으로 want 산출 → 5→11 오매수. 발동 시 시드로 보유 5 유지.
     store.setBotPositionState(id, { status: "open", entryAvg: 90, qty: 5, openedAt: "2025-01-01T00:00:00.000Z", live: true } satisfies PaperPosition);
-    klinesMock.mockResolvedValue(barsAt(50, (i) => (i < 25 ? 90 : 110))); // 엔진 넷 0(buy+sell) — 종전이면 전량청산
+    klinesMock.mockResolvedValue(barsAt(50, () => 90)); // 매수 신호만(청산 없음) — 시드면 보유 5, 비시드면 11로 오매수
     const r = await tickBot(id);
-    expect(r.action).toBe("hold"); // 스크롤아웃 즉시 발동 → 보유 유지(오청산 차단)
-    expect(store.recentTrades(id, 10).filter((t) => t.side === "sell")).toHaveLength(0);
+    expect(r.action).toBe("hold"); // 스크롤아웃 발동 → 시드 → 보유 유지
+    expect(store.recentTrades(id, 10).filter((t) => t.side === "buy")).toHaveLength(0); // 오매수 0
     expect((store.getBot(id)?.position_state as PaperPosition).qty).toBe(5);
   });
 });

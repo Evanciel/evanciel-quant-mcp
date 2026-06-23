@@ -743,7 +743,12 @@ export function runCompositeBacktest(
   // composite(워크플로우) 레벨 SL/TP. live bot-runner의 composite.stop_loss_percent / take_profit_percent에 해당.
   // 활성 leaf가 자체 SL/TP를 갖지 않거나(=Case 2) 활성 leaf 자체가 없을 때(=Case 3)의 폴백 손절/익절선.
   // 미전달(undefined) 시 기존 동작과 100% 동일(폴백 없음) → 기존 호출부·테스트·퍼저 회귀 없음.
-  compositeRisk?: { stopLossPercent?: number | null; takeProfitPercent?: number | null; tpLadder?: LadderLevel[] | null; scaleIn?: ScaleInConfig | null; pyramid?: PyramidConfig | null; trailingStopPercent?: number | null }
+  compositeRisk?: { stopLossPercent?: number | null; takeProfitPercent?: number | null; tpLadder?: LadderLevel[] | null; scaleIn?: ScaleInConfig | null; pyramid?: PyramidConfig | null; trailingStopPercent?: number | null },
+  // P0-5 포지션 시드(라이브 러너 전용): 진입봉이 윈도우 밖으로 스크롤아웃된 장기보유를 엔진이 '이미 보유 중'으로 보게 한다.
+  //   단순 SL/TP 경로에서만 적용(라더/스케일인/피라미딩은 미지원 → 무시). 보유 중엔 재매수 차단(position!==0)·청산만 평가하므로
+  //   풀히스토리 백테가 그 시점에 보유 중이던 상태와 동일 → derivePosition(seed 동반)으로 want 동일(backtest≡live).
+  //   ⚠️ 의사결정(trades) 추출 전용 — balance/equity는 시드 매입비용 미반영이라 성능지표 산출엔 쓰지 말 것.
+  seed?: { position: number; avgEntryPrice: number }
 ): BacktestResult {
   if (depth > MAX_RECURSION_DEPTH) {
     console.error(`[backtest] composite max recursion depth (${MAX_RECURSION_DEPTH}) exceeded`);
@@ -776,6 +781,8 @@ export function runCompositeBacktest(
   const ladder = compositeRisk?.tpLadder && compositeRisk.tpLadder.length > 0 ? compositeRisk.tpLadder : null;
   const scaleIn = compositeRisk?.scaleIn && compositeRisk.scaleIn.ladder.length > 0 ? compositeRisk.scaleIn : null;
   const pyramid = compositeRisk?.pyramid && compositeRisk.pyramid.ladder.length > 0 ? compositeRisk.pyramid : null;
+  // P0-5 시드 주입: 단순 SL/TP 경로에서만(라더/스케일인/피라미딩은 포지션 라이프사이클이 달라 미지원). 보유 중 시작 → 재매수 차단.
+  if (seed && seed.position > 1e-9 && !ladder && !scaleIn && !pyramid) { position = seed.position; avgEntryPrice = seed.avgEntryPrice; }
 
   for (let i = 0; i < data.length; i++) {
     const price = data[i].close;
