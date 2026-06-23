@@ -290,6 +290,10 @@ export interface PaperPosition {
   // 지정가 진입 대기(audit P1-5, binance 라이브 한정). 신호 봉에 LIMIT 배치 후 체결/타임아웃까지 추적(크래시 생존 → cid로 재조회·중복방지).
   //   존재하면 무포지션(미체결) — resolvePendingEntry가 매 틱 최우선 해소(신호평가·reconcile 스킵). KR/스캐너는 진입 안 함(시장가).
   pendingEntry?: { cid: string; limitPrice: number; origQty: number; filledQty: number; placedBarIso: string; timeoutBars: number; maxSlippagePct: number };
+  // 신규 진입 결과불명(#5, binance 라이브 한정). 시장가 진입 placeOrder가 unknown(타임아웃/네트워크)으로 끝나면 주문이
+  //   거래소에 실렸는지 불명 → 마커 영속. resolveUnknownEntry가 매 틱 최우선 해소: 거래소 실보유를 의도수량(intendedQty)
+  //   한도로 입양(=내 주문이 실림) 또는 RECON_CLEAR_MISSES틱 연속 부재 시 해제(=안 실림). 존재하는 동안 재진입 억제(이중매수 차단).
+  pendingUnknownEntry?: { intendedQty: number; placedBarIso: string; misses: number };
 }
 
 /** 폴링 주기(초) → Binance kline 타임프레임. 인트라데이 봉이라야 시간대(hour) 조건이 의미. (export: create_bot 인터벌 검증 공유) */
@@ -728,6 +732,70 @@ async function resolvePendingEntry(bot: store.BotRow, cur: PaperPosition, lastIs
   return fillMarketFallback(bot, remaining, pe.limitPrice, pe.maxSlippagePct, lastIso, risk, base);
 }
 
+/**
+ * #5 신규 진입 결과불명 해소(바이낸스 라이브 한정). 시장가 진입 placeOrder가 unknown으로 끝난 뒤, 주문이 거래소에
+ * 실렸는지를 거래소 실보유(getPositions)로 확인한다. tickBot 최상단에서 pendingEntry 다음, 신호평가·reconcile보다 먼저 호출.
+ *
+ * - 거래소에 보유 발견(adopt): 내 주문이 실린 것 → **의도수량(intendedQty) 한도**로 입양(수동보유 초과분 미입양 = 오입양 방지).
+ *   BUY를 멱등 기록(placedBarIso 기준) + 포지션 확정 + 상주 보호주문 배치. 마커 제거 → 정상 운용 복귀.
+ * - 거래소 부재(no_exchange_pos): 주문이 안 실렸을 가능성. RECON_CLEAR_MISSES틱 연속 부재면 마커 해제(재진입 허용),
+ *   그 전엔 마커 유지(재진입 억제 = 바 롤오버 이중매수 차단). 조회 실패/게이트 미통과는 마커 유지(보수).
+ * 멱등/fail-closed: 의도수량 한도 캡 → 절대 과입양 없음. 미해소 동안 tickBot이 hold 반환(신규 매수 0).
+ * backtest 무관(라이브 전용 네트워크 실패 복구) — backtest≡live 영향 없음.
+ */
+async function resolveUnknownEntry(bot: store.BotRow, cur: PaperPosition, lastIso: string, price: number, risk: RiskCfg): Promise<PaperPosition | null> {
+  const pue = cur.pendingUnknownEntry!;
+  const live = liveAdapterFor(bot);
+  if (!live) { store.setBotPositionState(bot.id, cur, true, false); return cur; } // 게이트 미통과 → 유지(다음 틱)
+  const adapter = live.adapter as { getPositions?: () => Promise<ExchangePos[]> };
+  if (typeof adapter.getPositions !== "function") { store.setBotPositionState(bot.id, null, true, false); return null; } // 조회 불가 어댑터 → 마커만 해제(보수: 억제 무한지속 금지)
+  let exPos: ExchangePos[];
+  try { exPos = await getReconcilePositions(bot.broker, live.env, () => (adapter.getPositions as () => Promise<ExchangePos[]>)()); }
+  catch (e) { store.insertLog(bot.id, "error", `[${live.env}] 진입 결과불명 reconcile 조회 실패(${e instanceof Error ? e.message : e}) → 마커 유지(다음 틱)`); store.setBotPositionState(bot.id, cur, true, false); return cur; }
+  let rec = reconcilePositionFromExchange(null, exPos, bot.symbol);
+  if (rec.action === "no_exchange_pos" && bot.broker === "binance") rec = reconcilePositionFromExchange(null, exPos, baseAsset(bot.symbol));
+
+  if (rec.action === "adopt" && rec.next && rec.next.qty > 1e-9) {
+    const adoptQty = Math.min(rec.next.qty, pue.intendedQty); // 의도수량 한도 — 수동보유 초과분은 미입양(오입양 방지)
+    if (adoptQty > 1e-9) {
+      const entryAvg = rec.next.entryAvg > 0 ? rec.next.entryAvg : (price > 0 ? price : 0);
+      const openedAt = cur.openedAt ?? new Date().toISOString();
+      const peakPrice = Math.max(entryAvg, price);
+      // 체결 기록 + 포지션 확정 원자화(멱등키=placedBarIso → 재시도/크래시에도 1회). 마커 제거.
+      const booked = store.tx(() => {
+        const t0 = store.insertTrade({ bot_id: bot.id, side: "buy", price: entryAvg, qty: adoptQty, pnl: 0, is_paper: 0, reason: "신규 진입 결과불명 → 거래소 reconcile 입양", idempotency_key: `${bot.id}:${pue.placedBarIso}:unkadopt` });
+        if (t0) store.setBotPositionState(bot.id, { status: "open", entryAvg, qty: adoptQty, openedAt, live: true, peakPrice, protectiveIds: [], protFails: 0 } satisfies PaperPosition, true, true);
+        return t0;
+      });
+      if (!booked) { // 이미 입양됨(멱등) — 현 거래소 보유를 그대로 포지션화(마커만 제거)
+        const adopted: PaperPosition = { status: "open", entryAvg, qty: adoptQty, openedAt, live: true, peakPrice, protectiveIds: cur.protectiveIds ?? [], protFails: 0 };
+        store.setBotPositionState(bot.id, adopted, true, false);
+        return adopted;
+      }
+      const ps = await syncBotProtective(bot, true, bot.symbol, adoptQty, entryAvg, peakPrice, risk, []);
+      const protFails = nextProtFails(0, ps, (risk.stopLossPercent != null || risk.trailingStopPercent != null));
+      if (ps.failed > 0) noteProtectiveFailure(bot.id, protFails);
+      const adopted: PaperPosition = { status: "open", entryAvg, qty: adoptQty, openedAt, live: true, peakPrice, protectiveIds: ps.ids, protFails };
+      store.setBotPositionState(bot.id, adopted, true, true);
+      audit({ event: "unknown_entry_adopted", botId: bot.id, env: live.env, qty: adoptQty, entryAvg, intendedQty: pue.intendedQty });
+      store.insertLog(bot.id, "buy", `[실거래] 신규 진입 결과불명 → 거래소 보유 ${rec.next.qty} 확인, 의도 ${pue.intendedQty} 한도로 ${adoptQty} 입양 @${entryAvg}(상주 스톱 배치)`);
+      return adopted;
+    }
+  }
+  // 거래소 부재 → 주문 미발행 가능성. 연속 부재 누적 후 해제(그 전엔 재진입 억제 유지).
+  const misses = (pue.misses ?? 0) + 1;
+  if (misses >= RECON_CLEAR_MISSES) {
+    store.setBotPositionState(bot.id, null, true, false);
+    audit({ event: "unknown_entry_cleared", botId: bot.id, env: live.env, misses, intendedQty: pue.intendedQty });
+    store.insertLog(bot.id, "gate", `[${live.env}] 신규 진입 결과불명: 거래소 ${RECON_CLEAR_MISSES}틱 연속 부재 → 주문 미발행 판정, 마커 해제(재진입 허용)`);
+    return null;
+  }
+  const next: PaperPosition = { ...cur, pendingUnknownEntry: { ...pue, misses } };
+  store.setBotPositionState(bot.id, next, true, false);
+  store.insertLog(bot.id, "gate", `[${live.env}] 신규 진입 결과불명: 거래소 부재(${misses}/${RECON_CLEAR_MISSES}틱) — 재진입 억제 유지(지연반영 가능성)`);
+  return next;
+}
+
 // ── 포트폴리오 레벨 캡(opt-in) — 러너측 스냅샷 + 진입 게이트 적용 ──
 // 러너가 position_state 모양(단일 PaperPosition / 스캐너 심볼맵)을 알므로 노출 추출은 여기서 한다.
 // 게이트 자체는 safety.portfolioGate(순수). env 미설정이면 buildPortfolioSnapshot도 호출 안 됨 → 오버헤드/거동 변화 0.
@@ -893,6 +961,12 @@ export async function tickBot(botId: string): Promise<{ action: "buy" | "sell" |
     const pr = await resolvePendingEntry(bot, cur, lastIso, peRisk);
     return { action: "hold", detail: pr.detail };
   }
+  // #5 신규 진입 결과불명 해소(pendingEntry 다음 최우선). 미해소면 hold(재진입 억제=이중매수 차단). 해소(입양/해제) 시 계속 진행.
+  if (cur?.pendingUnknownEntry) {
+    cur = await resolveUnknownEntry(bot, cur, lastIso, price, risk);
+    if (cur?.pendingUnknownEntry) return { action: "hold", detail: "신규 진입 결과불명 — 거래소 reconcile 회수 대기(재진입 억제)" };
+    // 입양됐으면 cur=실포지션(아래 신호평가가 운용), 해제됐으면 cur=null(재평가). 둘 다 정상 진행.
+  }
 
   // ── P0-4 체결 reconcile(라이브 전용, 신호평가 전): 키움/KIS는 주문 시점 체결확인 불가(getOrderByClientId 미지원)
   //    → 매수 시장가가 pending+price0로 동결(fail-closed)된 뒤 거래소가 지연체결하면 거래소엔 실보유·장부엔 0(역방향
@@ -1006,6 +1080,15 @@ export async function tickBot(botId: string): Promise<{ action: "buy" | "sell" |
       return { action: "hold", detail: `지정가 진입 대기 @${fill.limitPrice}` };
     }
     if (fill.failed) {
+      // #5 신규 진입 결과불명(unknown): 주문이 거래소에 실렸을 수 있다(유령) → 재진입 억제 마커 영속.
+      //   다음 틱 resolveUnknownEntry가 거래소 실보유를 의도수량 한도로 입양(실림) 또는 N틱 부재 시 해제(안 실림).
+      //   바이낸스 라이브 신규 진입(curQty 0·추가매수 아님)에만 — 추가매수/KR/페이퍼는 종전대로 동결.
+      if (fill.unknown && curQty < 1e-9 && !plan.partial && bot.broker === "binance") {
+        const marker: PaperPosition = { status: "open", entryAvg: 0, qty: 0, openedAt: cur?.openedAt ?? new Date().toISOString(), live: false, pendingUnknownEntry: { intendedQty: buyQty, placedBarIso: lastIso, misses: 0 } };
+        store.setBotPositionState(botId, marker, true, false);
+        store.insertLog(botId, "error", `신규 진입 결과불명(${fill.note}) → 재진입 억제 + 다음 틱 거래소 reconcile 회수 대기(의도 ${buyQty})`);
+        return { action: "hold", detail: `진입 결과불명 — reconcile 회수 대기(${fill.note})` };
+      }
       // P0-1: 라이브 주문 실패/결과불명 → 페이퍼로 위장 기록하지 않고 동결(장부·상태 무변경). 다음 틱 재시도.
       store.setBotPositionState(botId, cur);
       return { action: "hold", detail: `라이브 매수 실패 — 동결(${fill.note})` };

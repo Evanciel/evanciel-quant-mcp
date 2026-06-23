@@ -122,15 +122,18 @@ describe("P0-1 채널 고정: 라이브 실패의 조용한 페이퍼 기록 금
     expect((store.getBot(id)?.position_state as PaperPosition).live).toBe(false); // 채널=페이퍼로 시작
   });
 
-  it("모호 실패(주문 throw + 조회 불가) 신규 진입 → 기록 없이 동결(이중 장부 방지)", async () => {
+  it("모호 실패(주문 throw + 조회 불가) 신규 진입 → 유령 기록 0 + 재진입 억제 마커(#5, 이중매수 방지)", async () => {
     reset(); calls.mode = "throwAll"; calls.getOrderThrows = true; // verdict unknown
     const id = mkLiveBot("p01-unknown", null);
     klinesMock.mockResolvedValue(barsAt(50, () => 90));
     const r = await tickBot(id);
     expect(r.action).toBe("hold");
-    expect(r.detail).toContain("동결");
-    expect(store.recentTrades(id, 10)).toHaveLength(0); // 주문이 나갔을 수도 → 페이퍼 기록 금지
-    expect(store.getBot(id)?.position_state).toBeNull();
+    // #5: 옛 '동결(null)'은 다음 봉 재매수를 허용했다 → 재진입 억제 마커로 강화(거래소 reconcile 회수 대기).
+    expect(r.detail).toContain("결과불명");
+    expect(store.recentTrades(id, 10)).toHaveLength(0); // 핵심: 주문이 나갔을 수도 → 유령 페이퍼/라이브 기록 금지
+    const ps = store.getBot(id)?.position_state as PaperPosition & { pendingUnknownEntry?: { intendedQty: number } };
+    expect(ps?.pendingUnknownEntry?.intendedQty).toBeGreaterThan(0); // 의도수량 기록(다음 틱 회수 근거)
+    expect(ps?.qty).toBe(0); // 포지션 수량 0(유령 보유 없음)
   });
 });
 
