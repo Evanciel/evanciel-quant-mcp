@@ -4,7 +4,7 @@
  * 증명: 진입봉이 윈도우 밖으로 스크롤아웃돼도, 라이브 포지션으로 **시드 재실행**한 윈도우 백테가
  *   풀히스토리 백테와 **동일한 want(보유/청산)** 를 낸다 → 라이브가 시드 결과를 써도 진실과 일치.
  * 지표는 period-1(=현재가, 룩백 절단 없음)로 시딩 정확성만 격리(지표 윈도우 절단은 별개·기존 사안).
- * 첫 청산까지의 결정만 비교(청산 후 balance 발산 — 러너는 청산 후 flat이라 무관).
+ * 청산→재진입까지 비교(시드 시 balance에서 매입원가 차감 → 재진입 사이징도 풀히스토리와 정합).
  */
 import { describe, it, expect } from "vitest";
 import { runCompositeBacktest } from "../src/core/backtest/engine.js";
@@ -76,5 +76,14 @@ describe("P0-5 시드 패리티 (backtest≡live)", () => {
     const full = wantFull(data, risk);
     expect(full.holding).toBe(false);
     eq(wantSeeded(data, K, risk), full);
+  });
+
+  it("청산→재진입(윈도우 내) → 시드 윈도우 = 풀히스토리(재진입 수량까지 일치)", () => {
+    // 바0 진입@90 → 바9 청산@120(sell>110) → 바10 재진입@90(buy<95) → 바11 보유.
+    // 시드 시 balance 미차감이면 청산대금이 미차감 원금 위에 더해져 재진입 want.qty가 과대(라이브 과매수) → 이 케이스가 게이트.
+    const data = [bar(0, 90), ...Array.from({ length: 8 }, (_, i) => bar(i + 1, 100)), bar(9, 120), bar(10, 90), bar(11, 100)];
+    const full = wantFull(data);
+    expect(full.holding).toBe(true); // 재진입 후 보유
+    eq(wantSeeded(data, K), full);   // 재진입 수량(qty)·평단까지 풀히스토리와 일치
   });
 });

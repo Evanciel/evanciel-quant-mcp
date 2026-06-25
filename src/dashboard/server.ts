@@ -2027,9 +2027,11 @@ function ensureHero(){if(heroChart)return;var el=document.getElementById('heroCh
 function heroTfBar(){var tfs=market==='kr'?[['1d','일']]:[['1h','1시간'],['1d','일'],['1w','주']];document.getElementById('heroTf').innerHTML=tfs.map(function(t){return '<span class="tfb '+(t[0]===heroTf?'on':'')+'" onclick="setHeroTf(&quot;'+t[0]+'&quot;)">'+t[1]+'</span>';}).join('');}
 function setHeroTf(tf){heroTf=tf;if(heroChart)heroChart.applyOptions({timeScale:{timeVisible:tf!=='1d'&&tf!=='1w'}});heroTfBar();heroLoad(heroBroker,heroSym,document.getElementById('heroSym').textContent);}
 function heroStopLive(){try{if(heroWs)heroWs.close();}catch(e){}heroWs=null;if(heroPoll){clearInterval(heroPoll);heroPoll=null;}}
-function heroLoad(broker,sym,label){heroBroker=broker;heroSym=sym;ensureHero();if(!heroSeries)return;document.getElementById('heroSym').textContent=label||sym;heroTfBar();heroStopLive();
- fetch('/api/candles?bot=sym:'+encodeURIComponent(broker)+':'+encodeURIComponent(sym)+'&tf='+heroTf).then(function(r){return r.json()}).then(function(d){if(!d.ok||!d.bars){document.getElementById('heroPx').textContent='—';return;}
-  heroSeries.setData(d.bars);heroChart.timeScale().fitContent();var last=d.bars[d.bars.length-1];if(last)document.getElementById('heroPx').textContent=pxStr(last.close);heroLiveOn(broker,sym,last);}).catch(function(){});}
+function heroLoad(broker,sym,label,_tries){heroBroker=broker;heroSym=sym;ensureHero();if(!heroSeries)return;document.getElementById('heroSym').textContent=label||sym;heroTfBar();heroStopLive();
+ var tries=_tries||0;
+ var retry=function(){if(tries<4&&heroBroker===broker&&heroSym===sym)setTimeout(function(){heroLoad(broker,sym,label,tries+1);},2000);}; // 콜드스타트/일시 429로 첫 fetch 실패 시 자동 재시도(심볼 안 바뀐 동안만) → 빈 차트 자가복구
+ fetch('/api/candles?bot=sym:'+encodeURIComponent(broker)+':'+encodeURIComponent(sym)+'&tf='+heroTf).then(function(r){return r.json()}).then(function(d){if(!d.ok||!d.bars){document.getElementById('heroPx').textContent='—';retry();return;}
+  heroSeries.setData(d.bars);heroChart.timeScale().fitContent();var last=d.bars[d.bars.length-1];if(last)document.getElementById('heroPx').textContent=pxStr(last.close);heroLiveOn(broker,sym,last);}).catch(function(e){console.error('heroLoad 실패',e);document.getElementById('heroPx').textContent='—';retry();});}
 function heroLiveOn(broker,sym,lastBar){
  if(broker==='binance'){try{heroWs=new WebSocket('wss://stream.binance.com:9443/ws/'+sym.toLowerCase()+'@kline_'+heroIv(heroTf));}catch(e){return;}
   heroWs.onmessage=function(e){if(!heroSeries)return;var k;try{k=JSON.parse(e.data).k}catch(err){return;}if(!k)return;try{heroSeries.update({time:Math.floor(k.t/1000),open:+k.o,high:+k.h,low:+k.l,close:+k.c});}catch(err){}document.getElementById('heroPx').textContent='$'+fmt(+k.c,+k.c<1?5:2);};}
@@ -2039,21 +2041,21 @@ function heroLiveOn(broker,sym,lastBar){
 var REGLBL={trend_up:'📈 상승추세',trend_down:'📉 하락추세',range:'↔️ 횡보',high_vol:'⚡ 고변동'};
 function mktToggleHtml(){return '<div class="mktoggle"><span class="mkt '+(market==='kr'?'on':'')+'" onclick="setMarket(&quot;kr&quot;)">📈 주식</span><span class="mkt '+(market==='crypto'?'on':'')+'" onclick="setMarket(&quot;crypto&quot;)">₿ 코인</span></div>';}
 function setMarket(m){if(market===m)return;market=m;heroTf='1d';var hd=HERO_DEFAULT[m];document.getElementById('mstrip').innerHTML='<span class="skel">불러오는 중…</span>';document.getElementById('topvol').innerHTML='<span class="skel">불러오는 중…</span>';document.getElementById('scanbody').innerHTML='<span class="skel">불러오는 중…</span>';heroLoad(hd[0],hd[1],hd[2]);loadMarket();loadScan();}
-function loadMarket(){fetch('/api/market?market='+market).then(function(r){return r.json()}).then(function(d){if(!d.ok){document.getElementById('mstrip').innerHTML=mktToggleHtml()+'<span class="skel">'+esc(d.error||'실패')+'</span>';return;}
+function loadMarket(){var reqMarket=market;fetch('/api/market?market='+reqMarket).then(function(r){return r.json()}).then(function(d){if(reqMarket!==market)return;if(!d.ok){document.getElementById('mstrip').innerHTML=mktToggleHtml()+'<span class="skel">'+esc(d.error||'실패')+'</span>';return;}
  var chips=(d.majors||[]).map(function(m){return '<div class="mchip" onclick="heroLoad(&quot;'+esc(itBroker(m))+'&quot;,&quot;'+esc(m.symbol)+'&quot;,&quot;'+esc(nameOf(m))+'&quot;)"><div class="ms">'+esc(nameOf(m))+'</div><div class="mp">'+pxStr(m.price)+'</div><div class="mc">'+pctSpan(m.changePct)+'</div></div>';}).join('');
  var regsrc=market==='kr'?'삼성전자':'BTC';
  var reg=d.regime?'<div class="regbadge reg-'+esc(d.regime.label)+'"><span class="rl">'+(REGLBL[d.regime.label]||esc(d.regime.label))+'</span><span class="hint" style="font-weight:400">'+regsrc+'레짐 · ADX '+Math.round(d.regime.adx)+'</span></div>':'';
  document.getElementById('mstrip').innerHTML=mktToggleHtml()+chips+reg;
  document.getElementById('topvol').innerHTML=(d.topVolume||[]).map(function(t,i){return '<div class="lrow" onclick="heroLoad(&quot;'+esc(itBroker(t))+'&quot;,&quot;'+esc(t.symbol)+'&quot;,&quot;'+esc(nameOf(t))+'&quot;)"><div><span class="rank">'+(i+1)+'</span><span class="ls">'+esc(nameOf(t))+'</span><div class="lsub" style="margin-left:26px">거래대금 '+fmtValue(market==='kr'?t.value:t.quoteVolume)+'</div></div><div class="lr">'+pxStr(t.price)+'<div class="lsub">'+pctSpan(t.changePct)+'</div></div></div>';}).join('')||'<span class="skel">데이터 없음</span>';
- }).catch(function(){});}
+ }).catch(function(e){console.error('loadMarket 실패',e);var ms=document.getElementById('mstrip');if(ms)ms.innerHTML=mktToggleHtml()+'<span class="skel">불러오기 실패</span>';var tv=document.getElementById('topvol');if(tv)tv.innerHTML='<span class="skel">불러오기 실패</span>';});}
 // 스캐너
 var SCANM=[['roc','모멘텀'],['relVolume','거래량급증'],['gapPct','갭'],['rangePct','변동성']];var scanMetric='roc';
 function scanTabs(){document.getElementById('scantabs').innerHTML=SCANM.map(function(m){return '<span class="scantab '+(m[0]===scanMetric?'on':'')+'" onclick="setScan(&quot;'+m[0]+'&quot;)">'+esc(m[1])+'</span>';}).join('');}
 function setScan(m){scanMetric=m;scanTabs();loadScan();}
 function loadScan(){var b=document.getElementById('scanbody');b.innerHTML='<span class="skel">스캔 중…</span>';
- fetch('/api/scan?metric='+scanMetric+'&market='+market).then(function(r){return r.json()}).then(function(d){if(!d.ok){b.innerHTML='<span class="skel">'+esc(d.error||'실패')+'</span>';return;}
-  var unit=scanMetric==='relVolume'?'x':'%';
-  b.innerHTML=(d.rows||[]).map(function(r,i){return '<div class="lrow" onclick="heroLoad(&quot;'+esc(itBroker(r))+'&quot;,&quot;'+esc(r.symbol)+'&quot;,&quot;'+esc(nameOf(r))+'&quot;)"><div><span class="rank">'+(i+1)+'</span><span class="ls">'+esc(nameOf(r))+'</span></div><div class="lr"><span class="'+(r.score>=0?'up':'dn')+'">'+(r.score>=0?'+':'')+fmt(r.score,2)+unit+'</span><div class="lsub">'+pxStr(r.price)+'</div></div></div>';}).join('')||'<span class="skel">결과 없음</span>';
+ var reqMarket=market;fetch('/api/scan?metric='+scanMetric+'&market='+reqMarket).then(function(r){return r.json()}).then(function(d){if(reqMarket!==market)return;if(!d.ok){b.innerHTML='<span class="skel">'+esc(d.error||'실패')+'</span>';return;}
+  var unit=scanMetric==='relVolume'?'x':'%';var signed=(scanMetric==='roc'||scanMetric==='gapPct'); // 부호·색은 등락 의미가 있는 모멘텀/갭만. relVolume(비율)·rangePct(변동성)은 항상 양수라 중립 표기
+  b.innerHTML=(d.rows||[]).map(function(r,i){var cls=signed?(r.score>=0?'up':'dn'):'';var sign=(signed&&r.score>=0)?'+':'';return '<div class="lrow" onclick="heroLoad(&quot;'+esc(itBroker(r))+'&quot;,&quot;'+esc(r.symbol)+'&quot;,&quot;'+esc(nameOf(r))+'&quot;)"><div><span class="rank">'+(i+1)+'</span><span class="ls">'+esc(nameOf(r))+'</span></div><div class="lr"><span class="'+cls+'">'+sign+fmt(r.score,2)+unit+'</span><div class="lsub">'+pxStr(r.price)+'</div></div></div>';}).join('')||'<span class="skel">결과 없음</span>';
  }).catch(function(){b.innerHTML='<span class="skel">스캔 실패</span>';});}
 // 포트폴리오(누적 실현손익 곡선 + 봇 성과)
 var eqChart=null,eqSeries=null;
@@ -2065,7 +2067,7 @@ function loadPortfolio(){fetch('/api/portfolio').then(function(r){return r.json(
   if(eqSeries){var seen={},data=[];for(var i=0;i<pts.length;i++){var t=pts[i].t;while(seen[t])t++;seen[t]=1;data.push({time:t,value:pts[i].cum});}eqSeries.setData(data);eqChart.timeScale().fitContent();}}
  var arr=(d.perBot||[]).filter(function(b){return b.closes>0||b.running;});
  document.getElementById('botperf').innerHTML=arr.slice(0,8).map(function(b){var v=b.realizedPnl;return '<div class="bpc"><div class="bn">'+(b.running?'🟢 ':'⚪ ')+esc(b.name)+'</div><div class="bv '+(v>=0?'up':'dn')+'">'+(v>=0?'+':'')+fmt(v,2)+'</div><div class="bm">승률 '+b.winRate+'% · '+b.closes+'청산 · '+esc(coin(b.symbol))+'</div></div>';}).join('');
- }).catch(function(){});}
+ }).catch(function(e){console.error('loadPortfolio 실패',e);});}
 (function(){var hd=HERO_DEFAULT[market];heroTfBar();heroLoad(hd[0],hd[1],hd[2]);scanTabs();loadMarket();loadScan();loadPortfolio();})();
 setInterval(loadMarket,30000);setInterval(loadScan,60000);setInterval(loadPortfolio,30000);
 const es=new EventSource('/events'); // same-origin SSE — 세션쿠키 자동 첨부

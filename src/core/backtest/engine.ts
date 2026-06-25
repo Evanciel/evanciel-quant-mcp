@@ -747,7 +747,7 @@ export function runCompositeBacktest(
   // P0-5 포지션 시드(라이브 러너 전용): 진입봉이 윈도우 밖으로 스크롤아웃된 장기보유를 엔진이 '이미 보유 중'으로 보게 한다.
   //   단순 SL/TP 경로에서만 적용(라더/스케일인/피라미딩은 미지원 → 무시). 보유 중엔 재매수 차단(position!==0)·청산만 평가하므로
   //   풀히스토리 백테가 그 시점에 보유 중이던 상태와 동일 → derivePosition(seed 동반)으로 want 동일(backtest≡live).
-  //   ⚠️ 의사결정(trades) 추출 전용 — balance/equity는 시드 매입비용 미반영이라 성능지표 산출엔 쓰지 말 것.
+  //   시드 시 매입원가를 balance에서 차감(line 785)하므로 청산→재진입 사이징까지 풀히스토리와 정합. equity 곡선은 윈도우 구간만 반영(전체 성능지표는 풀히스토리 백테 사용).
   seed?: { position: number; avgEntryPrice: number }
 ): BacktestResult {
   if (depth > MAX_RECURSION_DEPTH) {
@@ -782,7 +782,12 @@ export function runCompositeBacktest(
   const scaleIn = compositeRisk?.scaleIn && compositeRisk.scaleIn.ladder.length > 0 ? compositeRisk.scaleIn : null;
   const pyramid = compositeRisk?.pyramid && compositeRisk.pyramid.ladder.length > 0 ? compositeRisk.pyramid : null;
   // P0-5 시드 주입: 단순 SL/TP 경로에서만(라더/스케일인/피라미딩은 포지션 라이프사이클이 달라 미지원). 보유 중 시작 → 재매수 차단.
-  if (seed && seed.position > 1e-9 && !ladder && !scaleIn && !pyramid) { position = seed.position; avgEntryPrice = seed.avgEntryPrice; }
+  //   매입원가를 balance에서 차감(진입 회계 line 797/873과 동일) → 윈도우 내 청산→재진입 시 사이징(equity=balance)이 풀히스토리와 정합(backtest≡live).
+  if (seed && seed.position > 1e-9 && !ladder && !scaleIn && !pyramid) {
+    position = seed.position;
+    avgEntryPrice = seed.avgEntryPrice;
+    balance -= seed.position * seed.avgEntryPrice * (1 + (config.commission ?? 0.1) / 100);
+  }
 
   for (let i = 0; i < data.length; i++) {
     const price = data[i].close;

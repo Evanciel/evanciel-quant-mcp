@@ -122,22 +122,33 @@ export const KR_UNIVERSE: [string, string][] = [
 type KrBar = { date: string; datetime?: string; open: number; high: number; low: number; close: number; volume?: number };
 const krSleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 const _krCandleCache = new Map<string, { at: number; bars: KrBar[] }>();
+const _krInflight = new Map<string, Promise<KrBar[]>>();   // in-flight 합치기: 동시 동일코드 요청을 단일 Promise로(중복 업스트림/429 폭주 방지)
+const _krLastGood = new Map<string, KrBar[]>();             // 직전 성공 일봉(무TTL): 일시적 429에도 유니버스 구성 종목 안정화(stale 폴백)
 const KR_CANDLE_TTL = 600_000; // 일봉 10분
 async function krDaily(code: string): Promise<KrBar[]> {
   const c = _krCandleCache.get(code);
   if (c && Date.now() - c.at < KR_CANDLE_TTL) return c.bars;
-  const ad = getAdapter("kiwoom", "spot")?.adapter as { getCandles?: (s: string, i: string, n: number) => Promise<KrBar[]> } | undefined;
-  if (!ad?.getCandles) throw new Error("키움 미설정(키 필요)");
-  const bars = await ad.getCandles(code, "1d", 60);
-  _krCandleCache.set(code, { at: Date.now(), bars });
-  return bars;
+  const inflight = _krInflight.get(code);
+  if (inflight) return inflight; // 진행 중 동일코드 요청에 합류 → 콜드스타트/TTL만료 동시호출 중복 제거
+  const p = (async () => {
+    const ad = getAdapter("kiwoom", "spot")?.adapter as { getCandles?: (s: string, i: string, n: number) => Promise<KrBar[]> } | undefined;
+    if (!ad?.getCandles) throw new Error("키움 미설정(키 필요)");
+    const bars = await ad.getCandles(code, "1d", 60);
+    _krCandleCache.set(code, { at: Date.now(), bars });
+    return bars;
+  })();
+  _krInflight.set(code, p);
+  try { return await p; } finally { _krInflight.delete(code); }
 }
 async function krUniverseData(): Promise<{ code: string; name: string; bars: KrBar[] }[]> {
   const out: { code: string; name: string; bars: KrBar[] }[] = [];
   for (const [code, name] of KR_UNIVERSE) {
     const cached = _krCandleCache.get(code);
     const hit = cached && Date.now() - cached.at < KR_CANDLE_TTL;
-    try { const bars = await krDaily(code); if (bars.length >= 2) out.push({ code, name, bars }); } catch { /* 429/개별실패 스킵 */ }
+    let bars: KrBar[] | null = null;
+    try { bars = await krDaily(code); }
+    catch { bars = _krLastGood.get(code) ?? null; /* 429/개별실패 → 직전 성공값 폴백(없으면 스킵). 구성 종목 churn 방지 */ }
+    if (bars && bars.length >= 2) { _krLastGood.set(code, bars); out.push({ code, name, bars }); }
     if (!hit) await krSleep(150); // 실제 호출했을 때만 throttle(429 회피)
   }
   return out;
