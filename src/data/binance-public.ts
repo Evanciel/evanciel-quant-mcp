@@ -63,6 +63,22 @@ export async function fetchKlines(symbol: string, interval: string, limit: numbe
   return sorted.slice(-want).map(mapKline);
 }
 
+// 24시간 티커(전 심볼) — 대시보드 마켓 오버뷰/거래대금 랭킹용(읽기·키불필요). 30s 캐시(레이트리밋 보호).
+export interface Ticker24h { symbol: string; lastPrice: number; priceChangePercent: number; quoteVolume: number; highPrice: number; lowPrice: number }
+let _tickCache: { at: number; data: Ticker24h[] } | null = null;
+const TICK_TTL_MS = 30_000;
+export async function fetch24hrTickers(): Promise<Ticker24h[]> {
+  if (_tickCache && Date.now() - _tickCache.at < TICK_TTL_MS) return _tickCache.data;
+  const data = await withRetry(async () => {
+    const res = await fetch("https://api.binance.com/api/v3/ticker/24hr", { signal: AbortSignal.timeout(20000) });
+    if (!res.ok) { const ra = res.headers.get("retry-after"); throw new Error(`ticker24hr ${res.status} [http:${res.status}]${ra && /^\d+$/.test(ra.trim()) ? ` [retry-after:${ra.trim()}]` : ""}`); }
+    const raw = (await res.json()) as Record<string, string>[];
+    return raw.map((t) => ({ symbol: t.symbol, lastPrice: parseFloat(t.lastPrice), priceChangePercent: parseFloat(t.priceChangePercent), quoteVolume: parseFloat(t.quoteVolume), highPrice: parseFloat(t.highPrice), lowPrice: parseFloat(t.lowPrice) }));
+  });
+  _tickCache = { at: Date.now(), data };
+  return data;
+}
+
 // 현물 거래가능 심볼 목록 캐시(검색 자동완성용) — exchangeInfo는 크므로 1h 1회만 페치.
 let _symCache: { at: number; symbols: string[] } | null = null;
 const SYM_TTL_MS = 3_600_000;
