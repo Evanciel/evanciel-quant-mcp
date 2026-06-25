@@ -322,6 +322,18 @@ describe("P1-6 일일손실 통화 분리", () => {
     expect(checkLimits({ symbol: "BTCUSDT", notional: 500, quoteCurrency: "USDT" }).ok).toBe(false);
     delete process.env.LIVE_MAX_NOTIONAL;
   });
+
+  // ── rank3(2026-06-25): 전역 LIVE_MAX_TOTAL_NOTIONAL(통화표기 없음)이 KRW 버킷에 USDT단위로 오적용돼 KR 신규매수를 통째 차단하던 footgun. ──
+  it("rank3: 전역 LIVE_MAX_TOTAL_NOTIONAL은 KRW 신규매수를 오차단하지 않고(통화혼선 차단), 기본통화 USDT엔 여전히 적용", () => {
+    process.env.LIVE_TRADING_ENABLED = "true";
+    process.env.LIVE_MAX_TOTAL_NOTIONAL = "1000"; // USDT 의도 전역값(통화 미표기)
+    // 수정 전: KRW 버킷에 1000(원) 오적용 → 2000원 주문이 예산초과로 차단. 수정 후: KRW는 _KRW/기본값(1,000,000)만 → 통과.
+    expect(checkLimits({ symbol: "005930", notional: 2000, quoteCurrency: "KRW", side: "buy" }).ok).toBe(true);
+    // 전역값은 기본통화(USDT)엔 여전히 적용: cap 비차단 위해 LIVE_MAX_NOTIONAL 상향 후 totalCap(1000) 초과 → 차단.
+    process.env.LIVE_MAX_NOTIONAL = "5000";
+    expect(checkLimits({ symbol: "BTCUSDT", notional: 2000, quoteCurrency: "USDT", side: "buy" }).ok).toBe(false);
+    delete process.env.LIVE_MAX_TOTAL_NOTIONAL; delete process.env.LIVE_MAX_NOTIONAL;
+  });
 });
 
 describe("P1-24 dailyRealizedLoss fail-closed", () => {

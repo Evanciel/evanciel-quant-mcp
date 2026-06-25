@@ -60,16 +60,17 @@ export interface BotPerf { id: string; name: string; symbol: string; mode: strin
 export interface PortfolioAnalytics {
   curve: { t: number; cum: number }[];   // 누적 실현손익 시계열(체결 시점순)
   perBot: BotPerf[];
-  totals: { realized: number; closes: number; wins: number; winRate: number; bots: number; running: number };
+  totals: { realized: number; realizedLive: number; realizedPaper: number; closes: number; wins: number; winRate: number; bots: number; running: number };
 }
 export function portfolioAnalytics(bots: { id: string; name: string; symbol: string; mode: string; status?: string }[]): PortfolioAnalytics {
   // 누적 실현손익 곡선: 전 봇 체결을 시간 오름차순으로 누적(청산 시 pnl 기록).
   const trades = store.listTradesAll(1000).slice().sort((a, b) => (a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : 0));
-  let cum = 0;
+  let cum = 0, rLive = 0, rPaper = 0;
   const curve: { t: number; cum: number }[] = [];
   for (const tr of trades) {
     if (!tr.pnl) continue; // 진입(pnl=0)은 곡선에 점 안 찍음 — 청산 실현만
     cum += tr.pnl;
+    if (tr.is_paper) rPaper += tr.pnl; else rLive += tr.pnl; // paper/live 분리 집계 → totals로 split 노출('확정 수익' 모의 혼입 오인 방지)
     curve.push({ t: Math.floor(Date.parse(tr.ts) / 1000), cum: +cum.toFixed(2) });
   }
   const perBot: BotPerf[] = bots.map((b) => {
@@ -79,7 +80,7 @@ export function portfolioAnalytics(bots: { id: string; name: string; symbol: str
   const realized = perBot.reduce((a, b) => a + b.realizedPnl, 0);
   const closes = perBot.reduce((a, b) => a + b.closes, 0);
   const wins = perBot.reduce((a, b) => a + b.wins, 0);
-  return { curve, perBot, totals: { realized: +realized.toFixed(2), closes, wins, winRate: closes > 0 ? Math.round((wins / closes) * 100) : 0, bots: bots.length, running: perBot.filter((p) => p.running).length } };
+  return { curve, perBot, totals: { realized: +realized.toFixed(2), realizedLive: +rLive.toFixed(2), realizedPaper: +rPaper.toFixed(2), closes, wins, winRate: closes > 0 ? Math.round((wins / closes) * 100) : 0, bots: bots.length, running: perBot.filter((p) => p.running).length } };
 }
 
 // ── 스캐너 (유니버스 = 거래대금 상위 USDT 페어, 일봉 메트릭 랭킹) ──
@@ -158,7 +159,8 @@ export interface KrTickerView { symbol: string; name: string; price: number; cha
 function krView(u: { code: string; name: string; bars: KrBar[] }): KrTickerView {
   const n = u.bars.length, last = u.bars[n - 1], prev = u.bars[n - 2];
   const pc = prev && prev.close > 0 ? ((last.close - prev.close) / prev.close) * 100 : 0;
-  return { symbol: u.code, name: u.name, price: last.close, changePct: +pc.toFixed(2), value: last.close * (last.volume || 0), broker: "kiwoom" };
+  // 거래대금 근사: 키움 일봉은 체결대금 미제공 → 종가×거래량보다 typical price((고+저+종)/3)×거래량이 장중 가격대를 더 반영(추정치).
+  return { symbol: u.code, name: u.name, price: last.close, changePct: +pc.toFixed(2), value: ((last.high + last.low + last.close) / 3) * (last.volume || 0), broker: "kiwoom" };
 }
 let _krOvCache: { at: number; ov: unknown } | null = null;
 export async function krMarketOverview(): Promise<{ majors: KrTickerView[]; topVolume: KrTickerView[]; regime: MarketOverview["regime"]; market: "kr"; at: number }> {

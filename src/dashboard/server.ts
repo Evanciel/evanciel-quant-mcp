@@ -1297,7 +1297,7 @@ h1{font-size:20px;letter-spacing:.2px;background:linear-gradient(90deg,#e6e6e6,#
   <div class="card"><div class="k">지금 손익 <span class="hint">(안 팔았을 때)</span></div><div class="v" id="tot">+0.00</div></div>
   <div class="card"><div class="k">확정 수익 <span class="hint">(이미 번 돈)</span></div><div class="v" id="rtot">+0.00</div></div>
 </div>
-<div class="card eqcard panel"><div class="ph">📈 누적 실현손익 <span class="hint">전 봇 합산 · 청산 실현 기준</span></div>
+<div class="card eqcard panel"><div class="ph">📈 누적 실현손익 <span class="hint">전 봇 합산 · 청산 실현 기준</span><span class="hint" id="eqSplit"></span></div>
   <div class="eqchart" id="eqChart"></div>
   <div class="hint" id="eqEmpty" style="display:none;padding:18px;text-align:center">아직 청산 내역이 없어요 — 봇이 매매를 마치면 곡선이 그려져요.</div></div>
 <div class="botperf panel" id="botperf"></div>
@@ -2041,7 +2041,7 @@ function heroLiveOn(broker,sym,lastBar){
 var REGLBL={trend_up:'📈 상승추세',trend_down:'📉 하락추세',range:'↔️ 횡보',high_vol:'⚡ 고변동'};
 function mktToggleHtml(){return '<div class="mktoggle"><span class="mkt '+(market==='kr'?'on':'')+'" onclick="setMarket(&quot;kr&quot;)">📈 주식</span><span class="mkt '+(market==='crypto'?'on':'')+'" onclick="setMarket(&quot;crypto&quot;)">₿ 코인</span></div>';}
 function setMarket(m){if(market===m)return;market=m;heroTf='1d';var hd=HERO_DEFAULT[m];document.getElementById('mstrip').innerHTML='<span class="skel">불러오는 중…</span>';document.getElementById('topvol').innerHTML='<span class="skel">불러오는 중…</span>';document.getElementById('scanbody').innerHTML='<span class="skel">불러오는 중…</span>';heroLoad(hd[0],hd[1],hd[2]);loadMarket();loadScan();}
-function loadMarket(){var reqMarket=market;fetch('/api/market?market='+reqMarket).then(function(r){return r.json()}).then(function(d){if(reqMarket!==market)return;if(!d.ok){document.getElementById('mstrip').innerHTML=mktToggleHtml()+'<span class="skel">'+esc(d.error||'실패')+'</span>';return;}
+function loadMarket(){var reqMarket=market;fetch('/api/market?market='+reqMarket).then(function(r){return r.json()}).then(function(d){if(reqMarket!==market)return;if(!d.ok){var ms=document.getElementById('mstrip');if(!ms.querySelector('.mchip'))ms.innerHTML=mktToggleHtml()+'<span class="skel">'+esc(d.error||'실패')+'</span>';return;} // 갱신 실패 시 직전 칩 유지(stale-while-error, rank8)
  var chips=(d.majors||[]).map(function(m){return '<div class="mchip" onclick="heroLoad(&quot;'+esc(itBroker(m))+'&quot;,&quot;'+esc(m.symbol)+'&quot;,&quot;'+esc(nameOf(m))+'&quot;)"><div class="ms">'+esc(nameOf(m))+'</div><div class="mp">'+pxStr(m.price)+'</div><div class="mc">'+pctSpan(m.changePct)+'</div></div>';}).join('');
  var regsrc=market==='kr'?'삼성전자':'BTC';
  var reg=d.regime?'<div class="regbadge reg-'+esc(d.regime.label)+'"><span class="rl">'+(REGLBL[d.regime.label]||esc(d.regime.label))+'</span><span class="hint" style="font-weight:400">'+regsrc+'레짐 · ADX '+Math.round(d.regime.adx)+'</span></div>':'';
@@ -2052,14 +2052,15 @@ function loadMarket(){var reqMarket=market;fetch('/api/market?market='+reqMarket
 var SCANM=[['roc','모멘텀'],['relVolume','거래량급증'],['gapPct','갭'],['rangePct','변동성']];var scanMetric='roc';
 function scanTabs(){document.getElementById('scantabs').innerHTML=SCANM.map(function(m){return '<span class="scantab '+(m[0]===scanMetric?'on':'')+'" onclick="setScan(&quot;'+m[0]+'&quot;)">'+esc(m[1])+'</span>';}).join('');}
 function setScan(m){scanMetric=m;scanTabs();loadScan();}
-function loadScan(){var b=document.getElementById('scanbody');b.innerHTML='<span class="skel">스캔 중…</span>';
- var reqMarket=market;fetch('/api/scan?metric='+scanMetric+'&market='+reqMarket).then(function(r){return r.json()}).then(function(d){if(reqMarket!==market)return;if(!d.ok){b.innerHTML='<span class="skel">'+esc(d.error||'실패')+'</span>';return;}
+function loadScan(){var b=document.getElementById('scanbody');if(!b.querySelector('.lrow'))b.innerHTML='<span class="skel">스캔 중…</span>'; // 폴링 갱신 시엔 직전 행 유지(stale-while-error, rank8)
+ var reqMarket=market;fetch('/api/scan?metric='+scanMetric+'&market='+reqMarket).then(function(r){return r.json()}).then(function(d){if(reqMarket!==market)return;if(!d.ok){if(!b.querySelector('.lrow'))b.innerHTML='<span class="skel">'+esc(d.error||'실패')+'</span>';return;}
   var unit=scanMetric==='relVolume'?'x':'%';var signed=(scanMetric==='roc'||scanMetric==='gapPct'); // 부호·색은 등락 의미가 있는 모멘텀/갭만. relVolume(비율)·rangePct(변동성)은 항상 양수라 중립 표기
   b.innerHTML=(d.rows||[]).map(function(r,i){var cls=signed?(r.score>=0?'up':'dn'):'';var sign=(signed&&r.score>=0)?'+':'';return '<div class="lrow" onclick="heroLoad(&quot;'+esc(itBroker(r))+'&quot;,&quot;'+esc(r.symbol)+'&quot;,&quot;'+esc(nameOf(r))+'&quot;)"><div><span class="rank">'+(i+1)+'</span><span class="ls">'+esc(nameOf(r))+'</span></div><div class="lr"><span class="'+cls+'">'+sign+fmt(r.score,2)+unit+'</span><div class="lsub">'+pxStr(r.price)+'</div></div></div>';}).join('')||'<span class="skel">결과 없음</span>';
  }).catch(function(){b.innerHTML='<span class="skel">스캔 실패</span>';});}
 // 포트폴리오(누적 실현손익 곡선 + 봇 성과)
 var eqChart=null,eqSeries=null;
 function loadPortfolio(){fetch('/api/portfolio').then(function(r){return r.json()}).then(function(d){if(!d.ok)return;
+ var es=document.getElementById('eqSplit'),tt=d.totals||{};if(es)es.textContent=tt.realizedPaper?(' · 실거래 '+fmt(tt.realizedLive||0,0)+' · 모의 '+fmt(tt.realizedPaper,0)):''; // paper/live 혼입 정직 표기(rank5)
  var el=document.getElementById('eqChart'),em=document.getElementById('eqEmpty'),pts=d.curve||[];
  if(!pts.length){el.style.display='none';em.style.display='block';}
  else{el.style.display='block';em.style.display='none';

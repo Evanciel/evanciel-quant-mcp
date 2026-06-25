@@ -157,7 +157,12 @@ export function checkLimits(order: { symbol: string; notional: number; quoteCurr
   //  시나리오를 못 막는다. 그래서 현재 배치자금(열린 라이브 포지션 원가)+이번 주문 ≤ 예산 이어야 신규 매수 허용.
   //  매도는 배치액 감소라 면제. side 미지정(보호주문 등 reduceOnly)도 면제(undefined !== "buy").
   if (order.side === "buy") {
-    const explicitTotal = posNum(ccyU === "KRW" ? process.env.LIVE_MAX_TOTAL_NOTIONAL_KRW : process.env.LIVE_MAX_TOTAL_NOTIONAL_USDT) || posNum(process.env.LIVE_MAX_TOTAL_NOTIONAL);
+    // 전역 단일 env(LIVE_MAX_TOTAL_NOTIONAL, 통화표기 없음)는 기본통화(USDT/USD)에만 폴백. KRW는 _KRW env 또는 KRW 기본값만 —
+    //   USDT단위 전역값(예: 1000)이 KRW 버킷에 1000원으로 오적용돼 KR 신규매수가 통째 차단되는 통화혼선 footgun 차단(rank3).
+    //   (일일손실 LIVE_DAILY_LOSS_LIMIT도 동형 패턴이나 기존 설계 유지 — 별도 검토.)
+    const explicitTotal = ccyU === "KRW"
+      ? posNum(process.env.LIVE_MAX_TOTAL_NOTIONAL_KRW)
+      : (posNum(process.env.LIVE_MAX_TOTAL_NOTIONAL_USDT) || posNum(process.env.LIVE_MAX_TOTAL_NOTIONAL));
     const totalCap = explicitTotal || (liveActive ? def.totalCap : 0);
     if (totalCap > 0) {
       const deployed = liveDeployedNotional(order.quoteCurrency);
