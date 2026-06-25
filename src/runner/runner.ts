@@ -18,6 +18,7 @@ import { collectEventCalendars, buildEventCalendars } from "../core/calendar/cal
 import { rankUniverse, decideScannerActions, type RankBar } from "../core/scanner/rank.js";
 import { planProtectiveOrders, syncProtective } from "../core/execution/protective.js";
 import { evaluateProtectiveExit } from "../core/execution/protective-monitor.js"; // 데몬 측 합성 보호(거래소 상주 SL/TP 미지원 브로커)
+import { loadTelegramConfig, broadcastTelegram } from "../core/alerts/telegram.js"; // 보호 손절/공백 알림(아웃바운드, 미설정이면 no-op)
 import { sizeFromBalance, classifyFillStatus, reconcilePositionFromExchange, type ExchangePos } from "../core/execution/reconcile.js";
 import { computeOrderQty } from "../core/risk/order-sizing.js"; // 스캐너 진입 사이징(opt-in 변동성 타게팅)
 // 체결 reconcile(P0-4): 키움/KIS는 getOrderByClientId 미지원 → 주문 시점 체결확인 불가(지연체결). tickBot 시작 시
@@ -664,6 +665,13 @@ const PROTECT_SWEEP_MS = (() => { const n = Number(String(process.env.QUANT_PROT
 const PROTECT_BROKERS = new Set(["kiwoom", "kis", "toss"]);
 /** botId → 마지막 모니터 청산 시각(ms). 같은 봉 내 전략 틱의 재진입(엔진이 보유 원함) 억제용(engine sltpExited 의미를 라이브로 확장). */
 const _protectiveExitAt = new Map<string, number>();
+/** 보호 알림(best-effort 텔레그램 브로드캐스트, 미설정이면 no-op). fire-and-forget — 거래 비차단. */
+function notifyProtective(text: string): void {
+  try { const cfg = loadTelegramConfig(); if (cfg) void broadcastTelegram(cfg, text).catch(() => {}); } catch { /* 알림 실패는 거래에 영향 없음 */ }
+}
+/** 보호 공백(청산 실패) 알림 봇별 쿨다운 — 매 스윕(10s) 반복 스팸 방지. */
+const GAP_ALERT_COOLDOWN_MS = 5 * 60_000;
+const _lastGapAlertAt = new Map<string, number>();
 
 /**
  * 보호 모니터 청산 — 열린 라이브 포지션이 SL/TP/트레일링 위반 시 **단일 fillOrder 안전경로**로 시장가 청산 + 기록.
@@ -674,7 +682,12 @@ async function protectiveLiquidate(bot: store.BotRow, cur: PaperPosition, price:
   const qty = cur.qty;
   const barBucket = Math.floor(Date.now() / (Math.max(15, bot.interval_seconds) * 1000)); // 한 봉 주기당 1회 멱등(중복 청산 방지)
   const r = await fillOrder(bot, "sell", qty, price, bot.symbol, { posLive: true, barIso: new Date().toISOString() });
-  if (!r.live) { store.insertLog(bot.id, "gate", `보호 모니터 ${kind} 청산 보류 — ${r.note ?? "체결 미확정"}(다음 스윕 재시도)`); return false; }
+  if (!r.live) {
+    store.insertLog(bot.id, "gate", `보호 모니터 ${kind} 청산 보류 — ${r.note ?? "체결 미확정"}(다음 스윕 재시도)`);
+    const lastGap = _lastGapAlertAt.get(bot.id) ?? 0;
+    if (Date.now() - lastGap > GAP_ALERT_COOLDOWN_MS) { _lastGapAlertAt.set(bot.id, Date.now()); notifyProtective(`⚠️ 보호 공백 — ${bot.symbol} ${kind} 위반인데 청산 미확정(${r.note ?? "?"}). 거래소 수동 확인 필요.`); }
+    return false;
+  }
   const fillPrice = r.price > 0 ? r.price : price;
   const filled = Math.min(r.filledQty && r.filledQty > 0 ? r.filledQty : qty, qty);
   const pnl = (fillPrice - cur.entryAvg) * filled;
@@ -691,6 +704,7 @@ async function protectiveLiquidate(bot: store.BotRow, cur: PaperPosition, price:
   _protectiveExitAt.set(bot.id, Date.now());
   audit({ event: "protective_monitor_exit", botId: bot.id, env, symbol: bot.symbol, kind, price: fillPrice, qty: filled, pnl, level, remainQty });
   store.insertLog(bot.id, "sell", `[실거래] 보호 모니터 ${kind} 청산 -${filled} @${fillPrice.toFixed(2)} (pnl=${pnl.toFixed(2)})${stillOpen ? ` — 잔여 ${remainQty}` : " — 청산 완료"}`);
+  notifyProtective(`🛑 보호 모니터 ${kind} 청산 — ${bot.symbol} -${filled} @${fillPrice.toFixed(2)} (pnl ${pnl.toFixed(2)})${stillOpen ? ` · 잔여 ${remainQty}` : ""}`);
   return true;
 }
 
@@ -1610,9 +1624,13 @@ export class Runner {
     let bots: store.BotRow[]; try { bots = store.listRunningBots(); } catch { return; }
     for (const b of bots) {
       try {
-        if (b.mode !== "live" || !PROTECT_BROKERS.has(b.broker)) continue; // 라이브 + 거래소상주 미지원 브로커(KR)만
+        if (b.mode !== "live") continue;
         const cur0 = b.position_state as PaperPosition | null;
         if (!cur0 || cur0.status !== "open" || !(cur0.qty > 1e-9) || !cur0.live) continue; // 열린 라이브 포지션만
+        // 대상: KR(거래소 상주 미지원 → 상시 모니터) + 바이낸스 백스톱(거래소 상주 보호주문 부재 시에만 —
+        //   상주 존재 시 #6 reconcileProtectiveFills가 처리하므로 이중청산 방지). 상주 부재 창(진입 직후·sync 실패)을 메움.
+        const hasResident = !!(cur0.protectiveIds && cur0.protectiveIds.length > 0);
+        if (!(PROTECT_BROKERS.has(b.broker) || (b.broker === "binance" && !hasResident))) continue;
         if (this.ticking.has(b.id)) continue; // 전략 틱 진행 중 → 충돌 회피(다음 스윕)
         const comp = store.getComposite(b.composite_strategy_id);
         const sl = comp?.stop_loss_percent as number | null | undefined;
@@ -1635,8 +1653,9 @@ export class Runner {
         if (this.ticking.has(b.id)) continue; // getPrice await 사이 틱 시작 → 양보(이중청산 방지)
         this.ticking.add(b.id);
         try {
-          const fresh = store.getBot(b.id)?.position_state as PaperPosition | null; // 락 획득 후 fresh 재확인(틱이 먼저 청산했을 수 있음)
-          if (fresh && fresh.status === "open" && fresh.qty > 1e-9 && fresh.live) {
+          const fresh = store.getBot(b.id)?.position_state as PaperPosition | null; // 락 획득 후 fresh 재확인(틱이 먼저 청산/상주배치 했을 수 있음)
+          const freshResident = !!(fresh?.protectiveIds && fresh.protectiveIds.length > 0); // 바이낸스: 락 사이 상주주문 배치됐으면 백스톱 양보(이중청산 방지)
+          if (fresh && fresh.status === "open" && fresh.qty > 1e-9 && fresh.live && !(b.broker === "binance" && freshResident)) {
             await protectiveLiquidate(b, fresh, px, ev.kind!, ev.level, live.env);
           }
         } finally { this.ticking.delete(b.id); }
