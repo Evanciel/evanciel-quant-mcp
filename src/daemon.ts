@@ -12,7 +12,7 @@
  *  - ALERT_HEARTBEAT_MINUTES 설정 시 주기 하트비트 발신(채널 침묵 = 데몬 사망 신호).
  *  - 대시보드 /healthz(무인증·민감정보 0) → Docker HEALTHCHECK.
  */
-import { loadCredentialsFile } from "./setup/credentials.js";
+import { loadCredentialsFile, loadEnvLocalFile } from "./setup/credentials.js";
 import { runner, emergencyStopAll } from "./runner/runner.js";
 import { startDashboard } from "./dashboard/server.js";
 import { sendWebhook } from "./core/alerts/webhook.js";
@@ -46,6 +46,9 @@ function statusText(): string {
 async function main(): Promise<void> {
   const n = loadCredentialsFile();
   if (n > 0) log(`credentials.env에서 ${n}개 자격증명 로드`);
+  // 프로젝트 .env.local 폴백(MCP 서버와 동일 소스, non-override) — 대시보드 KR 패널/라이브가 .env.local 키(키움 등)를 보도록.
+  const m = loadEnvLocalFile();
+  if (m > 0) log(`.env.local에서 ${m}개 자격증명 로드`);
 
   // 러너(봇 재개 + 24h 백업 타이머) + 대시보드(/healthz 포함)
   runner().resumeAll();
