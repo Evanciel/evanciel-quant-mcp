@@ -9,9 +9,8 @@
 import { describe, it, expect } from "vitest";
 import { runCompositeBacktest } from "../src/core/backtest/engine.js";
 import { derivePosition } from "../src/runner/runner.js";
-import type { StrategyNode } from "../src/core/types/strategy.js";
-import type { BacktestConfig } from "../src/core/types/backtest.js";
-import type { OHLCV } from "../src/core/types/ohlcv.js";
+import type { StrategyNode, BacktestConfig } from "../src/core/types/strategy.js";
+type OHLCV = Parameters<typeof runCompositeBacktest>[1][number];
 
 const bar = (i: number, close: number, low?: number, high?: number): OHLCV => {
   const iso = new Date(Date.UTC(2025, 0, 1) + i * 86400000).toISOString();
