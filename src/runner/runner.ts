@@ -17,6 +17,7 @@ import { collectMtfConditions, buildMtfSeries, collectMtfRegimeConditions, build
 import { collectEventCalendars, buildEventCalendars } from "../core/calendar/calendars.js";
 import { rankUniverse, decideScannerActions, type RankBar } from "../core/scanner/rank.js";
 import { planProtectiveOrders, syncProtective } from "../core/execution/protective.js";
+import { evaluateProtectiveExit } from "../core/execution/protective-monitor.js"; // 데몬 측 합성 보호(거래소 상주 SL/TP 미지원 브로커)
 import { sizeFromBalance, classifyFillStatus, reconcilePositionFromExchange, type ExchangePos } from "../core/execution/reconcile.js";
 import { computeOrderQty } from "../core/risk/order-sizing.js"; // 스캐너 진입 사이징(opt-in 변동성 타게팅)
 // 체결 reconcile(P0-4): 키움/KIS는 getOrderByClientId 미지원 → 주문 시점 체결확인 불가(지연체결). tickBot 시작 시
@@ -656,6 +657,43 @@ async function reconcileProtectiveFills(bot: store.BotRow, cur: PaperPosition | 
   return { position: next, booked: true };
 }
 
+// ── 데몬 측 합성 보호 모니터(거래소 상주 SL/TP 미지원 브로커 = KR). 전략 봉 주기와 분리된 고빈도 스윕이 호출. ──
+/** 보호 스윕 주기(ms). 전략 봉 주기와 독립 — 일봉 봇도 초 단위 손절. env로 조정(3~60s 클램프, 기본 10s). */
+const PROTECT_SWEEP_MS = (() => { const n = Number(String(process.env.QUANT_PROTECT_SWEEP_MS ?? "").trim()); return Number.isFinite(n) && n >= 3000 && n <= 60000 ? n : 10000; })();
+/** 모니터 대상 브로커 — 거래소 상주 보호주문 미지원(KR). 바이낸스는 거래소 상주 SL/TP+#6 reconcile이 보호하므로 제외(이중청산 방지). */
+const PROTECT_BROKERS = new Set(["kiwoom", "kis", "toss"]);
+/** botId → 마지막 모니터 청산 시각(ms). 같은 봉 내 전략 틱의 재진입(엔진이 보유 원함) 억제용(engine sltpExited 의미를 라이브로 확장). */
+const _protectiveExitAt = new Map<string, number>();
+
+/**
+ * 보호 모니터 청산 — 열린 라이브 포지션이 SL/TP/트레일링 위반 시 **단일 fillOrder 안전경로**로 시장가 청산 + 기록.
+ * fail-closed: fillOrder가 live 확정(체결)이 아니면(동결/실패/미확인) 장부 변경 없이 false 반환(다음 스윕 재시도) — 오기록 금지.
+ * 기록 패턴은 reconcileProtectiveFills와 동형(tx + insertTrade + setBotPositionState, 멱등키로 1회).
+ */
+async function protectiveLiquidate(bot: store.BotRow, cur: PaperPosition, price: number, kind: string, level: number | null, env: string): Promise<boolean> {
+  const qty = cur.qty;
+  const barBucket = Math.floor(Date.now() / (Math.max(15, bot.interval_seconds) * 1000)); // 한 봉 주기당 1회 멱등(중복 청산 방지)
+  const r = await fillOrder(bot, "sell", qty, price, bot.symbol, { posLive: true, barIso: new Date().toISOString() });
+  if (!r.live) { store.insertLog(bot.id, "gate", `보호 모니터 ${kind} 청산 보류 — ${r.note ?? "체결 미확정"}(다음 스윕 재시도)`); return false; }
+  const fillPrice = r.price > 0 ? r.price : price;
+  const filled = Math.min(r.filledQty && r.filledQty > 0 ? r.filledQty : qty, qty);
+  const pnl = (fillPrice - cur.entryAvg) * filled;
+  const remainQty = +(qty - filled).toFixed(8);
+  const stillOpen = remainQty > 1e-9;
+  const next: PaperPosition | null = stillOpen ? { ...cur, qty: remainQty } : null;
+  const idemKey = `${bot.id}:protectmon:${barBucket}`;
+  const booked = store.tx(() => {
+    const t0 = store.insertTrade({ bot_id: bot.id, side: "sell", price: fillPrice, qty: filled, pnl, is_paper: 0, reason: `보호 모니터 ${kind} 청산${level != null ? ` (기준 ${level.toFixed(2)})` : ""}`, idempotency_key: idemKey });
+    if (t0) store.setBotPositionState(bot.id, next, true, true);
+    return t0;
+  });
+  if (!booked) return false; // 멱등(이미 같은 봉에 모니터 청산 기록) → 이중 정리 방지
+  _protectiveExitAt.set(bot.id, Date.now());
+  audit({ event: "protective_monitor_exit", botId: bot.id, env, symbol: bot.symbol, kind, price: fillPrice, qty: filled, pnl, level, remainQty });
+  store.insertLog(bot.id, "sell", `[실거래] 보호 모니터 ${kind} 청산 -${filled} @${fillPrice.toFixed(2)} (pnl=${pnl.toFixed(2)})${stillOpen ? ` — 잔여 ${remainQty}` : " — 청산 완료"}`);
+  return true;
+}
+
 // ── 지정가 진입 대기(pendingEntry) 상태머신 (audit P1-5, binance 라이브 한정) ──
 // 신호 봉에 LIMIT 배치 → 매 틱 resolvePendingEntry로 추적: 체결→개시 / 타임아웃→취소+캡게이트 시장가 폴백 / 거절→해제 / 조회실패→유지.
 // backtest≡live: 백테 게이트(handlers.backtest)가 동일 worse-of 모델 검증. 라이브 체결가(limit 또는 캡 시장가) ≤ 게이트 모델 → never-optimistic.
@@ -990,6 +1028,19 @@ export async function tickBot(botId: string): Promise<{ action: "buy" | "sell" |
   let want = derivePosition(res.trades);
   let cur = bot.position_state as PaperPosition | null;
   const lastIso = data[data.length - 1].datetime;
+
+  // 보호 모니터가 같은 봉 내 이 포지션을 청산했다면, 엔진(봉마감 평가)이 여전히 보유를 원해도 같은 봉 재진입을 억제한다
+  //   (engine sltpExited "같은 봉 stop→재매수 금지"의 라이브 확장). 다음 봉부터 정상 신호 복귀. gapHandling='worst'로 보통
+  //   다음 봉 엔진이 봉저가로 SL을 인지해 자연 일치하나, 데이터 granularity 차로 어긋나는 좁은 엣지를 막는 안전벨트.
+  const _pExit = _protectiveExitAt.get(botId);
+  if (_pExit && Date.now() - _pExit < Math.max(15, bot.interval_seconds) * 1000) {
+    const _curQty = cur && cur.status === "open" ? cur.qty : 0;
+    if (want.holding && _curQty <= 1e-9) {
+      store.insertLog(botId, "gate", "보호 모니터 청산 직후 동일봉 재진입 억제 — 다음 봉 평가");
+      store.setBotPositionState(botId, cur);
+      return { action: "hold", detail: "보호 청산 후 동일봉 재진입 억제" };
+    }
+  }
 
   // 지정가 진입 대기 해소(audit P1-5 Q7): pendingEntry 있으면 최우선 처리(신호평가·reconcile보다 먼저). 체결→개시 /
   //   타임아웃→캡게이트 시장가 폴백 / 거절→해제. 대기 중이면 hold 반환 → bootSeed/reconcile/신호 전부 스킵(이중입양 방지).
@@ -1525,12 +1576,16 @@ export class Runner {
   // setInterval이 같은 봇에 tick을 동시 재진입시켜 이중주문/lost-update 발생 → 진행 중이면 스킵. 전 봇 타입 적용.
   private ticking = new Set<string>();
   private backupTimer: ReturnType<typeof setInterval> | null = null;
+  private protectiveTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor() {
     // 주기 백업(P1-21): 기동 직후 1회 + 24h마다. 실패는 backupDb가 내부 고지(거래 비차단). unref=프로세스 종료 비차단.
     store.backupDb();
     this.backupTimer = setInterval(() => { store.backupDb(); }, 24 * 3600 * 1000);
     this.backupTimer.unref?.();
+    // 보호 모니터 스윕(전역 단일 타이머): 전략 봉 주기와 무관하게 열린 라이브 포지션(KR)을 고빈도로 감시 → 일봉 봇도 초 단위 손절.
+    this.protectiveTimer = setInterval(() => { this.protectiveSweep().catch(() => {}); }, PROTECT_SWEEP_MS);
+    this.protectiveTimer.unref?.();
   }
 
   start(botId: string): void {
@@ -1549,12 +1604,51 @@ export class Runner {
     run();
     this.timers.set(botId, setInterval(run, Math.max(15, bot.interval_seconds) * 1000));
   }
+  /** 보호 스윕(고빈도): 전략 봉 주기와 무관하게 열린 라이브 포지션(KR)을 현재가로 감시 → SL/TP/트레일링 위반 시 즉시 시장가 청산. */
+  private async protectiveSweep(): Promise<void> {
+    if (!this.alive) return;
+    let bots: store.BotRow[]; try { bots = store.listRunningBots(); } catch { return; }
+    for (const b of bots) {
+      try {
+        if (b.mode !== "live" || !PROTECT_BROKERS.has(b.broker)) continue; // 라이브 + 거래소상주 미지원 브로커(KR)만
+        const cur0 = b.position_state as PaperPosition | null;
+        if (!cur0 || cur0.status !== "open" || !(cur0.qty > 1e-9) || !cur0.live) continue; // 열린 라이브 포지션만
+        if (this.ticking.has(b.id)) continue; // 전략 틱 진행 중 → 충돌 회피(다음 스윕)
+        const comp = store.getComposite(b.composite_strategy_id);
+        const sl = comp?.stop_loss_percent as number | null | undefined;
+        const tp = comp?.take_profit_percent as number | null | undefined;
+        const trail = comp?.trailing_stop_percent as number | null | undefined;
+        if (!sl && !tp && !trail) continue; // 보호 설정 없음 → 감시 대상 아님
+        if (!isMarketOpen(b.broker as Broker, new Date(), b.symbol)) continue; // 휴장/장외 → 청산 불가(유동성 없음)
+        const live = liveAdapterFor(b);
+        const getPrice = (live?.adapter as { getPrice?: (s: string) => Promise<{ price: number }> } | undefined)?.getPrice;
+        if (!live || !getPrice) continue;
+        let px: number;
+        try { px = (await getPrice.call(live.adapter, b.symbol)).price; } catch { continue; } // 현재가 실패 → fail-closed 스킵(다음 스윕)
+        if (!(px > 0)) continue;
+        const peak = Math.max(cur0.peakPrice ?? cur0.entryAvg, px);
+        const ev = evaluateProtectiveExit({ entryAvg: cur0.entryAvg, peakPrice: peak, price: px, stopLossPercent: sl, takeProfitPercent: tp, trailingStopPercent: trail });
+        if (!ev.hit) {
+          if (peak > (cur0.peakPrice ?? 0)) { try { store.setBotPositionState(b.id, { ...cur0, peakPrice: peak }, true, false); } catch { /* 경합 무시 */ } } // intra-bar 고점 추종(트레일 정확도)
+          continue;
+        }
+        if (this.ticking.has(b.id)) continue; // getPrice await 사이 틱 시작 → 양보(이중청산 방지)
+        this.ticking.add(b.id);
+        try {
+          const fresh = store.getBot(b.id)?.position_state as PaperPosition | null; // 락 획득 후 fresh 재확인(틱이 먼저 청산했을 수 있음)
+          if (fresh && fresh.status === "open" && fresh.qty > 1e-9 && fresh.live) {
+            await protectiveLiquidate(b, fresh, px, ev.kind!, ev.level, live.env);
+          }
+        } finally { this.ticking.delete(b.id); }
+      } catch (e) { try { store.insertLog(b.id, "error", `보호 스윕 오류: ${e instanceof Error ? e.message : e}`); } catch { /* 로그 실패 무시 */ } }
+    }
+  }
   stop(botId: string): void {
     const t = this.timers.get(botId); if (t) { clearInterval(t); this.timers.delete(botId); }
     store.setBotStatus(botId, "stopped");
   }
   resumeAll(): void { for (const b of store.listRunningBots()) this.start(b.id); }
-  shutdown(): void { this.alive = false; for (const t of this.timers.values()) clearInterval(t); this.timers.clear(); if (this.backupTimer) { clearInterval(this.backupTimer); this.backupTimer = null; } }
+  shutdown(): void { this.alive = false; for (const t of this.timers.values()) clearInterval(t); this.timers.clear(); if (this.backupTimer) { clearInterval(this.backupTimer); this.backupTimer = null; } if (this.protectiveTimer) { clearInterval(this.protectiveTimer); this.protectiveTimer = null; } }
 }
 
 let _runner: Runner | null = null;
